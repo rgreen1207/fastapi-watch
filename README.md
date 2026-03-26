@@ -120,6 +120,36 @@ registry.add(PostgreSQLProbe(url="postgresql://..."), critical=True)
 
 Non-critical probes always appear in `/health/status` with their real result and a `"critical": false` field. They simply don't affect the overall `status`.
 
+### Probe result history
+
+Every probe result is stored in a rolling per-probe history. Use `/health/history` to inspect past runs — useful for debugging flapping probes or seeing how latency has changed over time.
+
+```python
+registry = HealthRegistry(
+    app,
+    history_size=20,  # keep the last 20 results per probe (default: 10)
+)
+```
+
+**`GET /health/history`**
+
+```json
+{
+  "probes": {
+    "postgresql": [
+      { "name": "postgresql", "status": "healthy", "critical": true, "latency_ms": 1.8, ... },
+      { "name": "postgresql", "status": "healthy", "critical": true, "latency_ms": 2.1, ... }
+    ],
+    "redis": [
+      { "name": "redis", "status": "unhealthy", "critical": true, "latency_ms": 5002.0, "error": "Connection refused" },
+      { "name": "redis", "status": "healthy",   "critical": true, "latency_ms": 0.9, ... }
+    ]
+  }
+}
+```
+
+Results are ordered oldest-first. The history is in-memory and resets on process restart.
+
 ### Startup grace period
 
 Pass `grace_period_ms` to hold `/health/ready` in a `503 {"status": "starting"}` state for a fixed window after the registry is created. This prevents Kubernetes or a load balancer from routing traffic before the application has had time to warm up, without requiring all probes to pass immediately on boot.
@@ -183,6 +213,7 @@ registry.set_poll_interval(0)        # disable polling (single-fetch mode)
 | `GET /health/status` | **Status** — full detail on every probe | `200 OK` | `207 Multi-Status` |
 | `GET /health/ready/stream` | **Readiness stream** — SSE; polls while connected | `200 OK` | stream of events |
 | `GET /health/status/stream` | **Status stream** — SSE; polls while connected | `200 OK` | stream of events |
+| `GET /health/history` | **History** — last N results per probe | `200 OK` | always `200` |
 
 The prefix defaults to `/health` and can be changed:
 
@@ -985,6 +1016,7 @@ class CompositeRedisProbe(BaseProbe):
 | `poll_interval_ms` | `int \| None` | `60000` | How often (ms) to re-run probes while an SSE client is connected. `0` or `None` disables polling — each request or stream event runs probes on demand. Values below `1000` are clamped to `1000`. |
 | `logger` | `logging.Logger \| None` | `None` | Logger for warnings (e.g. clamped interval) and probe exception messages. Pass `None` to emit no logs. |
 | `grace_period_ms` | `int` | `0` | How long (ms) after startup to return `503 {"status": "starting"}` from `/ready`. `0` disables the grace period. |
+| `history_size` | `int` | `10` | Number of past probe results to retain per probe. Retrieved via `GET /health/history`. Minimum `1`. |
 
 ### `HealthRegistry.add(probe, critical=True)`
 

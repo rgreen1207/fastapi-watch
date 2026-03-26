@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from collections import deque
 from datetime import datetime, timezone
 from typing import AsyncGenerator, Awaitable, Callable, Union
 
@@ -71,12 +72,15 @@ class HealthRegistry:
         poll_interval_ms: int | None = 60_000,
         logger: logging.Logger | None = None,
         grace_period_ms: int = 0,
+        history_size: int = 10,
     ) -> None:
         self.app = app
         self.prefix = prefix
         self._logger = logger
         self._grace_period_ms: int = max(0, grace_period_ms)
         self._start_time: datetime = datetime.now(timezone.utc)
+        self._history_size: int = max(1, history_size)
+        self._probe_history: dict[str, deque[ProbeResult]] = {}
         self._probes: list[tuple[BaseProbe, bool]] = []  # (probe, critical)
         self._poll_interval_ms: int | None = self._set_interval(poll_interval_ms)
         self._cached_results: list[ProbeResult] | None = None
@@ -188,6 +192,10 @@ class HealthRegistry:
 
         results = list(await asyncio.gather(*(_safe_check(p, c) for p, c in self._probes)))
         self._last_checked_at = datetime.now(timezone.utc)
+        for result in results:
+            if result.name not in self._probe_history:
+                self._probe_history[result.name] = deque(maxlen=self._history_size)
+            self._probe_history[result.name].append(result)
         await self._fire_state_changes(results)
         return results
 
@@ -328,6 +336,22 @@ class HealthRegistry:
             report = HealthReport.from_results(results, checked_at=registry._last_checked_at)
             code = 200 if report.status == ProbeStatus.HEALTHY else 207
             return JSONResponse(report.model_dump(mode="json"), status_code=code)
+
+        @self.app.get(
+            f"{prefix}/history",
+            tags=tags,
+            summary="Probe result history",
+            description=(
+                "Returns the last N results for each probe (N = history_size). "
+                "Results are ordered oldest-first."
+            ),
+        )
+        async def probe_history() -> JSONResponse:
+            payload = {
+                name: [r.model_dump(mode="json") for r in entries]
+                for name, entries in registry._probe_history.items()
+            }
+            return JSONResponse({"probes": payload})
 
         def _make_sse_report(results: list[ProbeResult]) -> dict:
             return HealthReport.from_results(results, checked_at=registry._last_checked_at).model_dump(mode="json")

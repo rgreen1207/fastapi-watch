@@ -838,3 +838,70 @@ def test_in_grace_period_false_when_zero():
     app = FastAPI()
     registry = HealthRegistry(app, grace_period_ms=0)
     assert registry._in_grace_period() is False
+
+
+# ---------------------------------------------------------------------------
+# Probe result history
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_history_populated_after_run_all():
+    app = FastAPI()
+    registry = HealthRegistry(app, history_size=5)
+    registry.add(MemoryProbe(name="mem"))
+    await registry.run_all()
+    assert "mem" in registry._probe_history
+    assert len(registry._probe_history["mem"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_history_respects_history_size():
+    app = FastAPI()
+    registry = HealthRegistry(app, history_size=3)
+    registry.add(MemoryProbe(name="mem"))
+    for _ in range(10):
+        await registry.run_all()
+    assert len(registry._probe_history["mem"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_history_entries_are_probe_results():
+    app = FastAPI()
+    registry = HealthRegistry(app, history_size=5)
+    registry.add(MemoryProbe(name="mem"))
+    await registry.run_all()
+    entry = registry._probe_history["mem"][0]
+    assert isinstance(entry, ProbeResult)
+    assert entry.name == "mem"
+    assert entry.status == ProbeStatus.HEALTHY
+
+
+def test_history_endpoint_returns_empty_before_any_run():
+    app = FastAPI()
+    HealthRegistry(app, poll_interval_ms=None)
+    client = TestClient(app)
+    resp = client.get("/health/history")
+    assert resp.status_code == 200
+    assert resp.json()["probes"] == {}
+
+
+def test_history_endpoint_returns_results_after_run():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None, history_size=5)
+    registry.add(MemoryProbe(name="mem"))
+    client = TestClient(app)
+    # Trigger a run via /status so history is populated
+    client.get("/health/status")
+    resp = client.get("/health/history")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "mem" in data["probes"]
+    assert len(data["probes"]["mem"]) == 1
+    assert data["probes"]["mem"][0]["status"] == "healthy"
+
+
+def test_history_default_size_is_10():
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    assert registry._history_size == 10
