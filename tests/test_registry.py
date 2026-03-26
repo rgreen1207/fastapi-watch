@@ -1,7 +1,8 @@
 import asyncio
 import json
+import logging
 import pytest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from fastapi_watch import HealthRegistry
@@ -195,6 +196,75 @@ def test_set_poll_interval_below_minimum_is_clamped():
     registry = HealthRegistry(app, poll_interval_ms=None)
     registry.set_poll_interval(100)
     assert registry._poll_interval_ms == 1000
+
+
+# ---------------------------------------------------------------------------
+# Logger
+# ---------------------------------------------------------------------------
+
+
+def test_no_logger_by_default():
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    assert registry._logger is None
+
+
+def test_custom_logger_stored():
+    app = FastAPI()
+    custom = logging.getLogger("my_app")
+    registry = HealthRegistry(app, logger=custom)
+    assert registry._logger is custom
+
+
+def test_logger_warns_on_clamped_interval():
+    app = FastAPI()
+    mock_logger = MagicMock(spec=logging.Logger)
+    HealthRegistry(app, poll_interval_ms=200, logger=mock_logger)
+    mock_logger.warning.assert_called_once()
+    args = mock_logger.warning.call_args[0]
+    assert 200 in args
+    assert 1000 in args
+
+
+def test_no_warning_without_logger():
+    """Should not raise even when interval is clamped and no logger is set."""
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=200)
+    assert registry._poll_interval_ms == 1000  # still clamped
+
+
+@pytest.mark.asyncio
+async def test_logger_records_probe_exception():
+    class BombProbe(MemoryProbe):
+        name = "bomb"
+
+        async def check(self):
+            raise RuntimeError("exploded")
+
+    app = FastAPI()
+    mock_logger = MagicMock(spec=logging.Logger)
+    registry = HealthRegistry(app, logger=mock_logger)
+    registry.add(BombProbe())
+    results = await registry.run_all()
+    assert results[0].status == ProbeStatus.UNHEALTHY
+    mock_logger.exception.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_no_log_on_probe_exception_without_logger():
+    """Probe exceptions must be captured silently when no logger is set."""
+    class BombProbe(MemoryProbe):
+        name = "bomb"
+
+        async def check(self):
+            raise RuntimeError("exploded")
+
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    registry.add(BombProbe())
+    results = await registry.run_all()
+    assert results[0].status == ProbeStatus.UNHEALTHY
+    assert "RuntimeError" in results[0].error
 
 
 # ---------------------------------------------------------------------------

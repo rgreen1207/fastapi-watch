@@ -9,8 +9,6 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from .models import HealthReport, ProbeResult, ProbeStatus
 from .probes.base import BaseProbe
 
-logger = logging.getLogger(__name__)
-
 _MIN_POLL_INTERVAL_MS = 1000
 
 
@@ -23,15 +21,7 @@ def _normalize_interval(ms: int | None) -> int | None:
     """
     if ms is None or ms == 0:
         return None
-    if ms < _MIN_POLL_INTERVAL_MS:
-        logger.warning(
-            "poll_interval_ms %d is below the minimum of %d ms; clamping to %d ms",
-            ms,
-            _MIN_POLL_INTERVAL_MS,
-            _MIN_POLL_INTERVAL_MS,
-        )
-        return _MIN_POLL_INTERVAL_MS
-    return ms
+    return max(ms, _MIN_POLL_INTERVAL_MS)
 
 
 class HealthRegistry:
@@ -58,10 +48,12 @@ class HealthRegistry:
             Pass ``0`` or ``None`` to disable polling — each request will run
             probes on demand and streaming endpoints return a single result then
             close.  Values between 1 and 999 are clamped to 1000 ms.
+        logger: Optional :class:`logging.Logger` to use for warnings and probe
+            exception messages.  If ``None`` (default) no logging is emitted.
 
     Example::
 
-        registry = HealthRegistry(app)
+        registry = HealthRegistry(app, logger=logging.getLogger(__name__))
         registry.add(RedisProbe(url="redis://localhost"))
         registry.add(HttpProbe(url="https://api.example.com/health"))
 
@@ -76,11 +68,13 @@ class HealthRegistry:
         prefix: str = "/health",
         tags: list[str] | None = None,
         poll_interval_ms: int | None = 60_000,
+        logger: logging.Logger | None = None,
     ) -> None:
         self.app = app
         self.prefix = prefix
+        self._logger = logger
         self._probes: list[BaseProbe] = []
-        self._poll_interval_ms: int | None = _normalize_interval(poll_interval_ms)
+        self._poll_interval_ms: int | None = self._set_interval(poll_interval_ms)
         self._cached_results: list[ProbeResult] | None = None
         self._poll_task: asyncio.Task | None = None
         self._active_connections: int = 0
@@ -110,7 +104,7 @@ class HealthRegistry:
         with the new interval.  If polling is disabled the task is cancelled and
         the cache is cleared.
         """
-        self._poll_interval_ms = _normalize_interval(ms)
+        self._poll_interval_ms = self._set_interval(ms)
         if self._poll_interval_ms is None:
             self._cached_results = None
             self._cancel_poll_task()
@@ -134,7 +128,8 @@ class HealthRegistry:
             try:
                 return await probe.check()
             except Exception as exc:
-                logger.exception("Probe %r raised an exception", probe.name)
+                if self._logger:
+                    self._logger.exception("Probe %r raised an exception", probe.name)
                 return ProbeResult(
                     name=probe.name,
                     status=ProbeStatus.UNHEALTHY,
@@ -142,6 +137,18 @@ class HealthRegistry:
                 )
 
         return list(await asyncio.gather(*(_safe_check(p) for p in self._probes)))
+
+    def _set_interval(self, ms: int | None) -> int | None:
+        """Normalize a poll interval and warn if it was clamped."""
+        normalized = _normalize_interval(ms)
+        if self._logger and ms is not None and ms != 0 and ms < _MIN_POLL_INTERVAL_MS:
+            self._logger.warning(
+                "poll_interval_ms %d is below the minimum of %d ms; clamping to %d ms",
+                ms,
+                _MIN_POLL_INTERVAL_MS,
+                _MIN_POLL_INTERVAL_MS,
+            )
+        return normalized
 
     async def _on_connect(self) -> None:
         self._active_connections += 1
