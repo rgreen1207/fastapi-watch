@@ -120,6 +120,35 @@ registry.add(PostgreSQLProbe(url="postgresql://..."), critical=True)
 
 Non-critical probes always appear in `/health/status` with their real result and a `"critical": false` field. They simply don't affect the overall `status`.
 
+### State-change callbacks
+
+React to probe status transitions in real time. Register one or more callbacks with `on_state_change()`; each receives the probe name, old status, and new status whenever a probe's result changes:
+
+```python
+import logging
+
+logger = logging.getLogger(__name__)
+
+def on_change(probe_name: str, old_status, new_status):
+    logger.warning("Probe %s changed: %s → %s", probe_name, old_status, new_status)
+
+registry.on_state_change(on_change)
+```
+
+Async callbacks are also supported:
+
+```python
+async def alert(probe_name, old_status, new_status):
+    await send_slack_alert(f"{probe_name} is now {new_status}")
+
+registry.on_state_change(alert)
+```
+
+- Callbacks fire after every `run_all()` for each probe whose result changed.
+- The **first run** seeds the initial state — no callbacks are fired until a subsequent run sees a different result.
+- Multiple callbacks can be registered; all are called in registration order.
+- `on_state_change()` returns `self` for chaining.
+
 You can change the poll interval at any point after startup:
 
 ```python
@@ -949,6 +978,10 @@ Accepts a single `BaseProbe` instance. Returns `self` for chaining. Adding the s
 ### `HealthRegistry.add_probes(probes, critical=True)`
 
 Accepts a `list` of `BaseProbe` instances. The `critical` flag applies to every probe in the list. Returns `self` for chaining. Duplicate instances are silently skipped.
+
+### `HealthRegistry.on_state_change(callback)`
+
+Registers a callback invoked whenever a probe's status changes between runs. The callback receives `(probe_name: str, old_status: ProbeStatus, new_status: ProbeStatus)` and may be a plain function or an `async` coroutine. Returns `self` for chaining.
 
 ### `HealthRegistry.set_poll_interval(ms)`
 

@@ -663,3 +663,118 @@ def test_add_probes_critical_flag_applied_to_all():
     # Both should be stored as non-critical
     for _, critical in registry._probes:
         assert critical is False
+
+
+# ---------------------------------------------------------------------------
+# State-change callbacks
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_callback_fired_on_state_change():
+    events = []
+
+    def on_change(name, old, new):
+        events.append((name, old, new))
+
+    class ToggleProbe(MemoryProbe):
+        def __init__(self):
+            super().__init__(name="toggle")
+            self._healthy = True
+
+        async def check(self):
+            status = ProbeStatus.HEALTHY if self._healthy else ProbeStatus.UNHEALTHY
+            return ProbeResult(name=self.name, status=status)
+
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    probe = ToggleProbe()
+    registry.add(probe)
+    registry.on_state_change(on_change)
+
+    await registry.run_all()          # first run — stores initial state, no callback
+    assert events == []
+
+    probe._healthy = False
+    await registry.run_all()          # healthy → unhealthy
+    assert len(events) == 1
+    assert events[0] == ("toggle", ProbeStatus.HEALTHY, ProbeStatus.UNHEALTHY)
+
+    probe._healthy = True
+    await registry.run_all()          # unhealthy → healthy
+    assert len(events) == 2
+    assert events[1] == ("toggle", ProbeStatus.UNHEALTHY, ProbeStatus.HEALTHY)
+
+
+@pytest.mark.asyncio
+async def test_callback_not_fired_when_status_unchanged():
+    events = []
+
+    registry = HealthRegistry(FastAPI())
+    registry.add(MemoryProbe(name="stable"))
+    registry.on_state_change(lambda n, o, nw: events.append((n, o, nw)))
+
+    await registry.run_all()
+    await registry.run_all()
+    await registry.run_all()
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_async_callback_is_awaited():
+    called = []
+
+    async def async_cb(name, old, new):
+        called.append(name)
+
+    class ToggleProbe(MemoryProbe):
+        def __init__(self):
+            super().__init__(name="t")
+            self._healthy = True
+
+        async def check(self):
+            status = ProbeStatus.HEALTHY if self._healthy else ProbeStatus.UNHEALTHY
+            return ProbeResult(name=self.name, status=status)
+
+    registry = HealthRegistry(FastAPI())
+    probe = ToggleProbe()
+    registry.add(probe)
+    registry.on_state_change(async_cb)
+
+    await registry.run_all()
+    probe._healthy = False
+    await registry.run_all()
+    assert called == ["t"]
+
+
+@pytest.mark.asyncio
+async def test_on_state_change_returns_self():
+    registry = HealthRegistry(FastAPI())
+    result = registry.on_state_change(lambda n, o, nw: None)
+    assert result is registry
+
+
+@pytest.mark.asyncio
+async def test_multiple_callbacks_all_fired():
+    counts = [0, 0]
+
+    registry = HealthRegistry(FastAPI())
+
+    class ToggleProbe(MemoryProbe):
+        def __init__(self):
+            super().__init__(name="t")
+            self._healthy = True
+
+        async def check(self):
+            status = ProbeStatus.HEALTHY if self._healthy else ProbeStatus.UNHEALTHY
+            return ProbeResult(name=self.name, status=status)
+
+    probe = ToggleProbe()
+    registry.add(probe)
+    registry.on_state_change(lambda n, o, nw: counts.__setitem__(0, counts[0] + 1))
+    registry.on_state_change(lambda n, o, nw: counts.__setitem__(1, counts[1] + 1))
+
+    await registry.run_all()
+    probe._healthy = False
+    await registry.run_all()
+    assert counts == [1, 1]

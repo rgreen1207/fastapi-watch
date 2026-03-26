@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
-from typing import AsyncGenerator, Callable
+from typing import AsyncGenerator, Awaitable, Callable, Union
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -78,6 +78,10 @@ class HealthRegistry:
         self._poll_interval_ms: int | None = self._set_interval(poll_interval_ms)
         self._cached_results: list[ProbeResult] | None = None
         self._last_checked_at: datetime | None = None
+        self._probe_states: dict[str, ProbeStatus] = {}
+        self._state_change_callbacks: list[
+            Callable[[str, ProbeStatus, ProbeStatus], Union[None, Awaitable[None]]]
+        ] = []
         self._poll_task: asyncio.Task | None = None
         self._active_connections: int = 0
         self._cache_lock = asyncio.Lock()
@@ -110,6 +114,22 @@ class HealthRegistry:
         """
         for probe in probes:
             self.add(probe, critical=critical)
+        return self
+
+    def on_state_change(
+        self,
+        callback: Callable[[str, ProbeStatus, ProbeStatus], Union[None, Awaitable[None]]],
+    ) -> "HealthRegistry":
+        """Register a callback invoked when a probe's status changes.
+
+        The callback receives ``(probe_name, old_status, new_status)`` and may
+        be a plain function or an async coroutine function.  It is called after
+        every ``run_all()`` for each probe whose status differs from the
+        previous run.
+
+        Returns ``self`` for chaining.
+        """
+        self._state_change_callbacks.append(callback)
         return self
 
     def set_poll_interval(self, ms: int | None) -> None:
@@ -165,7 +185,22 @@ class HealthRegistry:
 
         results = list(await asyncio.gather(*(_safe_check(p, c) for p, c in self._probes)))
         self._last_checked_at = datetime.now(timezone.utc)
+        await self._fire_state_changes(results)
         return results
+
+    async def _fire_state_changes(self, results: list[ProbeResult]) -> None:
+        """Fire callbacks for any probe whose status changed since the last run."""
+        if not self._state_change_callbacks:
+            return
+        for result in results:
+            old = self._probe_states.get(result.name)
+            if old != result.status:
+                self._probe_states[result.name] = result.status
+                if old is not None:  # skip initial state — no prior state to compare
+                    for cb in self._state_change_callbacks:
+                        ret = cb(result.name, old, result.status)
+                        if asyncio.iscoroutine(ret):
+                            await ret
 
     def _set_interval(self, ms: int | None) -> int | None:
         """Normalize a poll interval and warn if it was clamped."""
