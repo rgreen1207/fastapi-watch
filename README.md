@@ -81,14 +81,14 @@ registry = HealthRegistry(
 )
 ```
 
-Add probes individually, as a list, or chain calls. Adding the same instance twice is a no-op.
+Add probes one at a time with `add()`, or pass a list with `add_probes()`. Both methods return `self` for chaining. Adding the same instance twice is a no-op.
 
 ```python
 # Single probe
 registry.add(probe_a)
 
 # Multiple probes in one call
-registry.add([probe_a, probe_b, probe_c])
+registry.add_probes([probe_a, probe_b, probe_c])
 
 # Chained
 registry.add(probe_a).add(probe_b).add(probe_c)
@@ -879,9 +879,13 @@ class CompositeRedisProbe(BaseProbe):
 | `poll_interval_ms` | `int \| None` | `60000` | How often (ms) to re-run probes while an SSE client is connected. `0` or `None` disables polling — each request or stream event runs probes on demand. Values below `1000` are clamped to `1000`. |
 | `logger` | `logging.Logger \| None` | `None` | Logger for warnings (e.g. clamped interval) and probe exception messages. Pass `None` to emit no logs. |
 
-### `HealthRegistry.add(probe_or_list)`
+### `HealthRegistry.add(probe)`
 
-Accepts a single `BaseProbe` instance or a `list` of them. Returns `self` for chaining. Adding the same instance more than once is a no-op. Probes run concurrently on every request in the order they were added.
+Accepts a single `BaseProbe` instance. Returns `self` for chaining. Adding the same instance more than once is a no-op. Probes run concurrently on every request in the order they were added.
+
+### `HealthRegistry.add_probes(probes)`
+
+Accepts a `list` of `BaseProbe` instances. Returns `self` for chaining. Duplicate instances are silently skipped.
 
 ### `HealthRegistry.set_poll_interval(ms)`
 

@@ -88,12 +88,37 @@ def test_custom_prefix():
     assert client.get("/health/live").status_code == 404
 
 
-def test_registry_chaining():
+def test_add_chaining():
     app = FastAPI()
     registry = HealthRegistry(app)
     result = registry.add(MemoryProbe(name="a")).add(MemoryProbe(name="b"))
     assert result is registry
     assert len(registry._probes) == 2
+
+
+def test_add_probes():
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    result = registry.add_probes([MemoryProbe(name="a"), MemoryProbe(name="b"), MemoryProbe(name="c")])
+    assert result is registry
+    assert len(registry._probes) == 3
+
+
+def test_add_probes_skips_duplicates():
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    probe = MemoryProbe(name="a")
+    registry.add_probes([probe, probe])
+    assert len(registry._probes) == 1
+
+
+def test_add_skips_duplicate():
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    probe = MemoryProbe(name="a")
+    registry.add(probe)
+    registry.add(probe)
+    assert len(registry._probes) == 1
 
 
 @pytest.mark.asyncio

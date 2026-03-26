@@ -82,14 +82,22 @@ class HealthRegistry:
 
         self._register_routes(tags or ["health"])
 
-    def add(self, probes: BaseProbe | list[BaseProbe]) -> "HealthRegistry":
-        """Add a probe or list of probes to the registry. Returns ``self`` for chaining.
+    def add(self, probe: BaseProbe) -> "HealthRegistry":
+        """Add a single probe to the registry. Returns ``self`` for chaining.
+
+        Silently skips the probe if it is already registered (identity check).
+        """
+        if probe not in self._probes:
+            self._probes.append(probe)
+        return self
+
+    def add_probes(self, probes: list[BaseProbe]) -> "HealthRegistry":
+        """Add a list of probes to the registry. Returns ``self`` for chaining.
 
         Silently skips any probe that is already registered (identity check).
         """
-        for probe in (probes if isinstance(probes, list) else [probes]):
-            if probe not in self._probes:
-                self._probes.append(probe)
+        for probe in probes:
+            self.add(probe)
         return self
 
     def set_poll_interval(self, ms: int | None) -> None:
