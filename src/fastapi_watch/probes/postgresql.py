@@ -1,3 +1,4 @@
+import asyncio
 import time
 
 from ..models import ProbeResult, ProbeStatus
@@ -41,7 +42,7 @@ class PostgreSQLProbe(BaseProbe):
         try:
             conn = await asyncpg.connect(dsn=self.url, timeout=self.timeout)
 
-            version, active_connections, max_connections, db_size = await asyncpg.gather(
+            version, active_connections, max_connections, db_size = await asyncio.gather(
                 conn.fetchval("SELECT version()"),
                 conn.fetchval(
                     "SELECT count(*) FROM pg_stat_activity WHERE state = 'active'"

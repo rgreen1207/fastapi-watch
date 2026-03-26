@@ -12,12 +12,14 @@ except ImportError:
 pytestmark = pytest.mark.skipif(not HAS_ASYNCPG, reason="asyncpg not installed")
 
 
-def _make_mock_conn(fetchval_result=1, fetchval_exc=None):
+def _make_mock_conn(fetchval_results=None, fetchval_exc=None):
     conn = AsyncMock()
     if fetchval_exc:
         conn.fetchval = AsyncMock(side_effect=fetchval_exc)
     else:
-        conn.fetchval = AsyncMock(return_value=fetchval_result)
+        # The probe runs 4 fetchval calls concurrently via asyncio.gather
+        results = fetchval_results or ["PostgreSQL 16.2", 5, 100, "42 MB"]
+        conn.fetchval = AsyncMock(side_effect=results)
     conn.close = AsyncMock()
     return conn
 
@@ -67,11 +69,14 @@ async def test_postgresql_probe_custom_name():
 
 
 @pytest.mark.asyncio
-async def test_postgresql_probe_custom_query():
+async def test_postgresql_probe_returns_details():
     from fastapi_watch.probes.postgresql import PostgreSQLProbe
-    mock_conn = _make_mock_conn()
+    mock_conn = _make_mock_conn(fetchval_results=["PostgreSQL 16.2", 5, 100, "42 MB"])
     with patch("asyncpg.connect", AsyncMock(return_value=mock_conn)):
-        probe = PostgreSQLProbe(url="postgresql://localhost/db", query="SELECT version()")
+        probe = PostgreSQLProbe(url="postgresql://localhost/db")
         result = await probe.check()
-    mock_conn.fetchval.assert_called_once_with("SELECT version()")
     assert result.status == ProbeStatus.HEALTHY
+    assert result.details["version"] == "PostgreSQL 16.2"
+    assert result.details["active_connections"] == 5
+    assert result.details["max_connections"] == 100
+    assert result.details["database_size"] == "42 MB"

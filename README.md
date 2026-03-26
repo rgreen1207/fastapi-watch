@@ -73,14 +73,21 @@ app = FastAPI()
 registry = HealthRegistry(app)
 ```
 
-Add probes one at a time or chain them:
+Add probes individually, as a list, or chain calls. Adding the same instance twice is a no-op.
 
 ```python
+# Single probe
 registry.add(probe_a)
-registry.add(probe_b)
 
-# chained
+# Multiple probes in one call
+registry.add([probe_a, probe_b, probe_c])
+
+# Chained
 registry.add(probe_a).add(probe_b).add(probe_c)
+
+# Duplicate ignored — probe_a is only registered once
+registry.add(probe_a)
+registry.add(probe_a)
 ```
 
 ---
@@ -799,9 +806,9 @@ class CompositeRedisProbe(BaseProbe):
 | `prefix` | `str` | `"/health"` | URL prefix for all three endpoints |
 | `tags` | `list[str]` | `["health"]` | OpenAPI tags applied to the health routes |
 
-### `HealthRegistry.add(probe)`
+### `HealthRegistry.add(probe_or_list)`
 
-Returns `self` for chaining. Probes run concurrently on every request in the order they were added.
+Accepts a single `BaseProbe` instance or a `list` of them. Returns `self` for chaining. Adding the same instance more than once is a no-op. Probes run concurrently on every request in the order they were added.
 
 ### `HealthRegistry.run_all()`
 
