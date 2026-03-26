@@ -2,7 +2,7 @@
 
 Structured health and readiness check system for [FastAPI](https://fastapi.tiangolo.com/).
 
-Add `/health/live`, `/health/ready`, and `/health/status` endpoints to any FastAPI app with a single registry call. All probes run concurrently, so a slow dependency never blocks the others. Each probe returns rich service-specific details alongside the pass/fail result.
+Add `/health/live`, `/health/ready`, `/health/status`, and `/health/history` endpoints to any FastAPI app with a single registry call. All probes run concurrently, so a slow dependency never blocks the others. Each probe returns rich service-specific details alongside the pass/fail result.
 
 Connect a browser or monitoring tool to the SSE streaming endpoints (`/health/ready/stream`, `/health/status/stream`) and receive live updates as long as you stay connected — the background poll loop starts automatically on the first connection and stops when the last client disconnects.
 
@@ -11,22 +11,30 @@ Connect a browser or monitoring tool to the SSE streaming endpoints (`/health/re
 ## Table of contents
 
 - [Installation](#installation)
-- [How it works](#how-it-works)
+- [Quick start](#quick-start)
 - [Endpoints](#endpoints)
+- [Probe management](#probe-management)
+  - [Adding probes](#adding-probes)
+  - [Critical vs non-critical probes](#critical-vs-non-critical-probes)
+  - [Per-probe timeout](#per-probe-timeout)
 - [Live streaming](#live-streaming)
+- [Polling and caching](#polling-and-caching)
+- [State-change callbacks](#state-change-callbacks)
+- [Startup grace period](#startup-grace-period)
+- [Probe result history](#probe-result-history)
 - [Response format](#response-format)
-- [Probe details](#probe-details)
-- [Watching PostgreSQL](#watching-postgresql)
-- [Watching MySQL / MariaDB](#watching-mysql--mariadb)
-- [Watching Redis](#watching-redis)
-- [Watching Memcached](#watching-memcached)
-- [Watching RabbitMQ](#watching-rabbitmq)
-- [Watching Kafka](#watching-kafka)
-- [Watching MongoDB](#watching-mongodb)
-- [Watching an HTTP endpoint](#watching-an-http-endpoint)
-- [SQLAlchemy engine probe](#sqlalchemy-engine-probe)
 - [Writing a custom probe](#writing-a-custom-probe)
-- [All built-in probes](#all-built-in-probes)
+- [Built-in probes](#built-in-probes)
+  - [Watching PostgreSQL](#watching-postgresql)
+  - [Watching MySQL / MariaDB](#watching-mysql--mariadb)
+  - [Watching Redis](#watching-redis)
+  - [Watching Memcached](#watching-memcached)
+  - [Watching RabbitMQ](#watching-rabbitmq)
+  - [Watching Kafka](#watching-kafka)
+  - [Watching MongoDB](#watching-mongodb)
+  - [Watching an HTTP endpoint](#watching-an-http-endpoint)
+  - [SQLAlchemy engine probe](#sqlalchemy-engine-probe)
+  - [All built-in probes](#all-built-in-probes)
 - [Configuration reference](#configuration-reference)
 - [Kubernetes integration](#kubernetes-integration)
 - [License](#license)
@@ -64,7 +72,7 @@ pip install fastapi-watch[postgres,redis,rabbitmq]
 
 ---
 
-## How it works
+## Quick start
 
 Create a `HealthRegistry`, attach it to your FastAPI `app`, and call `.add()` for each service you want to monitor. The registry mounts all health endpoints automatically.
 
@@ -72,29 +80,72 @@ Create a `HealthRegistry`, attach it to your FastAPI `app`, and call `.add()` fo
 import logging
 from fastapi import FastAPI
 from fastapi_watch import HealthRegistry
+from fastapi_watch.probes import PostgreSQLProbe, RedisProbe
 
 app = FastAPI()
+
 registry = HealthRegistry(
     app,
-    poll_interval_ms=60_000,          # re-run probes every 60 s while streaming
-    logger=logging.getLogger(__name__) # optional — omit to silence all logging
+    poll_interval_ms=60_000,           # re-run probes every 60 s while streaming
+    logger=logging.getLogger(__name__), # optional — omit to silence all logging
+    grace_period_ms=10_000,            # hold /ready for 10 s while the app warms up
+    history_size=20,                   # keep the last 20 results per probe
 )
+
+registry.add(PostgreSQLProbe(url="postgresql://user:pass@localhost/mydb"))
+registry.add(RedisProbe(url="redis://localhost:6379"), critical=False)
 ```
+
+That's it. The following routes are now live:
+
+```
+GET /health/live          → always 200
+GET /health/ready         → 200 / 503
+GET /health/status        → 200 / 207
+GET /health/ready/stream  → SSE stream
+GET /health/status/stream → SSE stream
+GET /health/history       → rolling probe history
+```
+
+---
+
+## Endpoints
+
+| Endpoint | Purpose | Healthy | Degraded |
+|---|---|---|---|
+| `GET /health/live` | **Liveness** — is the process alive? | `200 OK` | never fails |
+| `GET /health/ready` | **Readiness** — are all critical probes passing? | `200 OK` | `503 Service Unavailable` |
+| `GET /health/status` | **Status** — full detail on every probe | `200 OK` | `207 Multi-Status` |
+| `GET /health/ready/stream` | **Readiness stream** — SSE; polls while connected | `200 OK` | stream of events |
+| `GET /health/status/stream` | **Status stream** — SSE; polls while connected | `200 OK` | stream of events |
+| `GET /health/history` | **History** — last N results per probe | `200 OK` | always `200` |
+
+The prefix defaults to `/health` and can be changed at construction time:
+
+```python
+registry = HealthRegistry(app, prefix="/ops/health")
+# → /ops/health/live
+# → /ops/health/ready
+# → /ops/health/status
+# → /ops/health/ready/stream
+# → /ops/health/status/stream
+# → /ops/health/history
+```
+
+---
+
+## Probe management
+
+### Adding probes
 
 Add probes one at a time with `add()`, or pass a list with `add_probes()`. Both methods return `self` for chaining. Adding the same instance twice is a no-op.
 
 ```python
-# Single probe (critical by default)
+# Single probe
 registry.add(probe_a)
-
-# Non-critical — failure is reported but never causes a 503
-registry.add(probe_a, critical=False)
 
 # Multiple probes in one call
 registry.add_probes([probe_a, probe_b, probe_c])
-
-# All non-critical
-registry.add_probes([probe_a, probe_b], critical=False)
 
 # Chained
 registry.add(probe_a).add(probe_b).add(probe_c)
@@ -104,6 +155,8 @@ registry.add(probe_a)
 registry.add(probe_a)
 ```
 
+Probes run **concurrently** on every check — a slow or failing probe never delays the others.
+
 ### Critical vs non-critical probes
 
 By default every probe is **critical** — a failing critical probe sets the overall `status` to `"unhealthy"` and causes `/health/ready` to return `503`.
@@ -111,64 +164,120 @@ By default every probe is **critical** — a failing critical probe sets the ove
 Mark a probe as non-critical when its failure should be visible in reports but shouldn't block traffic:
 
 ```python
-# Cache is nice-to-have; don't fail readiness if it's down
-registry.add(RedisProbe(url="redis://localhost"), critical=False)
-
 # Database is essential; fail readiness if it's unreachable
 registry.add(PostgreSQLProbe(url="postgresql://..."), critical=True)
+
+# Cache is nice-to-have; don't fail readiness if it's down
+registry.add(RedisProbe(url="redis://localhost"), critical=False)
 ```
 
-Non-critical probes always appear in `/health/status` with their real result and a `"critical": false` field. They simply don't affect the overall `status`.
+Non-critical probes always appear in `/health/status` with their real result and a `"critical": false` field. They simply don't affect the overall `status` or `/ready`.
 
-### Probe result history
-
-Every probe result is stored in a rolling per-probe history. Use `/health/history` to inspect past runs — useful for debugging flapping probes or seeing how latency has changed over time.
+`add_probes()` accepts the same flag, applied to every probe in the list:
 
 ```python
-registry = HealthRegistry(
-    app,
-    history_size=20,  # keep the last 20 results per probe (default: 10)
-)
+registry.add_probes([probe_a, probe_b], critical=False)
 ```
 
-**`GET /health/history`**
+### Per-probe timeout
 
-```json
-{
-  "probes": {
-    "postgresql": [
-      { "name": "postgresql", "status": "healthy", "critical": true, "latency_ms": 1.8, ... },
-      { "name": "postgresql", "status": "healthy", "critical": true, "latency_ms": 2.1, ... }
-    ],
-    "redis": [
-      { "name": "redis", "status": "unhealthy", "critical": true, "latency_ms": 5002.0, "error": "Connection refused" },
-      { "name": "redis", "status": "healthy",   "critical": true, "latency_ms": 0.9, ... }
-    ]
-  }
-}
-```
+Set a `timeout` (in seconds) on any probe class or instance. If the check doesn't complete within that time, the probe is recorded as unhealthy — all other probes are unaffected and still run concurrently.
 
-Results are ordered oldest-first. The history is in-memory and resets on process restart.
-
-### Startup grace period
-
-Pass `grace_period_ms` to hold `/health/ready` in a `503 {"status": "starting"}` state for a fixed window after the registry is created. This prevents Kubernetes or a load balancer from routing traffic before the application has had time to warm up, without requiring all probes to pass immediately on boot.
+**On the class:**
 
 ```python
-registry = HealthRegistry(
-    app,
-    grace_period_ms=15_000,  # hold readiness for 15 s after startup
-)
+class MyServiceProbe(BaseProbe):
+    name = "my-service"
+    timeout = 5.0  # fail after 5 seconds
+
+    async def check(self) -> ProbeResult:
+        ...
 ```
 
-- `/health/ready` returns `503 {"status": "starting"}` while the grace period is active.
-- `/health/status` and `/health/live` are **not** affected — they always reflect real probe results.
-- After the grace period expires, `/ready` resumes normal probe-based behaviour.
-- `grace_period_ms=0` (default) disables the grace period entirely.
+**On an instance:**
 
-### State-change callbacks
+```python
+probe = MyServiceProbe()
+probe.timeout = 2.0
+registry.add(probe)
+```
 
-React to probe status transitions in real time. Register one or more callbacks with `on_state_change()`; each receives the probe name, old status, and new status whenever a probe's result changes:
+`timeout = None` (the default) means no limit. Timed-out probes produce an unhealthy result with `error: "TimeoutError: "`.
+
+---
+
+## Live streaming
+
+The two streaming endpoints (`/health/ready/stream`, `/health/status/stream`) use [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) (SSE) to push probe results to connected clients.
+
+**The poll loop is demand-driven** — it starts when the first SSE client connects and stops automatically when the last one disconnects. No background work is done when nobody is watching.
+
+Each event is a JSON-encoded health report on a `data:` line:
+
+```
+data: {"status": "healthy", "checked_at": "2024-06-01T12:00:00.123456+00:00", "probes": [...]}
+
+data: {"status": "unhealthy", "checked_at": "2024-06-01T12:00:05.456789+00:00", "probes": [...]}
+```
+
+### Connecting from JavaScript
+
+```js
+const es = new EventSource('/health/status/stream');
+
+es.onmessage = (event) => {
+    const report = JSON.parse(event.data);
+    console.log(report.status, report.probes);
+};
+
+es.onerror = () => es.close();
+```
+
+### Connecting with curl
+
+```bash
+curl -N http://localhost:8000/health/status/stream
+```
+
+### Configuring the poll interval
+
+```python
+# Default — poll every 60 seconds while a client is connected
+registry = HealthRegistry(app)
+
+# Custom interval
+registry = HealthRegistry(app, poll_interval_ms=10_000)  # every 10 s
+
+# Minimum enforced interval is 1000 ms; lower values are clamped
+registry = HealthRegistry(app, poll_interval_ms=500)     # → 1000 ms
+
+# Disable polling — streaming endpoints emit one result then close
+registry = HealthRegistry(app, poll_interval_ms=None)
+```
+
+The interval can also be changed at any point after startup:
+
+```python
+registry.set_poll_interval(30_000)   # switch to every 30 s
+registry.set_poll_interval(0)        # disable — single-fetch mode
+```
+
+---
+
+## Polling and caching
+
+The regular `GET /health/ready` and `GET /health/status` endpoints always respond immediately:
+
+- **When SSE clients are connected** — the poll loop is running, so these endpoints serve the most recent cached probe results without re-running any probes.
+- **When no streaming is active** — probes are run on demand. A built-in lock prevents a thundering herd if multiple requests arrive simultaneously before the first result is cached.
+
+This means your GET endpoints are fast under all conditions, regardless of whether anyone is streaming.
+
+---
+
+## State-change callbacks
+
+React to probe status transitions in real time. Register one or more callbacks with `on_state_change()`; each receives the probe name, old status, and new status whenever a probe's result changes.
 
 ```python
 import logging
@@ -190,117 +299,133 @@ async def alert(probe_name, old_status, new_status):
 registry.on_state_change(alert)
 ```
 
-- Callbacks fire after every `run_all()` for each probe whose result changed.
+Key behaviours:
+
+- Callbacks fire after every `run_all()` for each probe whose status differs from the previous run.
 - The **first run** seeds the initial state — no callbacks are fired until a subsequent run sees a different result.
 - Multiple callbacks can be registered; all are called in registration order.
 - `on_state_change()` returns `self` for chaining.
 
-You can change the poll interval at any point after startup:
+---
+
+## Startup grace period
+
+Pass `grace_period_ms` to hold `/health/ready` in a `503 {"status": "starting"}` state for a fixed window after the registry is created. This prevents a load balancer from routing traffic before the application has had time to warm up — without requiring all probes to pass immediately on boot.
 
 ```python
-registry.set_poll_interval(30_000)   # switch to every 30 s
-registry.set_poll_interval(0)        # disable polling (single-fetch mode)
+registry = HealthRegistry(
+    app,
+    grace_period_ms=15_000,  # hold readiness for 15 s after startup
+)
+```
+
+- `/health/ready` returns `503 {"status": "starting"}` while the grace period is active.
+- `/health/status` and `/health/live` are **not** affected — they always reflect real probe results.
+- After the grace period expires, `/ready` resumes normal probe-based behaviour.
+- `grace_period_ms=0` (default) disables the grace period entirely.
+
+Pair with Kubernetes' `initialDelaySeconds` for belt-and-suspenders protection during slow startup:
+
+```yaml
+readinessProbe:
+  httpGet:
+    path: /health/ready
+    port: 8000
+  initialDelaySeconds: 5   # k8s waits 5 s before its first check
+  periodSeconds: 10
+```
+
+```python
+# App-side grace covers the remaining warmup window
+registry = HealthRegistry(app, grace_period_ms=20_000)
 ```
 
 ---
 
-## Endpoints
+## Probe result history
 
-| Endpoint | Purpose | Healthy | Degraded |
-|---|---|---|---|
-| `GET /health/live` | **Liveness** — is the process alive? | `200 OK` | never fails |
-| `GET /health/ready` | **Readiness** — are all probes passing? | `200 OK` | `503 Service Unavailable` |
-| `GET /health/status` | **Status** — full detail on every probe | `200 OK` | `207 Multi-Status` |
-| `GET /health/ready/stream` | **Readiness stream** — SSE; polls while connected | `200 OK` | stream of events |
-| `GET /health/status/stream` | **Status stream** — SSE; polls while connected | `200 OK` | stream of events |
-| `GET /health/history` | **History** — last N results per probe | `200 OK` | always `200` |
-
-The prefix defaults to `/health` and can be changed:
+Every probe result is stored in a rolling per-probe history. Use `GET /health/history` to inspect past runs — useful for debugging flapping probes or tracking latency over time.
 
 ```python
-registry = HealthRegistry(app, prefix="/ops/health")
-# → /ops/health/live, /ops/health/ready, /ops/health/status
-# → /ops/health/ready/stream, /ops/health/status/stream
+registry = HealthRegistry(
+    app,
+    history_size=20,  # keep the last 20 results per probe (default: 10)
+)
 ```
 
----
+**`GET /health/history` — response format:**
 
-## Live streaming
-
-The two streaming endpoints (`/health/ready/stream`, `/health/status/stream`) use [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) (SSE) to push probe results to connected clients at the configured `poll_interval_ms`.
-
-**The poll loop is demand-driven** — it starts when the first SSE client connects and stops automatically when the last one disconnects. No background work is done when nobody is watching.
-
-Each event is a JSON-encoded health report on a `data:` line:
-
-```
-data: {"status": "healthy", "checked_at": "2024-06-01T12:00:00.123456+00:00", "probes": [...]}
-
-data: {"status": "unhealthy", "checked_at": "2024-06-01T12:00:05.456789+00:00", "probes": [...]}
-```
-
-### Connecting from JavaScript
-
-```js
-const es = new EventSource('/health/status/stream');
-
-es.onmessage = (event) => {
-    const report = JSON.parse(event.data);
-    console.log(report.status, report.probes);
-};
-```
-
-### Connecting with curl
-
-```bash
-curl -N http://localhost:8000/health/status/stream
-```
-
-### Poll interval
-
-```python
-# Default — poll every 60 seconds while a client is connected
-registry = HealthRegistry(app)
-
-# Custom interval
-registry = HealthRegistry(app, poll_interval_ms=10_000)  # every 10 s
-
-# Minimum enforced interval is 1000 ms; lower values are clamped
-registry = HealthRegistry(app, poll_interval_ms=500)     # → 1000 ms
-
-# Disable polling — streaming endpoints return one result then close
-registry = HealthRegistry(app, poll_interval_ms=None)
+```json
+{
+  "probes": {
+    "postgresql": [
+      {
+        "name": "postgresql",
+        "status": "healthy",
+        "critical": true,
+        "latency_ms": 1.8,
+        "error": null,
+        "details": { "version": "PostgreSQL 16.2 ...", "active_connections": 5 }
+      },
+      {
+        "name": "postgresql",
+        "status": "healthy",
+        "critical": true,
+        "latency_ms": 2.1,
+        "error": null,
+        "details": { "version": "PostgreSQL 16.2 ...", "active_connections": 6 }
+      }
+    ],
+    "redis": [
+      {
+        "name": "redis",
+        "status": "unhealthy",
+        "critical": false,
+        "latency_ms": 5002.0,
+        "error": "Connection refused",
+        "details": null
+      },
+      {
+        "name": "redis",
+        "status": "healthy",
+        "critical": false,
+        "latency_ms": 0.9,
+        "error": null,
+        "details": { "version": "7.2.4", "total_keys": 312 }
+      }
+    ]
+  }
+}
 ```
 
-### Regular GET endpoints and caching
-
-The regular `GET /health/ready` and `GET /health/status` endpoints always respond immediately. When SSE clients are connected, they serve the most recent cached probe results. When no streaming is active, they run the probes on demand.
+Results are ordered oldest-first. History is in-memory and resets on process restart.
 
 ---
 
 ## Response format
 
-Every health report includes a top-level `checked_at` timestamp (ISO 8601, UTC) recording when the last probe run completed.
+Every response from `/health/ready`, `/health/status`, and the SSE streams shares the same shape.
 
-**Health report fields:**
+### Health report
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `status` | `"healthy"` \| `"unhealthy"` | Overall pass/fail |
+| `status` | `"healthy"` \| `"unhealthy"` | Overall result — determined by critical probes only |
 | `checked_at` | `string` \| `null` | UTC ISO 8601 timestamp of the last probe run; `null` before the first run |
-| `probes` | `array` | Individual probe results |
+| `probes` | `array` | Individual probe results (see below) |
 
-**Probe result fields:**
+### Probe result
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | `string` | Probe identifier |
-| `status` | `"healthy"` \| `"unhealthy"` | Pass/fail result |
+| `status` | `"healthy"` \| `"unhealthy"` | Pass/fail for this probe |
+| `critical` | `boolean` | `true` if the probe affects overall status and readiness |
 | `latency_ms` | `number` | How long the check took in milliseconds |
-| `error` | `string` \| `null` | Error message, only present on failure |
-| `details` | `object` \| `null` | Service-specific metadata (see [Probe details](#probe-details)) |
+| `error` | `string` \| `null` | Error message; only present on failure |
+| `details` | `object` \| `null` | Service-specific metadata (see each probe's section) |
 
-**All healthy — `200`**
+### Example: all healthy — `200`
 
 ```json
 {
@@ -310,7 +435,9 @@ Every health report includes a top-level `checked_at` timestamp (ISO 8601, UTC) 
     {
       "name": "postgresql",
       "status": "healthy",
+      "critical": true,
       "latency_ms": 1.8,
+      "error": null,
       "details": {
         "version": "PostgreSQL 16.2 on aarch64-unknown-linux-gnu",
         "active_connections": 5,
@@ -321,45 +448,323 @@ Every health report includes a top-level `checked_at` timestamp (ISO 8601, UTC) 
     {
       "name": "redis",
       "status": "healthy",
+      "critical": false,
       "latency_ms": 0.6,
+      "error": null,
       "details": {
         "version": "7.2.4",
         "uptime_seconds": 86400,
         "used_memory_human": "2.50M",
         "connected_clients": 8,
-        "total_keys": 312,
-        "clusters": {
-          "session": { "keys": 150, "ttl_seconds": 3600 },
-          "cache":   { "keys": 162, "ttl_seconds": 900  }
-        }
+        "total_keys": 312
       }
     }
   ]
 }
 ```
 
-**One probe failing — `503` on `/ready`, `207` on `/status`**
+### Example: one critical probe failing — `503` on `/ready`, `207` on `/status`
 
 ```json
 {
   "status": "unhealthy",
-  "checked_at": "2024-06-01T12:00:00.123456+00:00",
+  "checked_at": "2024-06-01T12:00:05.456789+00:00",
   "probes": [
-    { "name": "postgresql", "status": "healthy",   "latency_ms": 1.8, "details": { ... } },
-    { "name": "redis",      "status": "unhealthy", "latency_ms": 5002.1, "error": "Connection refused" }
+    {
+      "name": "postgresql",
+      "status": "unhealthy",
+      "critical": true,
+      "latency_ms": 5002.1,
+      "error": "Connection refused",
+      "details": null
+    },
+    {
+      "name": "redis",
+      "status": "healthy",
+      "critical": false,
+      "latency_ms": 0.6,
+      "error": null,
+      "details": { "version": "7.2.4" }
+    }
+  ]
+}
+```
+
+### Example: non-critical probe failing — still `200` on `/ready`
+
+```json
+{
+  "status": "healthy",
+  "checked_at": "2024-06-01T12:00:10.000000+00:00",
+  "probes": [
+    {
+      "name": "postgresql",
+      "status": "healthy",
+      "critical": true,
+      "latency_ms": 1.9,
+      "error": null,
+      "details": { "active_connections": 5 }
+    },
+    {
+      "name": "redis",
+      "status": "unhealthy",
+      "critical": false,
+      "latency_ms": 5001.3,
+      "error": "Connection timed out",
+      "details": null
+    }
   ]
 }
 ```
 
 ---
 
-## Probe details
+## Writing a custom probe
+
+Any class that extends `BaseProbe` and implements `check()` works as a probe. This is the right approach for internal services, third-party SDKs, business-logic checks, or composite conditions.
+
+### Minimal probe
+
+```python
+from fastapi_watch.probes import BaseProbe
+from fastapi_watch.models import ProbeResult, ProbeStatus
+
+class MyServiceProbe(BaseProbe):
+    name = "my-service"
+
+    async def check(self) -> ProbeResult:
+        ok = await call_my_service()
+        return ProbeResult(
+            name=self.name,
+            status=ProbeStatus.HEALTHY if ok else ProbeStatus.UNHEALTHY,
+        )
+
+registry.add(MyServiceProbe())
+```
+
+`check()` must be an async method and must return a `ProbeResult`. Any unhandled exception raised by `check()` is caught by the registry, automatically recorded as an unhealthy result, and optionally logged — your probe never needs to worry about crashing the health system.
+
+### Recording latency and details
+
+Use `time.perf_counter()` to measure the check duration and populate `latency_ms`. The `details` dict accepts any JSON-serializable data.
+
+```python
+import time
+from fastapi_watch.probes import BaseProbe
+from fastapi_watch.models import ProbeResult, ProbeStatus
+
+class PaymentGatewayProbe(BaseProbe):
+    name = "payment-gateway"
+
+    async def check(self) -> ProbeResult:
+        start = time.perf_counter()
+        try:
+            info = await ping_payment_gateway()
+            latency = (time.perf_counter() - start) * 1000
+            return ProbeResult(
+                name=self.name,
+                status=ProbeStatus.HEALTHY,
+                latency_ms=round(latency, 2),
+                details={
+                    "region": info.region,
+                    "provider_version": info.version,
+                    "response_ms": round(latency, 2),
+                },
+            )
+        except Exception as exc:
+            latency = (time.perf_counter() - start) * 1000
+            return ProbeResult(
+                name=self.name,
+                status=ProbeStatus.UNHEALTHY,
+                latency_ms=round(latency, 2),
+                error=str(exc),
+            )
+```
+
+### Configurable probe
+
+Pass configuration through `__init__` so the same probe class can be reused with different settings.
+
+```python
+class S3BucketProbe(BaseProbe):
+    def __init__(self, bucket: str, region: str = "us-east-1", name: str = "s3") -> None:
+        self.bucket = bucket
+        self.region = region
+        self.name = name
+
+    async def check(self) -> ProbeResult:
+        import time
+        import aiobotocore.session
+
+        start = time.perf_counter()
+        try:
+            session = aiobotocore.session.get_session()
+            async with session.create_client("s3", region_name=self.region) as client:
+                await client.head_bucket(Bucket=self.bucket)
+            latency = (time.perf_counter() - start) * 1000
+            return ProbeResult(
+                name=self.name,
+                status=ProbeStatus.HEALTHY,
+                latency_ms=round(latency, 2),
+                details={"bucket": self.bucket, "region": self.region},
+            )
+        except Exception as exc:
+            latency = (time.perf_counter() - start) * 1000
+            return ProbeResult(
+                name=self.name,
+                status=ProbeStatus.UNHEALTHY,
+                latency_ms=round(latency, 2),
+                error=str(exc),
+            )
+
+# Register multiple buckets as separate probes
+registry.add(S3BucketProbe(bucket="my-app-uploads", region="eu-west-1", name="s3-uploads"))
+registry.add(S3BucketProbe(bucket="my-app-backups", region="us-east-1", name="s3-backups"))
+```
+
+### Adding a timeout
+
+Set the `timeout` attribute (in seconds) on the class or instance. The registry will cancel the check and record it as unhealthy if it runs too long.
+
+```python
+class SlowExternalProbe(BaseProbe):
+    name = "slow-external"
+    timeout = 3.0  # class-level default
+
+    async def check(self) -> ProbeResult:
+        result = await call_slow_external_api()
+        return ProbeResult(name=self.name, status=ProbeStatus.HEALTHY)
+
+# Override on a specific instance
+probe = SlowExternalProbe()
+probe.timeout = 1.5
+registry.add(probe)
+```
+
+### Composite probe
+
+Wrap multiple inner probes to build custom aggregation logic — for example, reporting unhealthy only when both a primary and replica are down simultaneously.
+
+```python
+import asyncio
+from fastapi_watch.probes import BaseProbe, RedisProbe
+from fastapi_watch.models import ProbeResult, ProbeStatus
+
+class RedisHAProbe(BaseProbe):
+    name = "redis-ha"
+
+    def __init__(self, primary_url: str, replica_url: str) -> None:
+        self._primary = RedisProbe(url=primary_url, name="primary")
+        self._replica = RedisProbe(url=replica_url, name="replica")
+
+    async def check(self) -> ProbeResult:
+        primary, replica = await asyncio.gather(
+            self._primary.check(), self._replica.check()
+        )
+        if primary.is_healthy or replica.is_healthy:
+            return ProbeResult(
+                name=self.name,
+                status=ProbeStatus.HEALTHY,
+                details={
+                    "primary": primary.status.value,
+                    "replica": replica.status.value,
+                },
+            )
+        return ProbeResult(
+            name=self.name,
+            status=ProbeStatus.UNHEALTHY,
+            error=f"both nodes down — primary: {primary.error}, replica: {replica.error}",
+        )
+
+registry.add(RedisHAProbe(
+    primary_url="redis://primary.internal:6379",
+    replica_url="redis://replica.internal:6379",
+))
+```
+
+### Exception handling
+
+If `check()` raises an unhandled exception, the registry catches it and returns an unhealthy result automatically — you do **not** need to wrap your entire probe body in a try/except for this purpose. The auto-generated result looks like:
+
+```json
+{
+  "name": "my-service",
+  "status": "unhealthy",
+  "critical": true,
+  "latency_ms": 0.0,
+  "error": "RuntimeError: connection pool exhausted",
+  "details": null
+}
+```
+
+If a `logger` was passed to `HealthRegistry`, the exception is also logged with full traceback via `logger.exception()`.
+
+You should still catch exceptions yourself inside `check()` if you want to record partial details, a meaningful `latency_ms`, or a more specific `error` message.
+
+### Testing a custom probe
+
+Use `pytest-asyncio` to test `check()` directly without needing to spin up an HTTP server.
+
+```python
+import pytest
+from fastapi_watch.models import ProbeStatus
+from myapp.probes import MyServiceProbe
+
+@pytest.mark.asyncio
+async def test_healthy_when_service_responds():
+    probe = MyServiceProbe()
+    result = await probe.check()
+    assert result.status == ProbeStatus.HEALTHY
+    assert result.name == "my-service"
+
+@pytest.mark.asyncio
+async def test_unhealthy_when_service_raises(monkeypatch):
+    async def fail():
+        raise ConnectionError("refused")
+
+    monkeypatch.setattr("myapp.probes.call_my_service", fail)
+    probe = MyServiceProbe()
+    result = await probe.check()
+    assert result.status == ProbeStatus.UNHEALTHY
+    assert "refused" in result.error
+```
+
+You can also run the full registry against a real or mock dependency:
+
+```python
+from fastapi import FastAPI
+from fastapi_watch import HealthRegistry
+
+@pytest.mark.asyncio
+async def test_registry_run_all():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.add(MyServiceProbe())
+
+    results = await registry.run_all()
+    assert results[0].status == ProbeStatus.HEALTHY
+```
+
+### Probe implementation checklist
+
+- `name` must be set — either as a class attribute or in `__init__` via `self.name`.
+- `check()` must be `async` and return a `ProbeResult`.
+- Set `latency_ms` for probes where response time matters.
+- Populate `details` with any data useful for diagnosis.
+- Set `timeout` if the underlying call can hang indefinitely.
+- Do not call `registry.run_all()` or other registry methods from inside `check()`.
+
+---
+
+## Built-in probes
+
+### Probe details
 
 Every built-in probe populates the `details` field with service-specific metadata. Details are always best-effort — if the metadata query fails after a successful connectivity check, `details` will contain whatever was collected up to that point. The probe status reflects connectivity only, not the completeness of `details`.
 
 ---
 
-## Watching PostgreSQL
+### Watching PostgreSQL
 
 ```bash
 pip install fastapi-watch[postgres]
@@ -405,7 +810,7 @@ registry.add(PostgreSQLProbe(url="postgresql://...", timeout=2.0))
 
 ---
 
-## Watching MySQL / MariaDB
+### Watching MySQL / MariaDB
 
 ```bash
 pip install fastapi-watch[mysql]
@@ -449,7 +854,7 @@ registry.add(MySQLProbe(host="localhost", port=3306, user="app_user", password="
 
 ---
 
-## Watching Redis
+### Watching Redis
 
 ```bash
 pip install fastapi-watch[redis]
@@ -501,7 +906,7 @@ registry.add(RedisProbe(url="redis://localhost:6379/1", name="task-queue"))
 
 ---
 
-## Watching Memcached
+### Watching Memcached
 
 ```bash
 pip install fastapi-watch[memcached]
@@ -526,7 +931,7 @@ registry.add(MemcachedProbe(host="localhost", port=11211))
 
 ---
 
-## Watching RabbitMQ
+### Watching RabbitMQ
 
 ```bash
 pip install fastapi-watch[rabbitmq]
@@ -537,7 +942,7 @@ pip install fastapi-watch[rabbitmq]
 - **Connectivity only** (default) — opens and closes an AMQP connection. No channels or queues are touched.
 - **Rich mode** — when `management_url` is set, the probe also calls the RabbitMQ Management HTTP API and returns per-queue stats, message rates, and cluster metadata.
 
-### Connectivity only
+#### Connectivity only
 
 ```python
 from fastapi_watch.probes import RabbitMQProbe
@@ -556,7 +961,7 @@ registry.add(
 { "connected": true }
 ```
 
-### Rich mode — with Management API
+#### Rich mode — with Management API
 
 Pass `management_url` pointing at the RabbitMQ Management plugin (default port `15672`). Credentials are taken from the AMQP URL automatically.
 
@@ -607,12 +1012,6 @@ registry.add(
       "durable": true,
       "auto_delete": false,
       "idle_since": null
-    },
-    "dead-letter": {
-      "state": "running",
-      "messages": 22,
-      "consumers": 0,
-      ...
     }
   }
 }
@@ -644,7 +1043,7 @@ for i, host in enumerate(["rmq-1.internal", "rmq-2.internal", "rmq-3.internal"],
 
 ---
 
-## Watching Kafka
+### Watching Kafka
 
 ```bash
 pip install fastapi-watch[kafka]
@@ -685,7 +1084,7 @@ registry.add(KafkaProbe(bootstrap_servers=["b1:9092", "b2:9092", "b3:9092"]))
 
 ---
 
-## Watching MongoDB
+### Watching MongoDB
 
 ```bash
 pip install fastapi-watch[mongo]
@@ -728,7 +1127,7 @@ registry.add(MongoProbe(url="mongodb://localhost:27017"))
 
 ---
 
-## Watching an HTTP endpoint
+### Watching an HTTP endpoint
 
 ```bash
 pip install fastapi-watch[http]
@@ -773,7 +1172,7 @@ registry.add(HttpProbe(url="https://api.payments.com/health", timeout=2.0, name=
 
 ---
 
-## SQLAlchemy engine probe
+### SQLAlchemy engine probe
 
 ```bash
 pip install fastapi-watch[sqlalchemy]
@@ -809,160 +1208,9 @@ registry.add(SqlAlchemyProbe(engine=engine, name="primary-db"))
 
 ---
 
-## Writing a custom probe
+### All built-in probes
 
-Any class that extends `BaseProbe` and implements `check()` works as a probe. This is the right approach for internal services, third-party SDKs, business-logic checks, or composite conditions.
-
-### Minimal example
-
-```python
-from fastapi_watch.probes import BaseProbe
-from fastapi_watch.models import ProbeResult, ProbeStatus
-
-class MyServiceProbe(BaseProbe):
-    name = "my-service"
-
-    async def check(self) -> ProbeResult:
-        ok = await call_my_service()
-        return ProbeResult(
-            name=self.name,
-            status=ProbeStatus.HEALTHY if ok else ProbeStatus.UNHEALTHY,
-        )
-
-registry.add(MyServiceProbe())
-```
-
-### With latency and details
-
-```python
-import time
-from fastapi_watch.probes import BaseProbe
-from fastapi_watch.models import ProbeResult, ProbeStatus
-
-class PaymentGatewayProbe(BaseProbe):
-    name = "payment-gateway"
-
-    async def check(self) -> ProbeResult:
-        start = time.perf_counter()
-        try:
-            info = await ping_payment_gateway()
-            latency = (time.perf_counter() - start) * 1000
-            return ProbeResult(
-                name=self.name,
-                status=ProbeStatus.HEALTHY,
-                latency_ms=round(latency, 2),
-                details={
-                    "region": info.region,
-                    "provider_version": info.version,
-                },
-            )
-        except Exception as exc:
-            latency = (time.perf_counter() - start) * 1000
-            return ProbeResult(
-                name=self.name,
-                status=ProbeStatus.UNHEALTHY,
-                latency_ms=round(latency, 2),
-                error=str(exc),
-            )
-```
-
-### Configurable probe
-
-```python
-class S3BucketProbe(BaseProbe):
-    """Checks that an S3 bucket is reachable and the credentials are valid."""
-
-    def __init__(self, bucket: str, region: str = "us-east-1", name: str = "s3") -> None:
-        self.bucket = bucket
-        self.region = region
-        self.name = name
-
-    async def check(self) -> ProbeResult:
-        import time
-        import aiobotocore.session
-
-        start = time.perf_counter()
-        try:
-            session = aiobotocore.session.get_session()
-            async with session.create_client("s3", region_name=self.region) as client:
-                await client.head_bucket(Bucket=self.bucket)
-            latency = (time.perf_counter() - start) * 1000
-            return ProbeResult(
-                name=self.name,
-                status=ProbeStatus.HEALTHY,
-                latency_ms=round(latency, 2),
-                details={"bucket": self.bucket, "region": self.region},
-            )
-        except Exception as exc:
-            latency = (time.perf_counter() - start) * 1000
-            return ProbeResult(
-                name=self.name,
-                status=ProbeStatus.UNHEALTHY,
-                latency_ms=round(latency, 2),
-                error=str(exc),
-            )
-
-registry.add(S3BucketProbe(bucket="my-app-uploads", region="eu-west-1"))
-```
-
-### Per-probe timeout
-
-Set a `timeout` (in seconds) on any probe. If the check doesn't complete within that time it is recorded as unhealthy without blocking other probes — all probes still run concurrently.
-
-```python
-class MyServiceProbe(BaseProbe):
-    name = "my-service"
-    timeout = 5.0  # fail after 5 seconds
-
-    async def check(self) -> ProbeResult:
-        ok = await call_my_service()
-        return ProbeResult(
-            name=self.name,
-            status=ProbeStatus.HEALTHY if ok else ProbeStatus.UNHEALTHY,
-        )
-```
-
-Or set it on an instance:
-
-```python
-probe = MyServiceProbe()
-probe.timeout = 2.0
-registry.add(probe)
-```
-
-Timed-out probes produce an unhealthy result with `error: "TimeoutError: "`. `timeout = None` (the default) means no limit.
-
-### Composite probe
-
-Report unhealthy only when both Redis nodes are down simultaneously:
-
-```python
-class CompositeRedisProbe(BaseProbe):
-    name = "redis-composite"
-
-    def __init__(self, primary_url: str, replica_url: str) -> None:
-        self._primary = RedisProbe(url=primary_url, name="primary")
-        self._replica = RedisProbe(url=replica_url, name="replica")
-
-    async def check(self) -> ProbeResult:
-        import asyncio
-        primary, replica = await asyncio.gather(
-            self._primary.check(), self._replica.check()
-        )
-        if primary.is_healthy or replica.is_healthy:
-            return ProbeResult(name=self.name, status=ProbeStatus.HEALTHY)
-        return ProbeResult(
-            name=self.name,
-            status=ProbeStatus.UNHEALTHY,
-            error=f"both nodes down — primary: {primary.error}, replica: {replica.error}",
-        )
-```
-
----
-
-## All built-in probes
-
-### Databases
+#### Databases
 
 | Probe | Extra | Key constructor args | Details fields |
 |-------|-------|---------------------|----------------|
@@ -970,33 +1218,33 @@ class CompositeRedisProbe(BaseProbe):
 | `MySQLProbe` | `mysql` | `url` or `host`/`port`/`user`/`password`/`db`, `name`, `connect_timeout` | `version`, `connected_threads`, `uptime_seconds`, `max_used_connections` |
 | `SqlAlchemyProbe` | `sqlalchemy` | `engine`, `name` | `dialect`, `driver`, `server_version` |
 
-### Caches
+#### Caches
 
 | Probe | Extra | Key constructor args | Details fields |
 |-------|-------|---------------------|----------------|
 | `RedisProbe` | `redis` | `url`, `name` | `version`, `uptime_seconds`, `used_memory_human`, `connected_clients`, `role`, `total_keys`, `clusters` |
 | `MemcachedProbe` | `memcached` | `host`, `port`, `name`, `pool_size` | — |
 
-### Queues / messaging
+#### Queues / messaging
 
 | Probe | Extra | Key constructor args | Details fields |
 |-------|-------|---------------------|----------------|
 | `RabbitMQProbe` | `rabbitmq` | `url`, `name`, `management_url` | `connected`; + `server`, `totals`, `queues` when `management_url` is set |
 | `KafkaProbe` | `kafka` | `bootstrap_servers`, `name`, `request_timeout_ms` | `broker_count`, `controller_id`, `topics`, `internal_topics` |
 
-### Document stores
+#### Document stores
 
 | Probe | Extra | Key constructor args | Details fields |
 |-------|-------|---------------------|----------------|
 | `MongoProbe` | `mongo` | `url`, `name`, `server_selection_timeout_ms` | `version`, `uptime_seconds`, `connections`, `memory_mb`, `storage_engine` |
 
-### HTTP
+#### HTTP
 
 | Probe | Extra | Key constructor args | Details fields |
 |-------|-------|---------------------|----------------|
 | `HttpProbe` | `http` | `url`, `timeout`, `name`, `expected_status` | `status_code`, `content_type`, `response_bytes` |
 
-### Testing / placeholder
+#### Testing / placeholder
 
 | Probe | Extra | Key constructor args | Details fields |
 |-------|-------|---------------------|----------------|
@@ -1011,8 +1259,8 @@ class CompositeRedisProbe(BaseProbe):
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
 | `app` | `FastAPI` | required | The FastAPI application instance |
-| `prefix` | `str` | `"/health"` | URL prefix for all endpoints |
-| `tags` | `list[str]` | `["health"]` | OpenAPI tags applied to the health routes |
+| `prefix` | `str` | `"/health"` | URL prefix for all health endpoints |
+| `tags` | `list[str]` | `["health"]` | OpenAPI tags applied to all health routes |
 | `poll_interval_ms` | `int \| None` | `60000` | How often (ms) to re-run probes while an SSE client is connected. `0` or `None` disables polling — each request or stream event runs probes on demand. Values below `1000` are clamped to `1000`. |
 | `logger` | `logging.Logger \| None` | `None` | Logger for warnings (e.g. clamped interval) and probe exception messages. Pass `None` to emit no logs. |
 | `grace_period_ms` | `int` | `0` | How long (ms) after startup to return `503 {"status": "starting"}` from `/ready`. `0` disables the grace period. |
@@ -1020,13 +1268,13 @@ class CompositeRedisProbe(BaseProbe):
 
 ### `HealthRegistry.add(probe, critical=True)`
 
-Accepts a single `BaseProbe` instance. Returns `self` for chaining. Adding the same instance more than once is a no-op. Probes run concurrently on every request in the order they were added.
+Adds a single probe. Returns `self` for chaining. Adding the same instance more than once is a no-op.
 
 `critical=True` (default) — a failing probe causes the overall status to be `"unhealthy"` and `/ready` to return `503`. Set `critical=False` to include the probe in reports without affecting readiness.
 
 ### `HealthRegistry.add_probes(probes, critical=True)`
 
-Accepts a `list` of `BaseProbe` instances. The `critical` flag applies to every probe in the list. Returns `self` for chaining. Duplicate instances are silently skipped.
+Adds a list of probes. The `critical` flag applies to every probe in the list. Returns `self` for chaining. Duplicate instances are silently skipped.
 
 ### `HealthRegistry.on_state_change(callback)`
 
@@ -1043,20 +1291,20 @@ registry.set_poll_interval(0)        # disable — each event runs probes on dem
 
 ### `HealthRegistry.run_all()`
 
-Async method — runs every registered probe and returns `list[ProbeResult]`. Useful for testing or building custom aggregation logic outside of the mounted routes.
+Async method — runs every registered probe concurrently and returns `list[ProbeResult]`. Probe exceptions are caught and converted to unhealthy results. Useful for testing or building custom aggregation outside of the mounted routes.
 
 ```python
 results = await registry.run_all()
 for r in results:
-    print(r.name, r.status, r.details)
+    print(r.name, r.status, r.latency_ms, r.details)
 ```
 
 ### `BaseProbe`
 
 | Attribute | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `name` | `str` | `"unnamed"` | Label used in health reports |
-| `timeout` | `float \| None` | `None` | Per-probe timeout in seconds. If the check doesn't complete within this time it is marked unhealthy. `None` means no limit. |
+| `name` | `str` | `"unnamed"` | Label used in health reports. Override as a class attribute or set in `__init__`. |
+| `timeout` | `float \| None` | `None` | Per-probe timeout in seconds. The check is cancelled and recorded as unhealthy if it exceeds this value. `None` means no limit. |
 
 ### `ProbeResult`
 
@@ -1064,10 +1312,10 @@ for r in results:
 |-------|------|-------------|
 | `name` | `str` | Probe identifier |
 | `status` | `ProbeStatus` | `"healthy"` or `"unhealthy"` |
-| `critical` | `bool` | `True` if the probe was registered as critical; affects overall status |
+| `critical` | `bool` | `True` if the probe was registered as critical; affects overall status and readiness |
 | `latency_ms` | `float` | Duration of the check in milliseconds |
 | `error` | `str \| None` | Error message; only present on failure |
-| `details` | `dict \| None` | Service-specific metadata; see each probe's section above |
+| `details` | `dict \| None` | Service-specific metadata |
 | `is_healthy` | `bool` (property) | `True` when `status == "healthy"` |
 
 ---
@@ -1091,7 +1339,24 @@ readinessProbe:
   failureThreshold: 3
 ```
 
-Use `/health/ready` for the readiness probe — Kubernetes stops routing traffic to a pod the moment any dependency becomes unreachable. Use `/health/live` for liveness so the process is only restarted when it is genuinely stuck, not because an external service is temporarily down.
+Use `/health/ready` for the readiness probe — Kubernetes stops routing traffic to a pod the moment any critical dependency becomes unreachable. Use `/health/live` for liveness so the process is only restarted when it is genuinely stuck, not because an external service is temporarily down.
+
+For applications that need time to warm up (loading models, seeding caches, running migrations), combine `grace_period_ms` with a short `initialDelaySeconds`:
+
+```yaml
+readinessProbe:
+  httpGet:
+    path: /health/ready
+    port: 8000
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 6   # allow up to 60 s of failures before marking unready
+```
+
+```python
+# App holds /ready as "starting" for 30 s regardless of probe results
+registry = HealthRegistry(app, grace_period_ms=30_000)
+```
 
 ---
 
