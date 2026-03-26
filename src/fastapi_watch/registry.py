@@ -179,7 +179,7 @@ class HealthRegistry:
                     if probe.timeout is not None
                     else await coro
                 )
-                return result.model_copy(update={"critical": critical})
+                return result if result.critical == critical else result.model_copy(update={"critical": critical})
             except Exception as exc:
                 if self._logger:
                     self._logger.exception("Probe %r raised an exception", probe.name)
@@ -190,7 +190,7 @@ class HealthRegistry:
                     error=f"{type(exc).__name__}: {exc}",
                 )
 
-        results = list(await asyncio.gather(*(_safe_check(p, c) for p, c in self._probes)))
+        results = await asyncio.gather(*(_safe_check(p, c) for p, c in self._probes))
         self._last_checked_at = datetime.now(timezone.utc)
         for result in results:
             self._probe_history.setdefault(result.name, deque(maxlen=self._history_size)).append(result)
