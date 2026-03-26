@@ -1,5 +1,6 @@
+from datetime import datetime
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -12,9 +13,10 @@ class ProbeStatus(str, Enum):
 class ProbeResult(BaseModel):
     name: str
     status: ProbeStatus
+    critical: bool = True
     latency_ms: float = 0.0
-    error: Optional[str] = None
-    details: Optional[dict[str, Any]] = None
+    error: str | None = None
+    details: dict[str, Any] | None = None
 
     @property
     def is_healthy(self) -> bool:
@@ -23,13 +25,19 @@ class ProbeResult(BaseModel):
 
 class HealthReport(BaseModel):
     status: ProbeStatus
+    checked_at: datetime | None = None
     probes: list[ProbeResult] = Field(default_factory=list)
 
     @classmethod
-    def from_results(cls, results: list[ProbeResult]) -> "HealthReport":
+    def from_results(
+        cls,
+        results: list[ProbeResult],
+        checked_at: datetime | None = None,
+    ) -> "HealthReport":
+        critical_results = [r for r in results if r.critical]
         overall = (
             ProbeStatus.HEALTHY
-            if all(r.is_healthy for r in results)
+            if all(r.is_healthy for r in critical_results)
             else ProbeStatus.UNHEALTHY
         )
-        return cls(status=overall, probes=results)
+        return cls(status=overall, checked_at=checked_at, probes=results)
