@@ -9,6 +9,8 @@ from .base import BaseProbe
 class MongoProbe(BaseProbe):
     """Health probe for MongoDB using motor.
 
+    Returns server version, uptime, connection pool stats, and memory usage.
+
     Install with: ``pip install fastapi-watch[mongo]``
     """
 
@@ -37,12 +39,29 @@ class MongoProbe(BaseProbe):
                 self.url,
                 serverSelectionTimeoutMS=self._timeout_ms,
             )
-            await client.admin.command("ping")
+            status = await client.admin.command("serverStatus")
             latency = (time.perf_counter() - start) * 1000
+
+            connections = status.get("connections", {})
+            mem = status.get("mem", {})
             return ProbeResult(
                 name=self.name,
                 status=ProbeStatus.HEALTHY,
                 latency_ms=round(latency, 2),
+                details={
+                    "version": status.get("version"),
+                    "uptime_seconds": status.get("uptime"),
+                    "connections": {
+                        "current": connections.get("current"),
+                        "available": connections.get("available"),
+                        "total_created": connections.get("totalCreated"),
+                    },
+                    "memory_mb": {
+                        "resident": mem.get("resident"),
+                        "virtual": mem.get("virtual"),
+                    },
+                    "storage_engine": status.get("storageEngine", {}).get("name"),
+                },
             )
         except Exception as exc:
             latency = (time.perf_counter() - start) * 1000

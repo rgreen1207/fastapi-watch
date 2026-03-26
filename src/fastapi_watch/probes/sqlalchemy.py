@@ -13,23 +13,22 @@ if TYPE_CHECKING:
 class SqlAlchemyProbe(BaseProbe):
     """Health probe for a SQLAlchemy 2.x async engine.
 
+    Returns the dialect name, driver, and raw server version string.
+
     Install with: ``pip install fastapi-watch[sqlalchemy]``
 
     Args:
         engine: An ``AsyncEngine`` instance.
         name: Probe name shown in health reports.
-        query: SQL used to verify connectivity (default ``SELECT 1``).
     """
 
     def __init__(
         self,
         engine: "AsyncEngine",
         name: str = "database",
-        query: str = "SELECT 1",
     ) -> None:
         self.engine = engine
         self.name = name
-        self.query = query
 
     async def check(self) -> ProbeResult:
         try:
@@ -42,12 +41,22 @@ class SqlAlchemyProbe(BaseProbe):
         start = time.perf_counter()
         try:
             async with self.engine.connect() as conn:
-                await conn.execute(text(self.query))
+                await conn.execute(text("SELECT 1"))
+                server_version = conn.dialect.server_version_info
             latency = (time.perf_counter() - start) * 1000
             return ProbeResult(
                 name=self.name,
                 status=ProbeStatus.HEALTHY,
                 latency_ms=round(latency, 2),
+                details={
+                    "dialect": self.engine.dialect.name,
+                    "driver": self.engine.dialect.driver,
+                    "server_version": (
+                        ".".join(str(v) for v in server_version)
+                        if server_version
+                        else None
+                    ),
+                },
             )
         except Exception as exc:
             latency = (time.perf_counter() - start) * 1000

@@ -11,6 +11,8 @@ from .base import BaseProbe
 class HttpProbe(BaseProbe):
     """Health probe that performs an HTTP GET against an upstream URL.
 
+    Returns the HTTP status code, content type, and response body size.
+
     Install with: ``pip install fastapi-watch[http]``
 
     Args:
@@ -45,18 +47,26 @@ class HttpProbe(BaseProbe):
             timeout = aiohttp.ClientTimeout(total=self.timeout)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(self.url) as response:
+                    body = await response.read()
                     latency = (time.perf_counter() - start) * 1000
+                    details = {
+                        "status_code": response.status,
+                        "content_type": response.headers.get("Content-Type"),
+                        "response_bytes": len(body),
+                    }
                     if response.status == self.expected_status:
                         return ProbeResult(
                             name=self.name,
                             status=ProbeStatus.HEALTHY,
                             latency_ms=round(latency, 2),
+                            details=details,
                         )
                     return ProbeResult(
                         name=self.name,
                         status=ProbeStatus.UNHEALTHY,
                         latency_ms=round(latency, 2),
                         error=f"HTTP {response.status}",
+                        details=details,
                     )
         except Exception as exc:
             latency = (time.perf_counter() - start) * 1000

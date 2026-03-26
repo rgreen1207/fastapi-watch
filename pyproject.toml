@@ -33,7 +33,7 @@ mysql     = ["aiomysql>=0.2"]
 redis     = ["aioredis>=2.0"]
 memcached = ["aiomcache>=0.6"]
 # messaging / queues
-rabbitmq  = ["aio-pika>=9.0"]
+rabbitmq  = ["aio-pika>=9.0", "aiohttp>=3.9"]
 kafka     = ["aiokafka>=0.9"]
 # document stores
 mongo     = ["motor>=3.0"]

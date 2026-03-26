@@ -10,10 +10,10 @@ from .base import BaseProbe
 class KafkaProbe(BaseProbe):
     """Health probe for Apache Kafka using aiokafka.
 
-    Install with: ``pip install fastapi-watch[kafka]``
-
-    Connects an ``AIOKafkaAdminClient`` to verify broker reachability.
+    Returns the number of brokers in the cluster and a list of topic names.
     No topics are created or consumed.
+
+    Install with: ``pip install fastapi-watch[kafka]``
 
     Args:
         bootstrap_servers: Broker address(es) as a string
@@ -52,11 +52,28 @@ class KafkaProbe(BaseProbe):
                 request_timeout_ms=self._timeout_ms,
             )
             await client.start()
+
+            details: dict = {}
+            try:
+                topics = await client.list_topics()
+                cluster = await client.describe_cluster()
+                details["broker_count"] = len(cluster.brokers)
+                details["controller_id"] = cluster.controller_id
+                details["topics"] = sorted(
+                    t for t in topics if not t.startswith("__")
+                )
+                details["internal_topics"] = sorted(
+                    t for t in topics if t.startswith("__")
+                )
+            except Exception:
+                pass  # details are best-effort
+
             latency = (time.perf_counter() - start) * 1000
             return ProbeResult(
                 name=self.name,
                 status=ProbeStatus.HEALTHY,
                 latency_ms=round(latency, 2),
+                details=details,
             )
         except Exception as exc:
             latency = (time.perf_counter() - start) * 1000

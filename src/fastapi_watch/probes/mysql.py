@@ -11,6 +11,8 @@ from .base import BaseProbe
 class MySQLProbe(BaseProbe):
     """Health probe for MySQL / MariaDB using aiomysql.
 
+    Returns server version and the current number of connected threads.
+
     Install with: ``pip install fastapi-watch[mysql]``
 
     Accepts either a URL or explicit keyword arguments:
@@ -83,13 +85,30 @@ class MySQLProbe(BaseProbe):
                 db=self._db,
                 connect_timeout=self._timeout,
             )
+            details: dict = {}
             async with conn.cursor() as cur:
-                await cur.execute("SELECT 1")
+                await cur.execute("SELECT VERSION()")
+                row = await cur.fetchone()
+                details["version"] = row[0] if row else None
+
+                await cur.execute("SHOW STATUS LIKE 'Threads_connected'")
+                row = await cur.fetchone()
+                details["connected_threads"] = int(row[1]) if row else None
+
+                await cur.execute("SHOW STATUS LIKE 'Uptime'")
+                row = await cur.fetchone()
+                details["uptime_seconds"] = int(row[1]) if row else None
+
+                await cur.execute("SHOW STATUS LIKE 'Max_used_connections'")
+                row = await cur.fetchone()
+                details["max_used_connections"] = int(row[1]) if row else None
+
             latency = (time.perf_counter() - start) * 1000
             return ProbeResult(
                 name=self.name,
                 status=ProbeStatus.HEALTHY,
                 latency_ms=round(latency, 2),
+                details=details,
             )
         except Exception as exc:
             latency = (time.perf_counter() - start) * 1000

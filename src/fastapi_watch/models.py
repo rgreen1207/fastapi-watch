@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
@@ -16,6 +16,7 @@ class ProbeResult(BaseModel):
     status: ProbeStatus
     latency_ms: float = 0.0
     error: Optional[str] = None
+    details: Optional[dict[str, Any]] = None
 
     @property
     def is_healthy(self) -> bool:
