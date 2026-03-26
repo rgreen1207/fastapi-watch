@@ -70,10 +70,13 @@ class HealthRegistry:
         tags: list[str] | None = None,
         poll_interval_ms: int | None = 60_000,
         logger: logging.Logger | None = None,
+        grace_period_ms: int = 0,
     ) -> None:
         self.app = app
         self.prefix = prefix
         self._logger = logger
+        self._grace_period_ms: int = max(0, grace_period_ms)
+        self._start_time: datetime = datetime.now(timezone.utc)
         self._probes: list[tuple[BaseProbe, bool]] = []  # (probe, critical)
         self._poll_interval_ms: int | None = self._set_interval(poll_interval_ms)
         self._cached_results: list[ProbeResult] | None = None
@@ -224,6 +227,12 @@ class HealthRegistry:
         if self._active_connections == 0:
             self._cancel_poll_task()
 
+    def _in_grace_period(self) -> bool:
+        if not self._grace_period_ms:
+            return False
+        elapsed_ms = (datetime.now(timezone.utc) - self._start_time).total_seconds() * 1000
+        return elapsed_ms < self._grace_period_ms
+
     def _cancel_poll_task(self) -> None:
         if self._poll_task is not None:
             self._poll_task.cancel()
@@ -298,6 +307,8 @@ class HealthRegistry:
             description="Returns 200 if all probes pass, 503 if any fail.",
         )
         async def readiness() -> JSONResponse:
+            if registry._in_grace_period():
+                return JSONResponse({"status": "starting"}, status_code=503)
             results = await registry._get_results()
             report = HealthReport.from_results(results, checked_at=registry._last_checked_at)
             code = 200 if report.status == ProbeStatus.HEALTHY else 503

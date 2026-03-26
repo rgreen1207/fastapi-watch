@@ -120,6 +120,22 @@ registry.add(PostgreSQLProbe(url="postgresql://..."), critical=True)
 
 Non-critical probes always appear in `/health/status` with their real result and a `"critical": false` field. They simply don't affect the overall `status`.
 
+### Startup grace period
+
+Pass `grace_period_ms` to hold `/health/ready` in a `503 {"status": "starting"}` state for a fixed window after the registry is created. This prevents Kubernetes or a load balancer from routing traffic before the application has had time to warm up, without requiring all probes to pass immediately on boot.
+
+```python
+registry = HealthRegistry(
+    app,
+    grace_period_ms=15_000,  # hold readiness for 15 s after startup
+)
+```
+
+- `/health/ready` returns `503 {"status": "starting"}` while the grace period is active.
+- `/health/status` and `/health/live` are **not** affected — they always reflect real probe results.
+- After the grace period expires, `/ready` resumes normal probe-based behaviour.
+- `grace_period_ms=0` (default) disables the grace period entirely.
+
 ### State-change callbacks
 
 React to probe status transitions in real time. Register one or more callbacks with `on_state_change()`; each receives the probe name, old status, and new status whenever a probe's result changes:
@@ -968,6 +984,7 @@ class CompositeRedisProbe(BaseProbe):
 | `tags` | `list[str]` | `["health"]` | OpenAPI tags applied to the health routes |
 | `poll_interval_ms` | `int \| None` | `60000` | How often (ms) to re-run probes while an SSE client is connected. `0` or `None` disables polling — each request or stream event runs probes on demand. Values below `1000` are clamped to `1000`. |
 | `logger` | `logging.Logger \| None` | `None` | Logger for warnings (e.g. clamped interval) and probe exception messages. Pass `None` to emit no logs. |
+| `grace_period_ms` | `int` | `0` | How long (ms) after startup to return `503 {"status": "starting"}` from `/ready`. `0` disables the grace period. |
 
 ### `HealthRegistry.add(probe, critical=True)`
 

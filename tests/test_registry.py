@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import pytest
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -778,3 +779,62 @@ async def test_multiple_callbacks_all_fired():
     probe._healthy = False
     await registry.run_all()
     assert counts == [1, 1]
+
+
+# ---------------------------------------------------------------------------
+# Startup grace period
+# ---------------------------------------------------------------------------
+
+
+def test_grace_period_ready_returns_503_starting():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None, grace_period_ms=60_000)
+    registry.add(MemoryProbe(name="mem"))
+    client = TestClient(app)
+    resp = client.get("/health/ready")
+    assert resp.status_code == 503
+    assert resp.json()["status"] == "starting"
+
+
+def test_grace_period_zero_does_not_block_readiness():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None, grace_period_ms=0)
+    registry.add(MemoryProbe(name="mem"))
+    client = TestClient(app)
+    resp = client.get("/health/ready")
+    assert resp.status_code == 200
+
+
+def test_grace_period_status_endpoint_not_affected():
+    """Grace period only blocks /ready — /status still returns real results."""
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None, grace_period_ms=60_000)
+    registry.add(MemoryProbe(name="mem"))
+    client = TestClient(app)
+    resp = client.get("/health/status")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "healthy"
+
+
+def test_grace_period_expired_allows_readiness():
+    from datetime import timedelta
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None, grace_period_ms=1_000)
+    registry.add(MemoryProbe(name="mem"))
+    # Backdate start_time so grace period appears expired
+    registry._start_time = datetime.now(timezone.utc) - timedelta(seconds=2)
+    client = TestClient(app)
+    resp = client.get("/health/ready")
+    assert resp.status_code == 200
+
+
+def test_in_grace_period_true_when_active():
+    app = FastAPI()
+    registry = HealthRegistry(app, grace_period_ms=60_000)
+    assert registry._in_grace_period() is True
+
+
+def test_in_grace_period_false_when_zero():
+    app = FastAPI()
+    registry = HealthRegistry(app, grace_period_ms=0)
+    assert registry._in_grace_period() is False
