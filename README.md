@@ -4,6 +4,8 @@ Structured health and readiness check system for [FastAPI](https://fastapi.tiang
 
 Add `/health/live`, `/health/ready`, and `/health/status` endpoints to any FastAPI app with a single registry call. All probes run concurrently, so a slow dependency never blocks the others. Each probe returns rich service-specific details alongside the pass/fail result.
 
+Connect a browser or monitoring tool to the SSE streaming endpoints (`/health/ready/stream`, `/health/status/stream`) and receive live updates as long as you stay connected — the background poll loop starts automatically on the first connection and stops when the last client disconnects.
+
 ---
 
 ## Table of contents
@@ -11,6 +13,7 @@ Add `/health/live`, `/health/ready`, and `/health/status` endpoints to any FastA
 - [Installation](#installation)
 - [How it works](#how-it-works)
 - [Endpoints](#endpoints)
+- [Live streaming](#live-streaming)
 - [Response format](#response-format)
 - [Probe details](#probe-details)
 - [Watching PostgreSQL](#watching-postgresql)
@@ -63,24 +66,29 @@ pip install fastapi-watch[postgres,redis,rabbitmq]
 
 ## How it works
 
-Create a `HealthRegistry`, attach it to your FastAPI `app`, and call `.add()` for each service you want to monitor. The registry mounts the three health endpoints automatically and runs every probe concurrently on each request.
+Create a `HealthRegistry`, attach it to your FastAPI `app`, and call `.add()` for each service you want to monitor. The registry mounts all health endpoints automatically.
 
 ```python
+import logging
 from fastapi import FastAPI
 from fastapi_watch import HealthRegistry
 
 app = FastAPI()
-registry = HealthRegistry(app)
+registry = HealthRegistry(
+    app,
+    poll_interval_ms=60_000,          # re-run probes every 60 s while streaming
+    logger=logging.getLogger(__name__) # optional — omit to silence all logging
+)
 ```
 
-Add probes individually, as a list, or chain calls. Adding the same instance twice is a no-op.
+Add probes one at a time with `add()`, or pass a list with `add_probes()`. Both methods return `self` for chaining. Adding the same instance twice is a no-op.
 
 ```python
 # Single probe
 registry.add(probe_a)
 
 # Multiple probes in one call
-registry.add([probe_a, probe_b, probe_c])
+registry.add_probes([probe_a, probe_b, probe_c])
 
 # Chained
 registry.add(probe_a).add(probe_b).add(probe_c)
@@ -88,6 +96,13 @@ registry.add(probe_a).add(probe_b).add(probe_c)
 # Duplicate ignored — probe_a is only registered once
 registry.add(probe_a)
 registry.add(probe_a)
+```
+
+You can change the poll interval at any point after startup:
+
+```python
+registry.set_poll_interval(30_000)   # switch to every 30 s
+registry.set_poll_interval(0)        # disable polling (single-fetch mode)
 ```
 
 ---
@@ -99,13 +114,69 @@ registry.add(probe_a)
 | `GET /health/live` | **Liveness** — is the process alive? | `200 OK` | never fails |
 | `GET /health/ready` | **Readiness** — are all probes passing? | `200 OK` | `503 Service Unavailable` |
 | `GET /health/status` | **Status** — full detail on every probe | `200 OK` | `207 Multi-Status` |
+| `GET /health/ready/stream` | **Readiness stream** — SSE; polls while connected | `200 OK` | stream of events |
+| `GET /health/status/stream` | **Status stream** — SSE; polls while connected | `200 OK` | stream of events |
 
 The prefix defaults to `/health` and can be changed:
 
 ```python
 registry = HealthRegistry(app, prefix="/ops/health")
 # → /ops/health/live, /ops/health/ready, /ops/health/status
+# → /ops/health/ready/stream, /ops/health/status/stream
 ```
+
+---
+
+## Live streaming
+
+The two streaming endpoints (`/health/ready/stream`, `/health/status/stream`) use [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) (SSE) to push probe results to connected clients at the configured `poll_interval_ms`.
+
+**The poll loop is demand-driven** — it starts when the first SSE client connects and stops automatically when the last one disconnects. No background work is done when nobody is watching.
+
+Each event is a JSON-encoded health report on a `data:` line:
+
+```
+data: {"status": "healthy", "probes": [...]}
+
+data: {"status": "unhealthy", "probes": [...]}
+```
+
+### Connecting from JavaScript
+
+```js
+const es = new EventSource('/health/status/stream');
+
+es.onmessage = (event) => {
+    const report = JSON.parse(event.data);
+    console.log(report.status, report.probes);
+};
+```
+
+### Connecting with curl
+
+```bash
+curl -N http://localhost:8000/health/status/stream
+```
+
+### Poll interval
+
+```python
+# Default — poll every 60 seconds while a client is connected
+registry = HealthRegistry(app)
+
+# Custom interval
+registry = HealthRegistry(app, poll_interval_ms=10_000)  # every 10 s
+
+# Minimum enforced interval is 1000 ms; lower values are clamped
+registry = HealthRegistry(app, poll_interval_ms=500)     # → 1000 ms
+
+# Disable polling — streaming endpoints return one result then close
+registry = HealthRegistry(app, poll_interval_ms=None)
+```
+
+### Regular GET endpoints and caching
+
+The regular `GET /health/ready` and `GET /health/status` endpoints always respond immediately. When SSE clients are connected, they serve the most recent cached probe results. When no streaming is active, they run the probes on demand.
 
 ---
 
@@ -803,12 +874,27 @@ class CompositeRedisProbe(BaseProbe):
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
 | `app` | `FastAPI` | required | The FastAPI application instance |
-| `prefix` | `str` | `"/health"` | URL prefix for all three endpoints |
+| `prefix` | `str` | `"/health"` | URL prefix for all endpoints |
 | `tags` | `list[str]` | `["health"]` | OpenAPI tags applied to the health routes |
+| `poll_interval_ms` | `int \| None` | `60000` | How often (ms) to re-run probes while an SSE client is connected. `0` or `None` disables polling — each request or stream event runs probes on demand. Values below `1000` are clamped to `1000`. |
+| `logger` | `logging.Logger \| None` | `None` | Logger for warnings (e.g. clamped interval) and probe exception messages. Pass `None` to emit no logs. |
 
-### `HealthRegistry.add(probe_or_list)`
+### `HealthRegistry.add(probe)`
 
-Accepts a single `BaseProbe` instance or a `list` of them. Returns `self` for chaining. Adding the same instance more than once is a no-op. Probes run concurrently on every request in the order they were added.
+Accepts a single `BaseProbe` instance. Returns `self` for chaining. Adding the same instance more than once is a no-op. Probes run concurrently on every request in the order they were added.
+
+### `HealthRegistry.add_probes(probes)`
+
+Accepts a `list` of `BaseProbe` instances. Returns `self` for chaining. Duplicate instances are silently skipped.
+
+### `HealthRegistry.set_poll_interval(ms)`
+
+Updates the poll interval at runtime. Pass `0` or `None` to switch to single-fetch mode. If SSE clients are currently connected the poll task is restarted immediately with the new interval.
+
+```python
+registry.set_poll_interval(30_000)   # every 30 s
+registry.set_poll_interval(0)        # disable — each event runs probes on demand
+```
 
 ### `HealthRegistry.run_all()`
 
