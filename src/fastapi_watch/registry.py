@@ -1,8 +1,5 @@
-from __future__ import annotations
-
 import asyncio
 import logging
-from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -45,9 +42,14 @@ class HealthRegistry:
         self._probes: list[BaseProbe] = []
         self._register_routes(tags or ["health"])
 
-    def add(self, probe: BaseProbe) -> "HealthRegistry":
-        """Add *probe* to the registry. Returns ``self`` for chaining."""
-        self._probes.append(probe)
+    def add(self, probes: BaseProbe | list[BaseProbe]) -> "HealthRegistry":
+        """Add a probe or list of probes to the registry. Returns ``self`` for chaining.
+
+        Silently skips any probe that is already registered (identity check).
+        """
+        for probe in (probes if isinstance(probes, list) else [probes]):
+            if probe not in self._probes:
+                self._probes.append(probe)
         return self
 
     async def run_all(self) -> list[ProbeResult]:

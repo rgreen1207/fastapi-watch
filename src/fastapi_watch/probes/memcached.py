@@ -1,7 +1,4 @@
-from __future__ import annotations
-
 import time
-from urllib.parse import urlparse
 
 from ..models import ProbeResult, ProbeStatus
 from .base import BaseProbe
