@@ -45,29 +45,31 @@ Connect a browser or monitoring tool to the SSE streaming endpoints (`/health/re
 
 Install only the extras you actually use. Nothing is pulled in by default beyond FastAPI and Pydantic.
 
+> **zsh users:** wrap the package name in quotes to prevent the shell from interpreting `[` and `]` as glob patterns.
+
 ```bash
 # Core package — includes the always-passing MemoryProbe, no other deps
 pip install fastapi-watch
 
 # Add individual service probes as needed
-pip install fastapi-watch[postgres]     # PostgreSQL        (asyncpg)
-pip install fastapi-watch[mysql]        # MySQL / MariaDB   (aiomysql)
-pip install fastapi-watch[sqlalchemy]   # Any SQLAlchemy 2.x async engine
-pip install fastapi-watch[redis]        # Redis             (aioredis)
-pip install fastapi-watch[memcached]    # Memcached         (aiomcache)
-pip install fastapi-watch[rabbitmq]     # RabbitMQ          (aio-pika + aiohttp)
-pip install fastapi-watch[kafka]        # Kafka             (aiokafka)
-pip install fastapi-watch[mongo]        # MongoDB           (motor)
-pip install fastapi-watch[http]         # HTTP endpoint     (aiohttp)
+pip install "fastapi-watch[postgres]"     # PostgreSQL        (asyncpg)
+pip install "fastapi-watch[mysql]"        # MySQL / MariaDB   (aiomysql)
+pip install "fastapi-watch[sqlalchemy]"   # Any SQLAlchemy 2.x async engine
+pip install "fastapi-watch[redis]"        # Redis             (redis)
+pip install "fastapi-watch[memcached]"    # Memcached         (aiomcache)
+pip install "fastapi-watch[rabbitmq]"     # RabbitMQ          (aio-pika + aiohttp)
+pip install "fastapi-watch[kafka]"        # Kafka             (aiokafka)
+pip install "fastapi-watch[mongo]"        # MongoDB           (motor)
+pip install "fastapi-watch[http]"         # HTTP endpoint     (aiohttp)
 
 # Or pull everything in one shot
-pip install fastapi-watch[all]
+pip install "fastapi-watch[all]"
 ```
 
 Multiple extras can be combined:
 
 ```bash
-pip install fastapi-watch[postgres,redis,rabbitmq]
+pip install "fastapi-watch[postgres,redis,rabbitmq]"
 ```
 
 ---
@@ -767,7 +769,7 @@ Every built-in probe populates the `details` field with service-specific metadat
 ### Watching PostgreSQL
 
 ```bash
-pip install fastapi-watch[postgres]
+pip install "fastapi-watch[postgres]"
 ```
 
 `PostgreSQLProbe` uses `asyncpg` directly — no SQLAlchemy required. It opens a connection, runs `SELECT version()` and a set of metadata queries concurrently, then closes the connection.
@@ -813,7 +815,7 @@ registry.add(PostgreSQLProbe(url="postgresql://...", timeout=2.0))
 ### Watching MySQL / MariaDB
 
 ```bash
-pip install fastapi-watch[mysql]
+pip install "fastapi-watch[mysql]"
 ```
 
 `MySQLProbe` accepts either a URL or explicit connection kwargs.
@@ -857,7 +859,7 @@ registry.add(MySQLProbe(host="localhost", port=3306, user="app_user", password="
 ### Watching Redis
 
 ```bash
-pip install fastapi-watch[redis]
+pip install "fastapi-watch[redis]"
 ```
 
 `RedisProbe` sends `PING`, then collects server info and scans key prefixes to build a cluster breakdown.
@@ -909,7 +911,7 @@ registry.add(RedisProbe(url="redis://localhost:6379/1", name="task-queue"))
 ### Watching Memcached
 
 ```bash
-pip install fastapi-watch[memcached]
+pip install "fastapi-watch[memcached]"
 ```
 
 `MemcachedProbe` calls `stats()` to verify the server is reachable and responding.
@@ -934,7 +936,7 @@ registry.add(MemcachedProbe(host="localhost", port=11211))
 ### Watching RabbitMQ
 
 ```bash
-pip install fastapi-watch[rabbitmq]
+pip install "fastapi-watch[rabbitmq]"
 ```
 
 `RabbitMQProbe` has two modes:
@@ -1046,7 +1048,7 @@ for i, host in enumerate(["rmq-1.internal", "rmq-2.internal", "rmq-3.internal"],
 ### Watching Kafka
 
 ```bash
-pip install fastapi-watch[kafka]
+pip install "fastapi-watch[kafka]"
 ```
 
 `KafkaProbe` starts an `AIOKafkaAdminClient` to verify broker reachability, then lists topics and describes the cluster.
@@ -1087,7 +1089,7 @@ registry.add(KafkaProbe(bootstrap_servers=["b1:9092", "b2:9092", "b3:9092"]))
 ### Watching MongoDB
 
 ```bash
-pip install fastapi-watch[mongo]
+pip install "fastapi-watch[mongo]"
 ```
 
 `MongoProbe` runs `serverStatus` on the `admin` database to collect version, connection pool stats, memory, and storage engine.
@@ -1130,7 +1132,7 @@ registry.add(MongoProbe(url="mongodb://localhost:27017"))
 ### Watching an HTTP endpoint
 
 ```bash
-pip install fastapi-watch[http]
+pip install "fastapi-watch[http]"
 ```
 
 `HttpProbe` performs an HTTP GET and checks the response status code.
@@ -1175,7 +1177,7 @@ registry.add(HttpProbe(url="https://api.payments.com/health", timeout=2.0, name=
 ### SQLAlchemy engine probe
 
 ```bash
-pip install fastapi-watch[sqlalchemy]
+pip install "fastapi-watch[sqlalchemy]"
 ```
 
 `SqlAlchemyProbe` reuses your existing `AsyncEngine` so no extra connections are opened. Works with any database SQLAlchemy supports (PostgreSQL, MySQL, SQLite, etc.).
