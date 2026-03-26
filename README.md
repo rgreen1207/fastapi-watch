@@ -84,11 +84,17 @@ registry = HealthRegistry(
 Add probes one at a time with `add()`, or pass a list with `add_probes()`. Both methods return `self` for chaining. Adding the same instance twice is a no-op.
 
 ```python
-# Single probe
+# Single probe (critical by default)
 registry.add(probe_a)
+
+# Non-critical — failure is reported but never causes a 503
+registry.add(probe_a, critical=False)
 
 # Multiple probes in one call
 registry.add_probes([probe_a, probe_b, probe_c])
+
+# All non-critical
+registry.add_probes([probe_a, probe_b], critical=False)
 
 # Chained
 registry.add(probe_a).add(probe_b).add(probe_c)
@@ -97,6 +103,22 @@ registry.add(probe_a).add(probe_b).add(probe_c)
 registry.add(probe_a)
 registry.add(probe_a)
 ```
+
+### Critical vs non-critical probes
+
+By default every probe is **critical** — a failing critical probe sets the overall `status` to `"unhealthy"` and causes `/health/ready` to return `503`.
+
+Mark a probe as non-critical when its failure should be visible in reports but shouldn't block traffic:
+
+```python
+# Cache is nice-to-have; don't fail readiness if it's down
+registry.add(RedisProbe(url="redis://localhost"), critical=False)
+
+# Database is essential; fail readiness if it's unreachable
+registry.add(PostgreSQLProbe(url="postgresql://..."), critical=True)
+```
+
+Non-critical probes always appear in `/health/status` with their real result and a `"critical": false` field. They simply don't affect the overall `status`.
 
 You can change the poll interval at any point after startup:
 
@@ -918,13 +940,15 @@ class CompositeRedisProbe(BaseProbe):
 | `poll_interval_ms` | `int \| None` | `60000` | How often (ms) to re-run probes while an SSE client is connected. `0` or `None` disables polling — each request or stream event runs probes on demand. Values below `1000` are clamped to `1000`. |
 | `logger` | `logging.Logger \| None` | `None` | Logger for warnings (e.g. clamped interval) and probe exception messages. Pass `None` to emit no logs. |
 
-### `HealthRegistry.add(probe)`
+### `HealthRegistry.add(probe, critical=True)`
 
 Accepts a single `BaseProbe` instance. Returns `self` for chaining. Adding the same instance more than once is a no-op. Probes run concurrently on every request in the order they were added.
 
-### `HealthRegistry.add_probes(probes)`
+`critical=True` (default) — a failing probe causes the overall status to be `"unhealthy"` and `/ready` to return `503`. Set `critical=False` to include the probe in reports without affecting readiness.
 
-Accepts a `list` of `BaseProbe` instances. Returns `self` for chaining. Duplicate instances are silently skipped.
+### `HealthRegistry.add_probes(probes, critical=True)`
+
+Accepts a `list` of `BaseProbe` instances. The `critical` flag applies to every probe in the list. Returns `self` for chaining. Duplicate instances are silently skipped.
 
 ### `HealthRegistry.set_poll_interval(ms)`
 
@@ -958,6 +982,7 @@ for r in results:
 |-------|------|-------------|
 | `name` | `str` | Probe identifier |
 | `status` | `ProbeStatus` | `"healthy"` or `"unhealthy"` |
+| `critical` | `bool` | `True` if the probe was registered as critical; affects overall status |
 | `latency_ms` | `float` | Duration of the check in milliseconds |
 | `error` | `str \| None` | Error message; only present on failure |
 | `details` | `dict \| None` | Service-specific metadata; see each probe's section above |

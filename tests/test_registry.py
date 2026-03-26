@@ -582,3 +582,84 @@ async def test_probe_timeout_does_not_affect_other_probes():
     by_name = {r.name: r for r in results}
     assert by_name["slow"].status == ProbeStatus.UNHEALTHY
     assert by_name["fast"].status == ProbeStatus.HEALTHY
+
+
+# ---------------------------------------------------------------------------
+# Per-probe severity (critical flag)
+# ---------------------------------------------------------------------------
+
+
+def test_non_critical_probe_failure_does_not_affect_readiness():
+    class FailingProbe(MemoryProbe):
+        async def check(self):
+            return ProbeResult(name=self.name, status=ProbeStatus.UNHEALTHY, error="down")
+
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.add(MemoryProbe(name="ok"))
+    registry.add(FailingProbe(name="non-critical"), critical=False)
+    client = TestClient(app)
+    resp = client.get("/health/ready")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "healthy"
+
+
+def test_critical_probe_failure_causes_503():
+    class FailingProbe(MemoryProbe):
+        async def check(self):
+            return ProbeResult(name=self.name, status=ProbeStatus.UNHEALTHY, error="down")
+
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.add(MemoryProbe(name="ok"))
+    registry.add(FailingProbe(name="critical"), critical=True)
+    client = TestClient(app)
+    resp = client.get("/health/ready")
+    assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_probe_result_includes_critical_flag():
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    registry.add(MemoryProbe(name="a"), critical=True)
+    registry.add(MemoryProbe(name="b"), critical=False)
+    results = await registry.run_all()
+    by_name = {r.name: r for r in results}
+    assert by_name["a"].critical is True
+    assert by_name["b"].critical is False
+
+
+def test_status_response_includes_critical_flag():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.add(MemoryProbe(name="mem"), critical=False)
+    client = TestClient(app)
+    data = client.get("/health/status").json()
+    assert data["probes"][0]["critical"] is False
+
+
+def test_non_critical_failure_still_appears_in_status():
+    class FailingProbe(MemoryProbe):
+        async def check(self):
+            return ProbeResult(name=self.name, status=ProbeStatus.UNHEALTHY, error="down")
+
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.add(FailingProbe(name="nc"), critical=False)
+    client = TestClient(app)
+    resp = client.get("/health/status")
+    # 200 because no critical probes failed, but probe is still reported
+    assert resp.status_code == 200
+    probes = resp.json()["probes"]
+    assert probes[0]["name"] == "nc"
+    assert probes[0]["status"] == "unhealthy"
+
+
+def test_add_probes_critical_flag_applied_to_all():
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    registry.add_probes([MemoryProbe(name="a"), MemoryProbe(name="b")], critical=False)
+    # Both should be stored as non-critical
+    for _, critical in registry._probes:
+        assert critical is False

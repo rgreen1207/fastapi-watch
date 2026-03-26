@@ -74,7 +74,7 @@ class HealthRegistry:
         self.app = app
         self.prefix = prefix
         self._logger = logger
-        self._probes: list[BaseProbe] = []
+        self._probes: list[tuple[BaseProbe, bool]] = []  # (probe, critical)
         self._poll_interval_ms: int | None = self._set_interval(poll_interval_ms)
         self._cached_results: list[ProbeResult] | None = None
         self._last_checked_at: datetime | None = None
@@ -84,22 +84,32 @@ class HealthRegistry:
 
         self._register_routes(tags or ["health"])
 
-    def add(self, probe: BaseProbe) -> "HealthRegistry":
+    def add(self, probe: BaseProbe, critical: bool = True) -> "HealthRegistry":
         """Add a single probe to the registry. Returns ``self`` for chaining.
+
+        Args:
+            probe: The probe to register.
+            critical: When ``True`` (default) a failing probe marks the overall
+                status as unhealthy.  Non-critical probes appear in reports but
+                do not affect ``/health/ready`` or the top-level ``status``.
 
         Silently skips the probe if it is already registered (identity check).
         """
-        if probe not in self._probes:
-            self._probes.append(probe)
+        if not any(p is probe for p, _ in self._probes):
+            self._probes.append((probe, critical))
         return self
 
-    def add_probes(self, probes: list[BaseProbe]) -> "HealthRegistry":
+    def add_probes(self, probes: list[BaseProbe], critical: bool = True) -> "HealthRegistry":
         """Add a list of probes to the registry. Returns ``self`` for chaining.
+
+        Args:
+            probes: Probes to register.
+            critical: Applies to all probes in the list.
 
         Silently skips any probe that is already registered (identity check).
         """
         for probe in probes:
-            self.add(probe)
+            self.add(probe, critical=critical)
         return self
 
     def set_poll_interval(self, ms: int | None) -> None:
@@ -134,7 +144,7 @@ class HealthRegistry:
         if not self._probes:
             return []
 
-        async def _safe_check(probe: BaseProbe) -> ProbeResult:
+        async def _safe_check(probe: BaseProbe, critical: bool) -> ProbeResult:
             try:
                 coro = probe.check()
                 result = (
@@ -142,17 +152,18 @@ class HealthRegistry:
                     if probe.timeout is not None
                     else await coro
                 )
-                return result
+                return result.model_copy(update={"critical": critical})
             except Exception as exc:
                 if self._logger:
                     self._logger.exception("Probe %r raised an exception", probe.name)
                 return ProbeResult(
                     name=probe.name,
                     status=ProbeStatus.UNHEALTHY,
+                    critical=critical,
                     error=f"{type(exc).__name__}: {exc}",
                 )
 
-        results = list(await asyncio.gather(*(_safe_check(p) for p in self._probes)))
+        results = list(await asyncio.gather(*(_safe_check(p, c) for p, c in self._probes)))
         self._last_checked_at = datetime.now(timezone.utc)
         return results
 
