@@ -75,15 +75,12 @@ class HealthRegistry:
         self._poll_interval_ms: int | None = _normalize_interval(poll_interval_ms)
         self._cached_results: list[ProbeResult] | None = None
         self._poll_task: asyncio.Task | None = None
+        self._cache_lock = asyncio.Lock()
 
         app.router.on_startup.append(self._start_polling)
         app.router.on_shutdown.append(self._stop_polling)
 
         self._register_routes(tags or ["health"])
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     def add(self, probes: BaseProbe | list[BaseProbe]) -> "HealthRegistry":
         """Add a probe or list of probes to the registry. Returns ``self`` for chaining.
@@ -108,23 +105,15 @@ class HealthRegistry:
         (or not, in single-fetch mode).
         """
         self._poll_interval_ms = _normalize_interval(ms)
-
-        # If switching to single-fetch mode, drop stale cached data.
         if self._poll_interval_ms is None:
             self._cached_results = None
-
-        # Cancel any running task regardless of new mode.
-        if self._poll_task is not None:
-            self._poll_task.cancel()
-            self._poll_task = None
-
-        # Start a new task only when we're in poll mode and the loop is live.
+        self._cancel_poll_task()
         if self._poll_interval_ms is not None:
             try:
                 loop = asyncio.get_running_loop()
                 self._poll_task = loop.create_task(self._poll_loop())
             except RuntimeError:
-                pass  # No running loop yet; will be started by the startup handler.
+                pass  # _start_polling will create the task on app startup.
 
     async def run_all(self) -> list[ProbeResult]:
         """Run all probes concurrently and return their results.
@@ -148,21 +137,22 @@ class HealthRegistry:
 
         return list(await asyncio.gather(*(_safe_check(p) for p in self._probes)))
 
-    # ------------------------------------------------------------------
-    # Internal polling machinery
-    # ------------------------------------------------------------------
-
     async def _start_polling(self) -> None:
         if self._poll_interval_ms is not None:
             self._poll_task = asyncio.create_task(self._poll_loop())
 
     async def _stop_polling(self) -> None:
-        if self._poll_task is not None:
-            self._poll_task.cancel()
+        task = self._poll_task
+        self._cancel_poll_task()
+        if task is not None:
             try:
-                await self._poll_task
+                await task
             except asyncio.CancelledError:
                 pass
+
+    def _cancel_poll_task(self) -> None:
+        if self._poll_task is not None:
+            self._poll_task.cancel()
             self._poll_task = None
 
     async def _poll_loop(self) -> None:
@@ -171,21 +161,12 @@ class HealthRegistry:
             await asyncio.sleep(self._poll_interval_ms / 1000)
 
     async def _get_results(self) -> list[ProbeResult]:
-        """Return results for the current HTTP request.
-
-        In polling mode the cached results from the last poll cycle are
-        returned (running fresh if the first cycle hasn't completed yet).
-        In single-fetch mode probes are run on every call.
-        """
-        if self._poll_interval_ms is not None:
+        if self._poll_interval_ms is None:
+            return await self.run_all()
+        async with self._cache_lock:
             if self._cached_results is None:
                 self._cached_results = await self.run_all()
             return self._cached_results
-        return await self.run_all()
-
-    # ------------------------------------------------------------------
-    # Route registration
-    # ------------------------------------------------------------------
 
     def _register_routes(self, tags: list[str]) -> None:
         registry = self
