@@ -1,9 +1,11 @@
+import asyncio
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from fastapi_watch import HealthRegistry
 from fastapi_watch.probes.memory import MemoryProbe
 from fastapi_watch.models import ProbeResult, ProbeStatus
+from fastapi_watch.registry import _normalize_interval
 
 
 @pytest.fixture
@@ -116,3 +118,159 @@ async def test_probe_exception_becomes_unhealthy_result():
     results = await registry.run_all()
     assert results[0].status == ProbeStatus.UNHEALTHY
     assert "RuntimeError" in results[0].error
+
+
+# ---------------------------------------------------------------------------
+# Polling: _normalize_interval
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("ms, expected", [
+    (None, None),
+    (0, None),
+    (500, 1000),
+    (999, 1000),
+    (1000, 1000),
+    (5000, 5000),
+    (60_000, 60_000),
+])
+def test_normalize_interval(ms, expected):
+    assert _normalize_interval(ms) == expected
+
+
+# ---------------------------------------------------------------------------
+# Polling: __init__ defaults and overrides
+# ---------------------------------------------------------------------------
+
+
+def test_default_poll_interval_is_60s():
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    assert registry._poll_interval_ms == 60_000
+
+
+def test_poll_interval_none_disables_polling():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    assert registry._poll_interval_ms is None
+
+
+def test_poll_interval_zero_disables_polling():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=0)
+    assert registry._poll_interval_ms is None
+
+
+def test_poll_interval_below_minimum_is_clamped():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=200)
+    assert registry._poll_interval_ms == 1000
+
+
+# ---------------------------------------------------------------------------
+# Polling: set_poll_interval
+# ---------------------------------------------------------------------------
+
+
+def test_set_poll_interval_updates_value():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.set_poll_interval(5000)
+    assert registry._poll_interval_ms == 5000
+
+
+def test_set_poll_interval_to_zero_clears_cache():
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    registry._cached_results = [ProbeResult(name="x", status=ProbeStatus.HEALTHY)]
+    registry.set_poll_interval(0)
+    assert registry._poll_interval_ms is None
+    assert registry._cached_results is None
+
+
+def test_set_poll_interval_below_minimum_is_clamped():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.set_poll_interval(100)
+    assert registry._poll_interval_ms == 1000
+
+
+# ---------------------------------------------------------------------------
+# Polling: single-fetch mode (poll_interval_ms=None) via HTTP
+# ---------------------------------------------------------------------------
+
+
+def test_single_fetch_mode_readiness():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.add(MemoryProbe(name="mem"))
+    client = TestClient(app)
+    resp = client.get("/health/ready")
+    assert resp.status_code == 200
+
+
+def test_single_fetch_mode_status():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.add(MemoryProbe(name="mem"))
+    client = TestClient(app)
+    resp = client.get("/health/status")
+    assert resp.status_code == 200
+    assert resp.json()["probes"][0]["name"] == "mem"
+
+
+# ---------------------------------------------------------------------------
+# Polling: background task caches results
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_populates_cache():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=60_000)
+    registry.add(MemoryProbe(name="mem"))
+
+    # Simulate startup then run the poll loop once manually.
+    registry._cached_results = await registry.run_all()
+    assert registry._cached_results is not None
+    assert registry._cached_results[0].name == "mem"
+
+
+@pytest.mark.asyncio
+async def test_get_results_uses_cache_in_poll_mode():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=60_000)
+
+    cached = [ProbeResult(name="cached", status=ProbeStatus.HEALTHY)]
+    registry._cached_results = cached
+
+    results = await registry._get_results()
+    assert results is cached
+
+
+@pytest.mark.asyncio
+async def test_get_results_runs_fresh_in_single_fetch_mode():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.add(MemoryProbe(name="fresh"))
+
+    results = await registry._get_results()
+    assert len(results) == 1
+    assert results[0].name == "fresh"
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_starts_and_stops_with_lifespan():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=1000)
+    registry.add(MemoryProbe(name="mem"))
+
+    with TestClient(app) as client:
+        # Startup event fires; polling task should be running.
+        assert registry._poll_task is not None
+        assert not registry._poll_task.done()
+        resp = client.get("/health/status")
+        assert resp.status_code == 200
+
+    # Shutdown event fires; task should be cancelled.
+    assert registry._poll_task is None
