@@ -1,5 +1,4 @@
 import time
-from typing import Optional
 from urllib.parse import urlparse
 
 from ..models import ProbeResult, ProbeStatus
@@ -37,7 +36,7 @@ class MySQLProbe(BaseProbe):
 
     def __init__(
         self,
-        url: Optional[str] = None,
+        url: str | None = None,
         *,
         host: str = "localhost",
         port: int = 3306,

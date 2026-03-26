@@ -770,7 +770,7 @@ Every built-in probe populates the `details` field with service-specific metadat
 pip install fastapi-watch[postgres]
 ```
 
-`PostgreSQLProbe` uses `asyncpg` directly — no SQLAlchemy required. It opens a connection, runs `SELECT 1` to verify the server is responsive, collects metadata, then closes the connection.
+`PostgreSQLProbe` uses `asyncpg` directly — no SQLAlchemy required. It opens a connection, runs `SELECT version()` and a set of metadata queries concurrently, then closes the connection.
 
 ```python
 from fastapi_watch.probes import PostgreSQLProbe

@@ -1,5 +1,4 @@
 import time
-from typing import Optional
 from urllib.parse import urlparse
 
 from ..models import ProbeResult, ProbeStatus
@@ -24,7 +23,7 @@ class HttpProbe(BaseProbe):
         self,
         url: str,
         timeout: float = 5.0,
-        name: Optional[str] = None,
+        name: str | None = None,
         expected_status: int = 200,
     ) -> None:
         self.url = url
