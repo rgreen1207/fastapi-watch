@@ -1,8 +1,10 @@
 import asyncio
+import json
 import logging
+from typing import AsyncGenerator, Callable
 
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from .models import HealthReport, ProbeResult, ProbeStatus
 from .probes.base import BaseProbe
@@ -37,19 +39,25 @@ class HealthRegistry:
 
     Mounted routes (all customisable via *prefix*):
 
-    - ``GET /health/live``   — liveness; always 200
-    - ``GET /health/ready``  — readiness; 200 if all probes pass, 503 otherwise
-    - ``GET /health/status`` — full probe detail; 200 / 207 (Multi-Status)
+    - ``GET /health/live``          — liveness; always 200
+    - ``GET /health/ready``         — readiness; 200 if all probes pass, 503 otherwise
+    - ``GET /health/status``        — full probe detail; 200 / 207 (Multi-Status)
+    - ``GET /health/ready/stream``  — SSE stream of readiness; polls while connected
+    - ``GET /health/status/stream`` — SSE stream of full probe detail; polls while connected
+
+    The background poll loop only runs while at least one SSE client is connected.
+    Regular ``GET`` endpoints serve from the last cached result when available,
+    or run probes on demand if no stream has been active.
 
     Args:
         app: FastAPI application.
         prefix: URL prefix for health routes (default ``/health``).
-        tags: OpenAPI tags applied to all three routes.
-        poll_interval_ms: How often (in milliseconds) to re-run all probes in
-            the background and cache the results.  Defaults to ``60000`` (60 s).
-            Pass ``0`` or ``None`` to disable polling — each HTTP request will
-            run the probes on demand.  Values between 1 and 999 are clamped to
-            1000 ms.
+        tags: OpenAPI tags applied to all routes.
+        poll_interval_ms: How often (in milliseconds) to re-run all probes while
+            a streaming client is connected.  Defaults to ``60000`` (60 s).
+            Pass ``0`` or ``None`` to disable polling — each request will run
+            probes on demand and streaming endpoints return a single result then
+            close.  Values between 1 and 999 are clamped to 1000 ms.
 
     Example::
 
@@ -57,7 +65,7 @@ class HealthRegistry:
         registry.add(RedisProbe(url="redis://localhost"))
         registry.add(HttpProbe(url="https://api.example.com/health"))
 
-        # Change the interval at runtime (e.g. from a config endpoint):
+        # Change the interval at runtime:
         registry.set_poll_interval(30_000)   # every 30 s
         registry.set_poll_interval(0)        # back to single-fetch mode
     """
@@ -75,10 +83,8 @@ class HealthRegistry:
         self._poll_interval_ms: int | None = _normalize_interval(poll_interval_ms)
         self._cached_results: list[ProbeResult] | None = None
         self._poll_task: asyncio.Task | None = None
+        self._active_connections: int = 0
         self._cache_lock = asyncio.Lock()
-
-        app.router.on_startup.append(self._start_polling)
-        app.router.on_shutdown.append(self._stop_polling)
 
         self._register_routes(tags or ["health"])
 
@@ -97,23 +103,23 @@ class HealthRegistry:
 
         Args:
             ms: New interval in milliseconds.  Pass ``0`` or ``None`` to switch
-                to single-fetch mode (probes run on each HTTP request).  Values
-                between 1 and 999 are clamped to 1000 ms.
+                to single-fetch mode.  Values between 1 and 999 are clamped to
+                1000 ms.
 
-        If the application event loop is already running the change takes effect
-        immediately: the old polling task is cancelled and a new one is started
-        (or not, in single-fetch mode).
+        If streaming clients are connected the poll task is restarted immediately
+        with the new interval.  If polling is disabled the task is cancelled and
+        the cache is cleared.
         """
         self._poll_interval_ms = _normalize_interval(ms)
         if self._poll_interval_ms is None:
             self._cached_results = None
-        self._cancel_poll_task()
-        if self._poll_interval_ms is not None:
+            self._cancel_poll_task()
+        elif self._active_connections > 0:
+            self._cancel_poll_task()
             try:
-                loop = asyncio.get_running_loop()
-                self._poll_task = loop.create_task(self._poll_loop())
+                self._poll_task = asyncio.get_running_loop().create_task(self._poll_loop())
             except RuntimeError:
-                pass  # _start_polling will create the task on app startup.
+                pass
 
     async def run_all(self) -> list[ProbeResult]:
         """Run all probes concurrently and return their results.
@@ -137,18 +143,15 @@ class HealthRegistry:
 
         return list(await asyncio.gather(*(_safe_check(p) for p in self._probes)))
 
-    async def _start_polling(self) -> None:
-        if self._poll_interval_ms is not None:
+    async def _on_connect(self) -> None:
+        self._active_connections += 1
+        if self._active_connections == 1 and self._poll_interval_ms is not None:
             self._poll_task = asyncio.create_task(self._poll_loop())
 
-    async def _stop_polling(self) -> None:
-        task = self._poll_task
-        self._cancel_poll_task()
-        if task is not None:
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+    async def _on_disconnect(self) -> None:
+        self._active_connections -= 1
+        if self._active_connections == 0:
+            self._cancel_poll_task()
 
     def _cancel_poll_task(self) -> None:
         if self._poll_task is not None:
@@ -161,12 +164,47 @@ class HealthRegistry:
             await asyncio.sleep(self._poll_interval_ms / 1000)
 
     async def _get_results(self) -> list[ProbeResult]:
+        """Serve cached results for regular GET endpoints, running fresh if needed."""
         if self._poll_interval_ms is None:
             return await self.run_all()
+        if self._cached_results is not None:
+            return self._cached_results
         async with self._cache_lock:
             if self._cached_results is None:
                 self._cached_results = await self.run_all()
             return self._cached_results
+
+    async def _wait_for_next_poll(self, request: Request) -> bool:
+        """Sleep for poll_interval_ms, checking for client disconnect every 500 ms.
+
+        Returns True if the client disconnected before the interval elapsed.
+        """
+        deadline = asyncio.get_event_loop().time() + self._poll_interval_ms / 1000
+        while True:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(0.5, remaining))
+            if await request.is_disconnected():
+                return True
+
+    async def _event_stream(
+        self,
+        request: Request,
+        make_report: Callable[[list[ProbeResult]], dict],
+    ) -> AsyncGenerator[str, None]:
+        """Async generator that yields SSE events while the client is connected."""
+        await self._on_connect()
+        try:
+            while True:
+                results = self._cached_results or await self.run_all()
+                yield f"data: {json.dumps(make_report(results))}\n\n"
+                if self._poll_interval_ms is None:
+                    return
+                if await self._wait_for_next_poll(request):
+                    return
+        finally:
+            await self._on_disconnect()
 
     def _register_routes(self, tags: list[str]) -> None:
         registry = self
@@ -207,3 +245,41 @@ class HealthRegistry:
             report = HealthReport.from_results(results)
             code = 200 if report.status == ProbeStatus.HEALTHY else 207
             return JSONResponse(report.model_dump(), status_code=code)
+
+        @self.app.get(
+            f"{prefix}/ready/stream",
+            tags=tags,
+            summary="Readiness stream",
+            description=(
+                "SSE stream of readiness. Polls probes while connected; "
+                "poll loop stops when the last client disconnects."
+            ),
+        )
+        async def readiness_stream(request: Request) -> StreamingResponse:
+            def make_report(results: list[ProbeResult]) -> dict:
+                return HealthReport.from_results(results).model_dump()
+
+            return StreamingResponse(
+                registry._event_stream(request, make_report),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
+        @self.app.get(
+            f"{prefix}/status/stream",
+            tags=tags,
+            summary="Health status stream",
+            description=(
+                "SSE stream of full probe results. Polls probes while connected; "
+                "poll loop stops when the last client disconnects."
+            ),
+        )
+        async def status_stream(request: Request) -> StreamingResponse:
+            def make_report(results: list[ProbeResult]) -> dict:
+                return HealthReport.from_results(results).model_dump()
+
+            return StreamingResponse(
+                registry._event_stream(request, make_report),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )

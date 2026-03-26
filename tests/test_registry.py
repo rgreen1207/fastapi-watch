@@ -1,10 +1,12 @@
 import asyncio
+import json
 import pytest
+from unittest.mock import AsyncMock
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from fastapi_watch import HealthRegistry
 from fastapi_watch.probes.memory import MemoryProbe
-from fastapi_watch.models import ProbeResult, ProbeStatus
+from fastapi_watch.models import HealthReport, ProbeResult, ProbeStatus
 from fastapi_watch.registry import _normalize_interval
 
 
@@ -259,18 +261,119 @@ async def test_get_results_runs_fresh_in_single_fetch_mode():
     assert results[0].name == "fresh"
 
 
+# ---------------------------------------------------------------------------
+# Polling: demand-driven via SSE connections
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.asyncio
-async def test_poll_loop_starts_and_stops_with_lifespan():
+async def test_poll_task_starts_on_first_connect():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=60_000)
+    registry.add(MemoryProbe(name="mem"))
+
+    assert registry._poll_task is None
+    await registry._on_connect()
+    assert registry._poll_task is not None
+    assert not registry._poll_task.done()
+    registry._cancel_poll_task()
+
+
+@pytest.mark.asyncio
+async def test_poll_task_stops_when_last_client_disconnects():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=60_000)
+    registry.add(MemoryProbe(name="mem"))
+
+    await registry._on_connect()
+    await registry._on_connect()
+    assert registry._poll_task is not None
+
+    await registry._on_disconnect()
+    assert registry._poll_task is not None  # still one client connected
+
+    await registry._on_disconnect()
+    assert registry._poll_task is None  # last client gone
+
+
+@pytest.mark.asyncio
+async def test_poll_task_not_started_when_interval_is_none():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.add(MemoryProbe(name="mem"))
+
+    await registry._on_connect()
+    assert registry._poll_task is None
+    await registry._on_disconnect()
+
+
+@pytest.mark.asyncio
+async def test_set_poll_interval_restarts_task_when_connections_active():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=60_000)
+    registry.add(MemoryProbe(name="mem"))
+
+    await registry._on_connect()
+    original_task = registry._poll_task
+    registry.set_poll_interval(5_000)
+    assert registry._poll_task is not original_task
+    assert registry._poll_interval_ms == 5_000
+    registry._cancel_poll_task()
+    await registry._on_disconnect()
+
+
+# ---------------------------------------------------------------------------
+# Polling: SSE HTTP endpoints
+# ---------------------------------------------------------------------------
+
+
+def test_sse_endpoints_single_fetch_mode():
+    """In single-fetch mode the generator returns after one event so the stream
+    closes naturally — safe to consume fully with TestClient."""
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.add(MemoryProbe(name="mem"))
+    client = TestClient(app)
+
+    for path in ("/health/status/stream", "/health/ready/stream"):
+        resp = client.get(path)
+        assert resp.status_code == 200
+        assert "text/event-stream" in resp.headers["content-type"]
+        data_lines = [l for l in resp.text.splitlines() if l.startswith("data:")]
+        assert len(data_lines) == 1
+        data = json.loads(data_lines[0][len("data:"):].strip())
+        assert "status" in data
+
+
+@pytest.mark.asyncio
+async def test_event_stream_generator_yields_result_and_stops_on_disconnect():
+    """Test the SSE generator directly: verify it yields probe data and cleans
+    up when the mocked request reports a disconnect."""
     app = FastAPI()
     registry = HealthRegistry(app, poll_interval_ms=1000)
     registry.add(MemoryProbe(name="mem"))
 
-    with TestClient(app) as client:
-        # Startup event fires; polling task should be running.
-        assert registry._poll_task is not None
-        assert not registry._poll_task.done()
-        resp = client.get("/health/status")
-        assert resp.status_code == 200
+    disconnect_after = 2
+    call_count = 0
 
-    # Shutdown event fires; task should be cancelled.
+    async def is_disconnected() -> bool:
+        nonlocal call_count
+        call_count += 1
+        return call_count >= disconnect_after
+
+    request = AsyncMock()
+    request.is_disconnected = is_disconnected
+
+    def make_report(results: list) -> dict:
+        return HealthReport.from_results(results).model_dump()
+
+    events = []
+    async for chunk in registry._event_stream(request, make_report):
+        events.append(chunk)
+
+    assert len(events) >= 1
+    assert events[0].startswith("data:")
+    payload = json.loads(events[0][len("data:"):].strip().rstrip("\n"))
+    assert payload["status"] == "healthy"
+    assert registry._active_connections == 0
     assert registry._poll_task is None
