@@ -5,10 +5,14 @@ on:
     tags:
       - "v*.*.*"
 
+permissions: {}
+
 jobs:
   test:
     name: Run tests
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
@@ -27,6 +31,8 @@ jobs:
     name: Build distribution
     needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
@@ -53,6 +59,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
+      contents: read
       id-token: write
 
     steps:
