@@ -5,7 +5,7 @@ from .base import BaseProbe
 
 
 class RedisProbe(BaseProbe):
-    """Health probe for Redis using aioredis.
+    """Health probe for Redis using redis[asyncio].
 
     Returns server version, uptime, memory usage, connected clients,
     total key count, and a per-prefix cluster breakdown with key counts
@@ -20,7 +20,7 @@ class RedisProbe(BaseProbe):
 
     async def check(self) -> ProbeResult:
         try:
-            import aioredis
+            from redis.asyncio import from_url
         except ImportError as exc:
             raise ImportError(
                 "Install fastapi-watch[redis] to use RedisProbe."
@@ -29,7 +29,7 @@ class RedisProbe(BaseProbe):
         start = time.perf_counter()
         redis = None
         try:
-            redis = await aioredis.from_url(self.url, decode_responses=True)
+            redis = await from_url(self.url, decode_responses=True)
             await redis.ping()
             latency = (time.perf_counter() - start) * 1000
 
