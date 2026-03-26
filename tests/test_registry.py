@@ -525,3 +525,60 @@ def test_checked_at_none_before_first_run():
     app = FastAPI()
     registry = HealthRegistry(app)
     assert registry._last_checked_at is None
+
+
+# ---------------------------------------------------------------------------
+# Per-probe timeout
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_probe_timeout_becomes_unhealthy():
+    class SlowProbe(MemoryProbe):
+        timeout = 0.1  # 100 ms
+
+        def __init__(self):
+            super().__init__(name="slow")
+
+        async def check(self):
+            await asyncio.sleep(10)
+            return await super().check()
+
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    registry.add(SlowProbe())
+    results = await registry.run_all()
+    assert results[0].status == ProbeStatus.UNHEALTHY
+    assert "TimeoutError" in results[0].error
+
+
+@pytest.mark.asyncio
+async def test_probe_no_timeout_by_default():
+    """Probe with no timeout set completes normally."""
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    registry.add(MemoryProbe(name="mem"))
+    results = await registry.run_all()
+    assert results[0].status == ProbeStatus.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_probe_timeout_does_not_affect_other_probes():
+    class SlowProbe(MemoryProbe):
+        timeout = 0.1
+
+        def __init__(self):
+            super().__init__(name="slow")
+
+        async def check(self):
+            await asyncio.sleep(10)
+            return await super().check()
+
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    registry.add(SlowProbe())
+    registry.add(MemoryProbe(name="fast"))
+    results = await registry.run_all()
+    by_name = {r.name: r for r in results}
+    assert by_name["slow"].status == ProbeStatus.UNHEALTHY
+    assert by_name["fast"].status == ProbeStatus.HEALTHY

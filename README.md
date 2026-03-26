@@ -807,6 +807,33 @@ class S3BucketProbe(BaseProbe):
 registry.add(S3BucketProbe(bucket="my-app-uploads", region="eu-west-1"))
 ```
 
+### Per-probe timeout
+
+Set a `timeout` (in seconds) on any probe. If the check doesn't complete within that time it is recorded as unhealthy without blocking other probes — all probes still run concurrently.
+
+```python
+class MyServiceProbe(BaseProbe):
+    name = "my-service"
+    timeout = 5.0  # fail after 5 seconds
+
+    async def check(self) -> ProbeResult:
+        ok = await call_my_service()
+        return ProbeResult(
+            name=self.name,
+            status=ProbeStatus.HEALTHY if ok else ProbeStatus.UNHEALTHY,
+        )
+```
+
+Or set it on an instance:
+
+```python
+probe = MyServiceProbe()
+probe.timeout = 2.0
+registry.add(probe)
+```
+
+Timed-out probes produce an unhealthy result with `error: "TimeoutError: "`. `timeout = None` (the default) means no limit.
+
 ### Composite probe
 
 Report unhealthy only when both Redis nodes are down simultaneously:
@@ -917,6 +944,13 @@ results = await registry.run_all()
 for r in results:
     print(r.name, r.status, r.details)
 ```
+
+### `BaseProbe`
+
+| Attribute | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `name` | `str` | `"unnamed"` | Label used in health reports |
+| `timeout` | `float \| None` | `None` | Per-probe timeout in seconds. If the check doesn't complete within this time it is marked unhealthy. `None` means no limit. |
 
 ### `ProbeResult`
 

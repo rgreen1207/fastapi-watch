@@ -136,7 +136,13 @@ class HealthRegistry:
 
         async def _safe_check(probe: BaseProbe) -> ProbeResult:
             try:
-                return await probe.check()
+                coro = probe.check()
+                result = (
+                    await asyncio.wait_for(coro, timeout=probe.timeout)
+                    if probe.timeout is not None
+                    else await coro
+                )
+                return result
             except Exception as exc:
                 if self._logger:
                     self._logger.exception("Probe %r raised an exception", probe.name)
