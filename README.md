@@ -136,9 +136,9 @@ The two streaming endpoints (`/health/ready/stream`, `/health/status/stream`) us
 Each event is a JSON-encoded health report on a `data:` line:
 
 ```
-data: {"status": "healthy", "probes": [...]}
+data: {"status": "healthy", "checked_at": "2024-06-01T12:00:00.123456+00:00", "probes": [...]}
 
-data: {"status": "unhealthy", "probes": [...]}
+data: {"status": "unhealthy", "checked_at": "2024-06-01T12:00:05.456789+00:00", "probes": [...]}
 ```
 
 ### Connecting from JavaScript
@@ -182,7 +182,17 @@ The regular `GET /health/ready` and `GET /health/status` endpoints always respon
 
 ## Response format
 
-Every probe result has the same base shape:
+Every health report includes a top-level `checked_at` timestamp (ISO 8601, UTC) recording when the last probe run completed.
+
+**Health report fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `status` | `"healthy"` \| `"unhealthy"` | Overall pass/fail |
+| `checked_at` | `string` \| `null` | UTC ISO 8601 timestamp of the last probe run; `null` before the first run |
+| `probes` | `array` | Individual probe results |
+
+**Probe result fields:**
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -197,6 +207,7 @@ Every probe result has the same base shape:
 ```json
 {
   "status": "healthy",
+  "checked_at": "2024-06-01T12:00:00.123456+00:00",
   "probes": [
     {
       "name": "postgresql",
@@ -234,6 +245,7 @@ Every probe result has the same base shape:
 ```json
 {
   "status": "unhealthy",
+  "checked_at": "2024-06-01T12:00:00.123456+00:00",
   "probes": [
     { "name": "postgresql", "status": "healthy",   "latency_ms": 1.8, "details": { ... } },
     { "name": "redis",      "status": "unhealthy", "latency_ms": 5002.1, "error": "Connection refused" }

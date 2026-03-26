@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from datetime import datetime, timezone
 from typing import AsyncGenerator, Callable
 
 from fastapi import FastAPI, Request
@@ -76,6 +77,7 @@ class HealthRegistry:
         self._probes: list[BaseProbe] = []
         self._poll_interval_ms: int | None = self._set_interval(poll_interval_ms)
         self._cached_results: list[ProbeResult] | None = None
+        self._last_checked_at: datetime | None = None
         self._poll_task: asyncio.Task | None = None
         self._active_connections: int = 0
         self._cache_lock = asyncio.Lock()
@@ -144,7 +146,9 @@ class HealthRegistry:
                     error=f"{type(exc).__name__}: {exc}",
                 )
 
-        return list(await asyncio.gather(*(_safe_check(p) for p in self._probes)))
+        results = list(await asyncio.gather(*(_safe_check(p) for p in self._probes)))
+        self._last_checked_at = datetime.now(timezone.utc)
+        return results
 
     def _set_interval(self, ms: int | None) -> int | None:
         """Normalize a poll interval and warn if it was clamped."""
@@ -243,9 +247,9 @@ class HealthRegistry:
         )
         async def readiness() -> JSONResponse:
             results = await registry._get_results()
-            report = HealthReport.from_results(results)
+            report = HealthReport.from_results(results, checked_at=registry._last_checked_at)
             code = 200 if report.status == ProbeStatus.HEALTHY else 503
-            return JSONResponse(report.model_dump(), status_code=code)
+            return JSONResponse(report.model_dump(mode="json"), status_code=code)
 
         @self.app.get(
             f"{prefix}/status",
@@ -258,12 +262,12 @@ class HealthRegistry:
         )
         async def health_status() -> JSONResponse:
             results = await registry._get_results()
-            report = HealthReport.from_results(results)
+            report = HealthReport.from_results(results, checked_at=registry._last_checked_at)
             code = 200 if report.status == ProbeStatus.HEALTHY else 207
-            return JSONResponse(report.model_dump(), status_code=code)
+            return JSONResponse(report.model_dump(mode="json"), status_code=code)
 
         def _make_sse_report(results: list[ProbeResult]) -> dict:
-            return HealthReport.from_results(results).model_dump()
+            return HealthReport.from_results(results, checked_at=registry._last_checked_at).model_dump(mode="json")
 
         sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 

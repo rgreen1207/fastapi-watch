@@ -460,7 +460,7 @@ async def test_event_stream_generator_yields_result_and_stops_on_disconnect():
     request.is_disconnected = is_disconnected
 
     def make_report(results: list) -> dict:
-        return HealthReport.from_results(results).model_dump()
+        return HealthReport.from_results(results).model_dump(mode="json")
 
     events = []
     async for chunk in registry._event_stream(request, make_report):
@@ -472,3 +472,56 @@ async def test_event_stream_generator_yields_result_and_stops_on_disconnect():
     assert payload["status"] == "healthy"
     assert registry._active_connections == 0
     assert registry._poll_task is None
+
+
+# ---------------------------------------------------------------------------
+# last_checked_at timestamp
+# ---------------------------------------------------------------------------
+
+
+def test_status_response_includes_checked_at():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.add(MemoryProbe(name="mem"))
+    client = TestClient(app)
+    resp = client.get("/health/status")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "checked_at" in data
+    assert data["checked_at"] is not None
+
+
+def test_ready_response_includes_checked_at():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.add(MemoryProbe(name="mem"))
+    client = TestClient(app)
+    resp = client.get("/health/ready")
+    assert resp.status_code == 200
+    assert resp.json()["checked_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_last_checked_at_set_after_run_all():
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    registry.add(MemoryProbe(name="mem"))
+    assert registry._last_checked_at is None
+    await registry.run_all()
+    assert registry._last_checked_at is not None
+
+
+@pytest.mark.asyncio
+async def test_last_checked_at_is_utc():
+    from datetime import timezone as tz
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    registry.add(MemoryProbe(name="mem"))
+    await registry.run_all()
+    assert registry._last_checked_at.tzinfo == tz.utc
+
+
+def test_checked_at_none_before_first_run():
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    assert registry._last_checked_at is None

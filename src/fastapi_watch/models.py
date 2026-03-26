@@ -1,3 +1,4 @@
+from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
 
@@ -23,13 +24,18 @@ class ProbeResult(BaseModel):
 
 class HealthReport(BaseModel):
     status: ProbeStatus
+    checked_at: Optional[datetime] = None
     probes: list[ProbeResult] = Field(default_factory=list)
 
     @classmethod
-    def from_results(cls, results: list[ProbeResult]) -> "HealthReport":
+    def from_results(
+        cls,
+        results: list[ProbeResult],
+        checked_at: Optional[datetime] = None,
+    ) -> "HealthReport":
         overall = (
             ProbeStatus.HEALTHY
             if all(r.is_healthy for r in results)
             else ProbeStatus.UNHEALTHY
         )
-        return cls(status=overall, probes=results)
+        return cls(status=overall, checked_at=checked_at, probes=results)
