@@ -1,7 +1,9 @@
 import asyncio
 import json
 import logging
-from typing import AsyncGenerator, Callable
+from collections import deque
+from datetime import datetime, timezone
+from typing import AsyncGenerator, Awaitable, Callable
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -69,35 +71,72 @@ class HealthRegistry:
         tags: list[str] | None = None,
         poll_interval_ms: int | None = 60_000,
         logger: logging.Logger | None = None,
+        grace_period_ms: int = 0,
+        history_size: int = 10,
     ) -> None:
         self.app = app
         self.prefix = prefix
         self._logger = logger
-        self._probes: list[BaseProbe] = []
+        self._grace_period_ms: int = max(0, grace_period_ms)
+        self._start_time: datetime = datetime.now(timezone.utc)
+        self._history_size: int = max(1, history_size)
+        self._probe_history: dict[str, deque[ProbeResult]] = {}
+        self._probes: list[tuple[BaseProbe, bool]] = []  # (probe, critical)
         self._poll_interval_ms: int | None = self._set_interval(poll_interval_ms)
         self._cached_results: list[ProbeResult] | None = None
+        self._last_checked_at: datetime | None = None
+        self._probe_states: dict[str, ProbeStatus] = {}
+        self._state_change_callbacks: list[
+            Callable[[str, ProbeStatus, ProbeStatus], None | Awaitable[None]]
+        ] = []
         self._poll_task: asyncio.Task | None = None
         self._active_connections: int = 0
         self._cache_lock = asyncio.Lock()
 
         self._register_routes(tags or ["health"])
 
-    def add(self, probe: BaseProbe) -> "HealthRegistry":
+    def add(self, probe: BaseProbe, critical: bool = True) -> "HealthRegistry":
         """Add a single probe to the registry. Returns ``self`` for chaining.
+
+        Args:
+            probe: The probe to register.
+            critical: When ``True`` (default) a failing probe marks the overall
+                status as unhealthy.  Non-critical probes appear in reports but
+                do not affect ``/health/ready`` or the top-level ``status``.
 
         Silently skips the probe if it is already registered (identity check).
         """
-        if probe not in self._probes:
-            self._probes.append(probe)
+        if not any(p is probe for p, _ in self._probes):
+            self._probes.append((probe, critical))
         return self
 
-    def add_probes(self, probes: list[BaseProbe]) -> "HealthRegistry":
+    def add_probes(self, probes: list[BaseProbe], critical: bool = True) -> "HealthRegistry":
         """Add a list of probes to the registry. Returns ``self`` for chaining.
+
+        Args:
+            probes: Probes to register.
+            critical: Applies to all probes in the list.
 
         Silently skips any probe that is already registered (identity check).
         """
         for probe in probes:
-            self.add(probe)
+            self.add(probe, critical=critical)
+        return self
+
+    def on_state_change(
+        self,
+        callback: Callable[[str, ProbeStatus, ProbeStatus], None | Awaitable[None]],
+    ) -> "HealthRegistry":
+        """Register a callback invoked when a probe's status changes.
+
+        The callback receives ``(probe_name, old_status, new_status)`` and may
+        be a plain function or an async coroutine function.  It is called after
+        every ``run_all()`` for each probe whose status differs from the
+        previous run.
+
+        Returns ``self`` for chaining.
+        """
+        self._state_change_callbacks.append(callback)
         return self
 
     def set_poll_interval(self, ms: int | None) -> None:
@@ -132,19 +171,45 @@ class HealthRegistry:
         if not self._probes:
             return []
 
-        async def _safe_check(probe: BaseProbe) -> ProbeResult:
+        async def _safe_check(probe: BaseProbe, critical: bool) -> ProbeResult:
             try:
-                return await probe.check()
+                coro = probe.check()
+                result = (
+                    await asyncio.wait_for(coro, timeout=probe.timeout)
+                    if probe.timeout is not None
+                    else await coro
+                )
+                return result if result.critical == critical else result.model_copy(update={"critical": critical})
             except Exception as exc:
                 if self._logger:
                     self._logger.exception("Probe %r raised an exception", probe.name)
                 return ProbeResult(
                     name=probe.name,
                     status=ProbeStatus.UNHEALTHY,
+                    critical=critical,
                     error=f"{type(exc).__name__}: {exc}",
                 )
 
-        return list(await asyncio.gather(*(_safe_check(p) for p in self._probes)))
+        results = await asyncio.gather(*(_safe_check(p, c) for p, c in self._probes))
+        self._last_checked_at = datetime.now(timezone.utc)
+        for result in results:
+            self._probe_history.setdefault(result.name, deque(maxlen=self._history_size)).append(result)
+        await self._fire_state_changes(results)
+        return results
+
+    async def _fire_state_changes(self, results: list[ProbeResult]) -> None:
+        """Fire callbacks for any probe whose status changed since the last run."""
+        if not self._state_change_callbacks:
+            return
+        for result in results:
+            old = self._probe_states.get(result.name)
+            if old != result.status:
+                self._probe_states[result.name] = result.status
+                if old is not None:  # skip initial state — no prior state to compare
+                    for cb in self._state_change_callbacks:
+                        ret = cb(result.name, old, result.status)
+                        if asyncio.iscoroutine(ret):
+                            await ret
 
     def _set_interval(self, ms: int | None) -> int | None:
         """Normalize a poll interval and warn if it was clamped."""
@@ -167,6 +232,12 @@ class HealthRegistry:
         self._active_connections -= 1
         if self._active_connections == 0:
             self._cancel_poll_task()
+
+    def _in_grace_period(self) -> bool:
+        if not self._grace_period_ms:
+            return False
+        elapsed_ms = (datetime.now(timezone.utc) - self._start_time).total_seconds() * 1000
+        return elapsed_ms < self._grace_period_ms
 
     def _cancel_poll_task(self) -> None:
         if self._poll_task is not None:
@@ -242,10 +313,12 @@ class HealthRegistry:
             description="Returns 200 if all probes pass, 503 if any fail.",
         )
         async def readiness() -> JSONResponse:
+            if registry._in_grace_period():
+                return JSONResponse({"status": "starting"}, status_code=503)
             results = await registry._get_results()
-            report = HealthReport.from_results(results)
+            report = HealthReport.from_results(results, checked_at=registry._last_checked_at)
             code = 200 if report.status == ProbeStatus.HEALTHY else 503
-            return JSONResponse(report.model_dump(), status_code=code)
+            return JSONResponse(report.model_dump(mode="json"), status_code=code)
 
         @self.app.get(
             f"{prefix}/status",
@@ -258,12 +331,28 @@ class HealthRegistry:
         )
         async def health_status() -> JSONResponse:
             results = await registry._get_results()
-            report = HealthReport.from_results(results)
+            report = HealthReport.from_results(results, checked_at=registry._last_checked_at)
             code = 200 if report.status == ProbeStatus.HEALTHY else 207
-            return JSONResponse(report.model_dump(), status_code=code)
+            return JSONResponse(report.model_dump(mode="json"), status_code=code)
+
+        @self.app.get(
+            f"{prefix}/history",
+            tags=tags,
+            summary="Probe result history",
+            description=(
+                "Returns the last N results for each probe (N = history_size). "
+                "Results are ordered oldest-first."
+            ),
+        )
+        async def probe_history() -> JSONResponse:
+            payload = {
+                name: [r.model_dump(mode="json") for r in entries]
+                for name, entries in registry._probe_history.items()
+            }
+            return JSONResponse({"probes": payload})
 
         def _make_sse_report(results: list[ProbeResult]) -> dict:
-            return HealthReport.from_results(results).model_dump()
+            return HealthReport.from_results(results, checked_at=registry._last_checked_at).model_dump(mode="json")
 
         sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 

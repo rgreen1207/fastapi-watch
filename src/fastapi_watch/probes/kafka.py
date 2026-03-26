@@ -1,5 +1,4 @@
 import time
-from typing import Union
 
 from ..models import ProbeResult, ProbeStatus
 from .base import BaseProbe
@@ -23,7 +22,7 @@ class KafkaProbe(BaseProbe):
 
     def __init__(
         self,
-        bootstrap_servers: Union[str, list[str]] = "localhost:9092",
+        bootstrap_servers: str | list[str] = "localhost:9092",
         name: str = "kafka",
         request_timeout_ms: int = 5000,
     ) -> None:

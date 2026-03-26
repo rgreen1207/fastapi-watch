@@ -1,5 +1,4 @@
 import time
-from typing import Optional
 from urllib.parse import urlparse
 
 from ..models import ProbeResult, ProbeStatus
@@ -29,7 +28,7 @@ class RabbitMQProbe(BaseProbe):
         self,
         url: str = "amqp://guest:guest@localhost/",
         name: str = "rabbitmq",
-        management_url: Optional[str] = None,
+        management_url: str | None = None,
     ) -> None:
         self.url = url
         self.name = name

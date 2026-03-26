@@ -12,6 +12,7 @@ class BaseProbe(ABC):
     """
 
     name: str = "unnamed"
+    timeout: float | None = None  # seconds; None means no timeout
 
     @abstractmethod
     async def check(self) -> ProbeResult:
