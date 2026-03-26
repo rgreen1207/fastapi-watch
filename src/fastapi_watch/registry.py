@@ -186,9 +186,10 @@ class HealthRegistry:
 
         Returns True if the client disconnected before the interval elapsed.
         """
-        deadline = asyncio.get_event_loop().time() + self._poll_interval_ms / 1000
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._poll_interval_ms / 1000
         while True:
-            remaining = deadline - asyncio.get_event_loop().time()
+            remaining = deadline - loop.time()
             if remaining <= 0:
                 return False
             await asyncio.sleep(min(0.5, remaining))
@@ -253,6 +254,11 @@ class HealthRegistry:
             code = 200 if report.status == ProbeStatus.HEALTHY else 207
             return JSONResponse(report.model_dump(), status_code=code)
 
+        def _make_sse_report(results: list[ProbeResult]) -> dict:
+            return HealthReport.from_results(results).model_dump()
+
+        sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
         @self.app.get(
             f"{prefix}/ready/stream",
             tags=tags,
@@ -263,13 +269,10 @@ class HealthRegistry:
             ),
         )
         async def readiness_stream(request: Request) -> StreamingResponse:
-            def make_report(results: list[ProbeResult]) -> dict:
-                return HealthReport.from_results(results).model_dump()
-
             return StreamingResponse(
-                registry._event_stream(request, make_report),
+                registry._event_stream(request, _make_sse_report),
                 media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                headers=sse_headers,
             )
 
         @self.app.get(
@@ -282,11 +285,8 @@ class HealthRegistry:
             ),
         )
         async def status_stream(request: Request) -> StreamingResponse:
-            def make_report(results: list[ProbeResult]) -> dict:
-                return HealthReport.from_results(results).model_dump()
-
             return StreamingResponse(
-                registry._event_stream(request, make_report),
+                registry._event_stream(request, _make_sse_report),
                 media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                headers=sse_headers,
             )
