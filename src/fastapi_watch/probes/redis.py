@@ -29,7 +29,7 @@ class RedisProbe(BaseProbe):
         start = time.perf_counter()
         redis = None
         try:
-            redis = await from_url(self.url, decode_responses=True)
+            redis = from_url(self.url, decode_responses=True)
             await redis.ping()
             latency = (time.perf_counter() - start) * 1000
 
