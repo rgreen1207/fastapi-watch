@@ -757,7 +757,13 @@ async def test_on_state_change_returns_self():
 
 @pytest.mark.asyncio
 async def test_multiple_callbacks_all_fired():
-    counts = [0, 0]
+    fired = {"a": 0, "b": 0}
+
+    def cb_a(n, o, nw):
+        fired["a"] += 1
+
+    def cb_b(n, o, nw):
+        fired["b"] += 1
 
     registry = HealthRegistry(FastAPI())
 
@@ -772,13 +778,13 @@ async def test_multiple_callbacks_all_fired():
 
     probe = ToggleProbe()
     registry.add(probe)
-    registry.on_state_change(lambda n, o, nw: counts.__setitem__(0, counts[0] + 1))
-    registry.on_state_change(lambda n, o, nw: counts.__setitem__(1, counts[1] + 1))
+    registry.on_state_change(cb_a)
+    registry.on_state_change(cb_b)
 
     await registry.run_all()
     probe._healthy = False
     await registry.run_all()
-    assert counts == [1, 1]
+    assert fired == {"a": 1, "b": 1}
 
 
 # ---------------------------------------------------------------------------

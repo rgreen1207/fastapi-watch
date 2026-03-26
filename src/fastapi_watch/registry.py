@@ -3,7 +3,7 @@ import json
 import logging
 from collections import deque
 from datetime import datetime, timezone
-from typing import AsyncGenerator, Awaitable, Callable, Union
+from typing import AsyncGenerator, Awaitable, Callable
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -87,7 +87,7 @@ class HealthRegistry:
         self._last_checked_at: datetime | None = None
         self._probe_states: dict[str, ProbeStatus] = {}
         self._state_change_callbacks: list[
-            Callable[[str, ProbeStatus, ProbeStatus], Union[None, Awaitable[None]]]
+            Callable[[str, ProbeStatus, ProbeStatus], None | Awaitable[None]]
         ] = []
         self._poll_task: asyncio.Task | None = None
         self._active_connections: int = 0
@@ -125,7 +125,7 @@ class HealthRegistry:
 
     def on_state_change(
         self,
-        callback: Callable[[str, ProbeStatus, ProbeStatus], Union[None, Awaitable[None]]],
+        callback: Callable[[str, ProbeStatus, ProbeStatus], None | Awaitable[None]],
     ) -> "HealthRegistry":
         """Register a callback invoked when a probe's status changes.
 
@@ -193,9 +193,7 @@ class HealthRegistry:
         results = list(await asyncio.gather(*(_safe_check(p, c) for p, c in self._probes)))
         self._last_checked_at = datetime.now(timezone.utc)
         for result in results:
-            if result.name not in self._probe_history:
-                self._probe_history[result.name] = deque(maxlen=self._history_size)
-            self._probe_history[result.name].append(result)
+            self._probe_history.setdefault(result.name, deque(maxlen=self._history_size)).append(result)
         await self._fire_state_changes(results)
         return results
 
