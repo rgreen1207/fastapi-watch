@@ -26,6 +26,7 @@ class ProbeResult(BaseModel):
 class HealthReport(BaseModel):
     status: ProbeStatus
     checked_at: datetime | None = None
+    timezone: str | None = None
     probes: list[ProbeResult] = Field(default_factory=list)
 
     @classmethod
@@ -33,6 +34,7 @@ class HealthReport(BaseModel):
         cls,
         results: list[ProbeResult],
         checked_at: datetime | None = None,
+        timezone: str | None = None,
     ) -> "HealthReport":
         critical_results = [r for r in results if r.critical]
         overall = (
@@ -40,4 +42,4 @@ class HealthReport(BaseModel):
             if all(r.is_healthy for r in critical_results)
             else ProbeStatus.UNHEALTHY
         )
-        return cls(status=overall, checked_at=checked_at, probes=results)
+        return cls(status=overall, checked_at=checked_at, timezone=timezone, probes=results)

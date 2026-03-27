@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fastapi-watch"
-version = "1.0.1"
+version = "1.1.0"
 description = "Structured health and readiness check system for FastAPI"
 readme = "README.md"
 license = {text = "MIT"}
@@ -39,6 +39,8 @@ kafka     = ["aiokafka>=0.9"]
 mongo     = ["motor>=3.0"]
 # http
 http      = ["aiohttp>=3.9"]
+# task queues
+celery    = ["celery>=5.0"]
 # everything
 all = [
     "sqlalchemy>=2.0",
@@ -50,6 +52,7 @@ all = [
     "aiokafka>=0.9",
     "motor>=3.0",
     "aiohttp>=3.9",
+    "celery>=5.0",
 ]
 
 [project.urls]

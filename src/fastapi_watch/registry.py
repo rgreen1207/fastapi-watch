@@ -1,12 +1,12 @@
 import asyncio
-import json
 import logging
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import AsyncGenerator, Awaitable, Callable
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .models import HealthReport, ProbeResult, ProbeStatus
 from .probes.base import BaseProbe
@@ -52,6 +52,9 @@ class HealthRegistry:
             close.  Values between 1 and 999 are clamped to 1000 ms.
         logger: Optional :class:`logging.Logger` to use for warnings and probe
             exception messages.  If ``None`` (default) no logging is emitted.
+        timezone: IANA timezone name used for all timestamps (default ``"UTC"``).
+            The value is reflected in the ``timezone`` field of every health
+            response so callers know how to interpret ``checked_at``.
 
     Example::
 
@@ -73,12 +76,15 @@ class HealthRegistry:
         logger: logging.Logger | None = None,
         grace_period_ms: int = 0,
         history_size: int = 10,
+        timezone: str = "UTC",
     ) -> None:
         self.app = app
         self.prefix = prefix
         self._logger = logger
         self._grace_period_ms: int = max(0, grace_period_ms)
-        self._start_time: datetime = datetime.now(timezone.utc)
+        self._timezone_name: str = timezone
+        self._tzinfo: ZoneInfo = ZoneInfo(timezone)
+        self._start_time: datetime = datetime.now(self._tzinfo)
         self._history_size: int = max(1, history_size)
         self._probe_history: dict[str, deque[ProbeResult]] = {}
         self._probes: list[tuple[BaseProbe, bool]] = []  # (probe, critical)
@@ -191,7 +197,7 @@ class HealthRegistry:
                 )
 
         results = await asyncio.gather(*(_safe_check(p, c) for p, c in self._probes))
-        self._last_checked_at = datetime.now(timezone.utc)
+        self._last_checked_at = datetime.now(self._tzinfo)
         for result in results:
             self._probe_history.setdefault(result.name, deque(maxlen=self._history_size)).append(result)
         await self._fire_state_changes(results)
@@ -236,7 +242,7 @@ class HealthRegistry:
     def _in_grace_period(self) -> bool:
         if not self._grace_period_ms:
             return False
-        elapsed_ms = (datetime.now(timezone.utc) - self._start_time).total_seconds() * 1000
+        elapsed_ms = (datetime.now(self._tzinfo) - self._start_time).total_seconds() * 1000
         return elapsed_ms < self._grace_period_ms
 
     def _cancel_poll_task(self) -> None:
@@ -285,7 +291,7 @@ class HealthRegistry:
         try:
             while True:
                 results = self._cached_results or await self.run_all()
-                yield f"data: {json.dumps(make_report(results))}\n\n"
+                yield f"data: {make_report(results)}\n\n"
                 if self._poll_interval_ms is None:
                     return
                 if await self._wait_for_next_poll(request):
@@ -303,7 +309,7 @@ class HealthRegistry:
             summary="Liveness check",
             description="Returns 200 while the process is running.",
         )
-        async def liveness() -> JSONResponse:
+        async def liveness() -> Response:
             return JSONResponse({"status": "ok"})
 
         @self.app.get(
@@ -312,13 +318,13 @@ class HealthRegistry:
             summary="Readiness check",
             description="Returns 200 if all probes pass, 503 if any fail.",
         )
-        async def readiness() -> JSONResponse:
+        async def readiness() -> Response:
             if registry._in_grace_period():
                 return JSONResponse({"status": "starting"}, status_code=503)
             results = await registry._get_results()
-            report = HealthReport.from_results(results, checked_at=registry._last_checked_at)
+            report = HealthReport.from_results(results, checked_at=registry._last_checked_at, timezone=registry._timezone_name)
             code = 200 if report.status == ProbeStatus.HEALTHY else 503
-            return JSONResponse(report.model_dump(mode="json"), status_code=code)
+            return Response(content=report.model_dump_json(), status_code=code, media_type="application/json")
 
         @self.app.get(
             f"{prefix}/status",
@@ -329,11 +335,11 @@ class HealthRegistry:
                 "200 when all healthy, 207 Multi-Status when any probe fails."
             ),
         )
-        async def health_status() -> JSONResponse:
+        async def health_status() -> Response:
             results = await registry._get_results()
-            report = HealthReport.from_results(results, checked_at=registry._last_checked_at)
+            report = HealthReport.from_results(results, checked_at=registry._last_checked_at, timezone=registry._timezone_name)
             code = 200 if report.status == ProbeStatus.HEALTHY else 207
-            return JSONResponse(report.model_dump(mode="json"), status_code=code)
+            return Response(content=report.model_dump_json(), status_code=code, media_type="application/json")
 
         @self.app.get(
             f"{prefix}/history",
@@ -344,15 +350,15 @@ class HealthRegistry:
                 "Results are ordered oldest-first."
             ),
         )
-        async def probe_history() -> JSONResponse:
+        async def probe_history() -> Response:
             payload = {
                 name: [r.model_dump(mode="json") for r in entries]
                 for name, entries in registry._probe_history.items()
             }
             return JSONResponse({"probes": payload})
 
-        def _make_sse_report(results: list[ProbeResult]) -> dict:
-            return HealthReport.from_results(results, checked_at=registry._last_checked_at).model_dump(mode="json")
+        def _make_sse_report(results: list[ProbeResult]) -> str:
+            return HealthReport.from_results(results, checked_at=registry._last_checked_at, timezone=registry._timezone_name).model_dump_json()
 
         sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
