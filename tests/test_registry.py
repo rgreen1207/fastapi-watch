@@ -460,8 +460,8 @@ async def test_event_stream_generator_yields_result_and_stops_on_disconnect():
     request = AsyncMock()
     request.is_disconnected = is_disconnected
 
-    def make_report(results: list) -> dict:
-        return HealthReport.from_results(results).model_dump(mode="json")
+    def make_report(results: list) -> str:
+        return HealthReport.from_results(results).model_dump_json()
 
     events = []
     async for chunk in registry._event_stream(request, make_report):
@@ -514,12 +514,39 @@ async def test_last_checked_at_set_after_run_all():
 
 @pytest.mark.asyncio
 async def test_last_checked_at_is_utc():
-    from datetime import timezone as tz
     app = FastAPI()
     registry = HealthRegistry(app)
     registry.add(MemoryProbe(name="mem"))
     await registry.run_all()
-    assert registry._last_checked_at.tzinfo == tz.utc
+    assert registry._last_checked_at.utcoffset().total_seconds() == 0
+
+
+@pytest.mark.asyncio
+async def test_timezone_applied_to_checked_at():
+    from zoneinfo import ZoneInfo
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None, timezone="America/New_York")
+    registry.add(MemoryProbe(name="mem"))
+    await registry.run_all()
+    assert registry._last_checked_at.tzinfo == ZoneInfo("America/New_York")
+
+
+def test_timezone_in_status_response():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None, timezone="Europe/London")
+    registry.add(MemoryProbe(name="mem"))
+    client = TestClient(app)
+    data = client.get("/health/status").json()
+    assert data["timezone"] == "Europe/London"
+
+
+def test_default_timezone_is_utc():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.add(MemoryProbe(name="mem"))
+    client = TestClient(app)
+    data = client.get("/health/status").json()
+    assert data["timezone"] == "UTC"
 
 
 def test_checked_at_none_before_first_run():

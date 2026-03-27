@@ -1,4 +1,5 @@
 from .base import BaseProbe
+from .celery import CeleryProbe
 from .memory import MemoryProbe
 from .redis import RedisProbe
 from .rabbitmq import RabbitMQProbe
@@ -12,6 +13,7 @@ from .http import HttpProbe
 
 __all__ = [
     "BaseProbe",
+    "CeleryProbe",
     "MemoryProbe",
     # databases
     "SqlAlchemyProbe",
