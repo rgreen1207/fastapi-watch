@@ -33,6 +33,7 @@ Connect a browser or monitoring tool to the SSE streaming endpoints (`/health/re
   - [Watching Kafka](#watching-kafka)
   - [Watching MongoDB](#watching-mongodb)
   - [Watching an HTTP endpoint](#watching-an-http-endpoint)
+  - [Watching Celery workers](#watching-celery-workers)
   - [SQLAlchemy engine probe](#sqlalchemy-engine-probe)
   - [All built-in probes](#all-built-in-probes)
 - [Configuration reference](#configuration-reference)
@@ -61,6 +62,7 @@ pip install "fastapi-watch[rabbitmq]"     # RabbitMQ          (aio-pika + aiohtt
 pip install "fastapi-watch[kafka]"        # Kafka             (aiokafka)
 pip install "fastapi-watch[mongo]"        # MongoDB           (motor)
 pip install "fastapi-watch[http]"         # HTTP endpoint     (aiohttp)
+pip install "fastapi-watch[celery]"      # Celery workers    (celery)
 
 # Or pull everything in one shot
 pip install "fastapi-watch[all]"
@@ -1174,6 +1176,98 @@ registry.add(HttpProbe(url="https://api.payments.com/health", timeout=2.0, name=
 
 ---
 
+### Watching Celery workers
+
+```bash
+pip install "fastapi-watch[celery]"
+```
+
+`CeleryProbe` uses Celery's [control broadcast API](https://docs.celeryq.dev/en/stable/userguide/monitoring.html#inspection) to inspect every live worker — no extra infrastructure required beyond the broker your app already uses.
+
+Pass your existing Celery application instance directly:
+
+```python
+from celery_app import celery
+from fastapi_watch.probes import CeleryProbe
+
+registry.add(CeleryProbe(celery))
+```
+
+**Details returned (workers online):**
+
+```json
+{
+  "workers_online": 2,
+  "workers": {
+    "celery@host1": {
+      "status": "online",
+      "queues": ["celery", "high_priority"],
+      "active_tasks": 1,
+      "reserved_tasks": 3,
+      "scheduled_tasks": 0,
+      "pool": {
+        "implementation": "celery.concurrency.prefork:TaskPool",
+        "max_concurrency": 4,
+        "processes": [101, 102, 103, 104]
+      },
+      "total_tasks_executed": { "myapp.tasks.send_email": 99 },
+      "registered_tasks": ["myapp.tasks.cleanup", "myapp.tasks.send_email"],
+      "active": [
+        { "id": "abc-123", "name": "myapp.tasks.send_email", "args": ["user@example.com"], "kwargs": {}, "time_start": 1700000000.0, "worker_pid": 101 }
+      ],
+      "reserved": [],
+      "scheduled": []
+    }
+  }
+}
+```
+
+**Details returned (no workers online):**
+
+```json
+{
+  "workers_online": 0,
+  "reason": "no workers online — they may be scaled down because there are no pending tasks"
+}
+```
+
+#### Scale-to-zero and `min_workers`
+
+`min_workers` controls whether the probe considers having zero (or too few) online workers a failure.
+
+| `min_workers` | No workers online | Fewer than `min_workers` |
+|---|---|---|
+| `0` (default) | **Healthy** — silently explains workers may be scaled down | N/A |
+| `≥ 1` | **Unhealthy** — error lists how many are expected | **Unhealthy** — error lists count found vs. expected |
+
+Use `min_workers=0` (the default) for deployments that scale Celery workers to zero when there is no work to do. The probe will report healthy and note the reason, rather than raising a false alarm.
+
+Use `min_workers=1` (or higher) when at least that many workers must always be running — for example, a background processor that needs to be ready at all times regardless of queue depth.
+
+```python
+# Workers come and go — zero online is acceptable
+registry.add(CeleryProbe(celery))
+
+# At least one worker must always be online
+registry.add(CeleryProbe(celery, min_workers=1))
+
+# Fleet of workers — alert if fewer than 2 are responding
+registry.add(CeleryProbe(celery, min_workers=2))
+```
+
+The `min_workers` threshold only matters when `workers_online < min_workers`. Once enough workers are online, the probe is healthy regardless of the setting.
+
+**Constructor arguments:**
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `app` | required | Your Celery application instance |
+| `name` | `"celery"` | Probe label |
+| `timeout` | `1.0` | Seconds to wait for each inspector broadcast reply. Workers that are alive respond well within 1 s; the timeout only matters when workers are unreachable. |
+| `min_workers` | `0` | Minimum number of workers that must be online. `0` means workers are optional (scale-to-zero); any positive value requires at least that many workers to be live. |
+
+---
+
 ### SQLAlchemy engine probe
 
 ```bash
@@ -1233,6 +1327,7 @@ registry.add(SqlAlchemyProbe(engine=engine, name="primary-db"))
 |-------|-------|---------------------|----------------|
 | `RabbitMQProbe` | `rabbitmq` | `url`, `name`, `management_url` | `connected`; + `server`, `totals`, `queues` when `management_url` is set |
 | `KafkaProbe` | `kafka` | `bootstrap_servers`, `name`, `request_timeout_ms` | `broker_count`, `controller_id`, `topics`, `internal_topics` |
+| `CeleryProbe` | `celery` | `app`, `name`, `timeout`, `min_workers` | `workers_online`, per-worker `active`, `reserved`, `scheduled`, `registered_tasks`, `pool`, `total_tasks_executed`, `queues` |
 
 #### Document stores
 
