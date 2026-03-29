@@ -17,9 +17,11 @@ class MongoProbe(BaseProbe):
         url: str = "mongodb://localhost:27017",
         name: str = "mongodb",
         server_selection_timeout_ms: int = 2000,
+        poll_interval_ms: int | None = None,
     ) -> None:
         self.url = url
         self.name = name
+        self.poll_interval_ms = poll_interval_ms
         self._timeout_ms = server_selection_timeout_ms
         self._client = None  # reused across checks
 

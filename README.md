@@ -24,7 +24,7 @@ Instrument individual FastAPI route handlers with `RouteProbe` to collect real-t
 
 Organize probes across your codebase using `ProbeRouter`, the same file-splitting pattern FastAPI uses for routes. Declare probes in any module, compose them into routers, and pass them to `HealthRegistry` in one line at startup.
 
-Connect a browser or monitoring tool to the SSE streaming endpoints (`/health/ready/stream`, `/health/status/stream`) and receive live updates as long as you stay connected — the background poll loop starts automatically on the first connection and stops when the last client disconnects.
+Connect a browser or monitoring tool to the Server-Sent Events (SSE) streaming endpoints (`/health/ready/stream`, `/health/status/stream`) and receive live updates as long as you stay connected — the background poll loop starts automatically on the first connection and stops when the last client disconnects.
 
 Open `/health/dashboard` for a live HTML page that shows all probe results, updates in real time over SSE, and requires no extra dependencies.
 
@@ -43,6 +43,11 @@ Open `/health/dashboard` for a live HTML page that shows all probe results, upda
 - [ProbeRouter — organizing probes across files](#proberouter--organizing-probes-across-files)
 - [Live streaming](#live-streaming)
 - [Polling and caching](#polling-and-caching)
+- [Per-probe poll frequency](#per-probe-poll-frequency)
+- [Circuit breaker](#circuit-breaker)
+- [Webhook on state change](#webhook-on-state-change)
+- [Authentication](#authentication)
+- [Startup probe](#startup-probe)
 - [State-change callbacks](#state-change-callbacks)
 - [Startup grace period](#startup-grace-period)
 - [Probe result history](#probe-result-history)
@@ -132,6 +137,7 @@ GET /health/live          → always 200
 GET /health/ready         → 200 / 503
 GET /health/status        → 200 / 207
 GET /health/history       → rolling probe history
+GET /health/startup       → 200 after set_started(); 503 before
 GET /health/dashboard     → HTML dashboard with live SSE updates
 GET /health/ready/stream  → SSE stream
 GET /health/status/stream → SSE stream
@@ -188,6 +194,7 @@ async def list_users():
 | `GET /health/ready` | **Readiness** — are all critical probes passing? | `200 OK` | `503 Service Unavailable` |
 | `GET /health/status` | **Status** — full detail on every probe | `200 OK` | `207 Multi-Status` |
 | `GET /health/history` | **History** — last N results per probe | `200 OK` | always `200` |
+| `GET /health/startup` | **Startup** — has `set_started()` been called and do startup probes pass? | `200 OK` | `503 Service Unavailable` |
 | `GET /health/dashboard` | **Dashboard** — live HTML page | `200 OK` | `200 OK` (page shows degraded state) |
 | `GET /health/ready/stream` | **Readiness stream** — SSE; polls while connected | `200 OK` | stream of events |
 | `GET /health/status/stream` | **Status stream** — SSE; polls while connected | `200 OK` | stream of events |
@@ -200,6 +207,7 @@ registry = HealthRegistry(app, prefix="/ops/health")
 # → /ops/health/ready
 # → /ops/health/status
 # → /ops/health/history
+# → /ops/health/startup
 # → /ops/health/dashboard
 # → /ops/health/ready/stream
 # → /ops/health/status/stream
@@ -466,6 +474,226 @@ The regular `GET /health/ready` and `GET /health/status` endpoints always respon
 - **When no streaming is active** — probes are run on demand. A built-in lock prevents a thundering herd if multiple requests arrive simultaneously before the first result is cached.
 
 This means your GET endpoints are fast under all conditions, regardless of whether anyone is streaming.
+
+---
+
+## Per-probe poll frequency
+
+By default every probe uses the registry's `poll_interval_ms`. Set `poll_interval_ms` on any probe to override this for that probe only. Probes with their own interval run on their own schedule — a slow probe doesn't delay fast ones.
+
+```python
+registry = HealthRegistry(app, poll_interval_ms=60_000)  # global: every 60 s
+
+registry.add(PostgreSQLProbe(url="postgresql://...", poll_interval_ms=30_000))  # every 30 s
+registry.add(RedisProbe(url="redis://...", poll_interval_ms=10_000))            # every 10 s
+registry.add(MemoryProbe())                                                      # uses global: 60 s
+```
+
+The minimum enforced interval is 1000 ms — lower values are clamped. Pass `poll_interval_ms=None` on the probe to explicitly use the registry default. Probes without a custom interval are always in sync with the registry-level setting.
+
+All built-in probes expose `poll_interval_ms` as a constructor argument. Custom probes inherit the attribute from `BaseProbe`:
+
+```python
+class MyServiceProbe(BaseProbe):
+    name = "my-service"
+    poll_interval_ms = 5_000  # class-level default
+
+    async def check(self) -> ProbeResult:
+        ...
+```
+
+---
+
+## Circuit breaker
+
+The circuit breaker prevents a broken dependency from being called repeatedly when it is clearly failing. After a probe fails a configurable number of consecutive times, the circuit opens and the probe is suspended — it returns the last known result with a `"circuit_breaker_open": true` flag in `details` until the cooldown period expires.
+
+```python
+# Defaults: opens after 5 consecutive failures, stays open 10 minutes
+registry = HealthRegistry(app)
+
+# Custom threshold and cooldown
+registry = HealthRegistry(
+    app,
+    circuit_breaker_threshold=3,          # open after 3 consecutive failures
+    circuit_breaker_cooldown_ms=120_000,  # try again after 2 minutes
+)
+
+# Disable entirely — probes always run regardless of failure history
+registry = HealthRegistry(app, circuit_breaker=False)
+```
+
+Per-probe overrides let you tune the behaviour for individual dependencies without changing the global defaults:
+
+```python
+from fastapi_watch.probes import PostgreSQLProbe
+
+probe = PostgreSQLProbe(url="postgresql://...")
+probe.circuit_breaker_threshold = 2       # stricter — open after 2 failures
+probe.circuit_breaker_cooldown_ms = 60_000  # shorter cooldown — retry after 1 minute
+registry.add(probe)
+```
+
+When the circuit is open, `details` includes:
+
+```json
+{
+  "circuit_breaker_open": true,
+  "version": "7.2.4"
+}
+```
+
+All other fields (`status`, `error`, `latency_ms`) reflect the last result before the circuit opened. Once the cooldown expires the probe runs again — if it succeeds, the circuit closes and the error counter resets.
+
+---
+
+## Webhook on state change
+
+Pass `webhook_url` to receive an HTTP POST every time a probe's status changes. The call is fire-and-forget — it never blocks health check execution and failures are logged silently.
+
+```python
+registry = HealthRegistry(
+    app,
+    webhook_url="https://hooks.example.com/health",
+)
+```
+
+**Payload:**
+
+```json
+{
+  "probe": "postgresql",
+  "old_status": "healthy",
+  "new_status": "unhealthy",
+  "timestamp": "2024-06-01T12:05:00.000000+00:00"
+}
+```
+
+The `Content-Type` header is `application/json`. The webhook is called with a 5-second timeout. If the call fails (network error, non-2xx response), the failure is logged via the registry logger and silently discarded — the health check result is unaffected.
+
+---
+
+## Authentication
+
+Protect all health endpoints with optional authentication. The `auth` parameter accepts three forms.
+
+### No authentication (default)
+
+```python
+registry = HealthRegistry(app)  # all endpoints are open
+```
+
+### HTTP Basic auth
+
+```python
+registry = HealthRegistry(
+    app,
+    auth={"type": "basic", "username": "admin", "password": "s3cr3t"},
+)
+```
+
+Requests without a valid `Authorization: Basic ...` header receive `401 Unauthorized` with a `WWW-Authenticate` challenge.
+
+### API key header
+
+```python
+registry = HealthRegistry(
+    app,
+    auth={"type": "apikey", "key": "my-secret-key"},
+)
+```
+
+By default the key is read from the `X-API-Key` header. Use `"header"` to specify a different header name:
+
+```python
+auth={"type": "apikey", "key": "my-secret-key", "header": "Authorization"}
+```
+
+Requests without the correct key receive `403 Forbidden`.
+
+### Custom callable
+
+For anything more complex — JWT validation, IP allowlists, multi-factor logic — pass a callable that returns `True` to allow or `False` to reject:
+
+```python
+from fastapi import Request
+
+def my_auth(request: Request) -> bool:
+    token = request.headers.get("X-Internal-Token", "")
+    return token == "expected-value"
+
+registry = HealthRegistry(app, auth=my_auth)
+```
+
+Async callables are also supported:
+
+```python
+async def my_auth(request: Request) -> bool:
+    return await verify_token(request.headers.get("Authorization", ""))
+
+registry = HealthRegistry(app, auth=my_auth)
+```
+
+Returning `False` results in a `403 Forbidden` response.
+
+---
+
+## Startup probe
+
+`GET /health/startup` returns `503` until `set_started()` is called. Use it as a Kubernetes `startupProbe` target to hold traffic away while the application initialises.
+
+```python
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from fastapi_watch import HealthRegistry
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    registry.set_started()   # signal that startup is complete
+    yield
+
+app = FastAPI(lifespan=lifespan)
+registry = HealthRegistry(app)
+```
+
+**Before `set_started()` is called:**
+
+```json
+{"status": "starting"}   → HTTP 503
+```
+
+**After `set_started()` is called:**
+
+```json
+{"status": "started"}   → HTTP 200
+```
+
+### Startup probes
+
+Pass `startup_probes` to run additional checks as part of the startup gate. The `/health/startup` endpoint stays at `503` until both `set_started()` has been called *and* every startup probe passes.
+
+```python
+from fastapi_watch.probes import PostgreSQLProbe
+
+db_probe = PostgreSQLProbe(url="postgresql://...")
+
+registry = HealthRegistry(
+    app,
+    startup_probes=[db_probe],
+)
+```
+
+Startup probes are separate from the main probe registry — they do not appear in `/health/status` and are not subject to the circuit breaker. They are evaluated on every `/health/startup` request.
+
+```yaml
+# Kubernetes — hold traffic until app is fully started and DB is reachable
+startupProbe:
+  httpGet:
+    path: /health/startup
+    port: 8000
+  failureThreshold: 30
+  periodSeconds: 5
+```
 
 ---
 
@@ -1236,13 +1464,13 @@ registry.add(RedisProbe(url="redis://localhost:6379"))
   "role": "master",
   "total_keys": 312,
   "clusters": {
-    "session": { "keys": 150, "ttl_seconds": 3600 },
-    "cache":   { "keys": 162, "ttl_seconds": 900  }
+    "session": 150,
+    "cache":   162
   }
 }
 ```
 
-`clusters` groups keys by the segment before the first `:`. For example, a key named `session:abc123` falls into the `session` cluster. `ttl_seconds` is sampled from one key in the group; `null` means the key has no expiry.
+`clusters` groups keys by the segment before the first `:` and reports a key count per group. For example, a key named `session:abc123` falls into the `session` cluster. Up to 1000 keys are scanned; if the keyspace exceeds that limit a `"clusters_truncated": true` field is added.
 
 **Common URL forms:**
 
@@ -1721,7 +1949,13 @@ registry.add(SqlAlchemyProbe(engine=engine, name="primary-db"))
 | `history_size` | `int` | `10` | Number of past probe results to retain per probe. Retrieved via `GET /health/history`. Minimum `1`. |
 | `timezone` | `str` | `"UTC"` | IANA timezone name for all `checked_at` timestamps. Reflected in the `timezone` field of every response. |
 | `routers` | `list[ProbeRouter] \| None` | `None` | One or more `ProbeRouter` instances to include at startup. Equivalent to calling `include_router()` for each. |
-| `dashboard` | `bool` | `True` | When `True`, registers `GET /health/dashboard` — a server-rendered HTML page with live SSE updates. Pass `False` to omit the route. |
+| `dashboard` | `bool \| Callable` | `True` | `True` — built-in HTML dashboard at `GET /health/dashboard`. `False` — omit the route. Callable `(report: HealthReport) -> str` — custom renderer. |
+| `circuit_breaker` | `bool` | `True` | Enable the circuit breaker. When a probe fails `circuit_breaker_threshold` consecutive times it is suspended for `circuit_breaker_cooldown_ms` ms. |
+| `circuit_breaker_threshold` | `int` | `5` | Consecutive failures before the circuit opens. |
+| `circuit_breaker_cooldown_ms` | `int` | `600000` | How long (ms) the circuit stays open before the probe is retried (default 10 minutes). |
+| `webhook_url` | `str \| None` | `None` | HTTP(S) URL that receives a JSON `POST` whenever a probe changes state. Fire-and-forget; never blocks health checks. |
+| `auth` | `dict \| Callable \| None` | `None` | Authentication for all health endpoints. `None` = open. See [Authentication](#authentication) for accepted forms. |
+| `startup_probes` | `list[BaseProbe] \| None` | `None` | Probes that must pass for `/health/startup` to return 200. Evaluated separately from the main registry. |
 
 ### `HealthRegistry.add(probe, critical=True)`
 
@@ -1753,6 +1987,10 @@ Updates the poll interval at runtime. Pass `0` or `None` to switch to single-fet
 registry.set_poll_interval(30_000)   # every 30 s
 registry.set_poll_interval(0)        # disable — each event runs probes on demand
 ```
+
+### `HealthRegistry.set_started()`
+
+Signals that application startup is complete. After this is called, `GET /health/startup` returns `200` (provided all startup probes pass). Call this at the end of your lifespan startup block or application boot sequence.
 
 ### `HealthRegistry.run_all()`
 
@@ -1801,6 +2039,9 @@ Instruments a FastAPI route handler via the `@probe.watch` decorator and reports
 |-----------|------|---------|-------------|
 | `name` | `str` | `"unnamed"` | Label used in health reports. Override as a class attribute or set in `__init__`. |
 | `timeout` | `float \| None` | `None` | Per-probe timeout in seconds. The check is cancelled and recorded as unhealthy if it exceeds this value. `None` means no limit. |
+| `poll_interval_ms` | `int \| None` | `None` | Per-probe poll interval override. When set, this probe runs on its own schedule independent of the registry default. `None` uses the registry `poll_interval_ms`. |
+| `circuit_breaker_threshold` | `int \| None` | `None` | Per-probe consecutive-failure threshold before opening the circuit. `None` uses the registry default. |
+| `circuit_breaker_cooldown_ms` | `int \| None` | `None` | Per-probe circuit-open cooldown in milliseconds. `None` uses the registry default. |
 
 ---
 

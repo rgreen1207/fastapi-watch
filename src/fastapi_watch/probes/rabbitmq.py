@@ -30,10 +30,12 @@ class RabbitMQProbe(BaseProbe):
         url: str = "amqp://guest:guest@localhost/",
         name: str = "rabbitmq",
         management_url: str | None = None,
+        poll_interval_ms: int | None = None,
     ) -> None:
         self.url = url
         self.name = name
         self.management_url = management_url
+        self.poll_interval_ms = poll_interval_ms
 
         parsed = urlparse(url)
         self._mgmt_user = parsed.username or "guest"

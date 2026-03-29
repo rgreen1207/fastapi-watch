@@ -156,9 +156,11 @@ class WebSocketProbe(BaseProbe):
         window_size: int = 100,
         ema_alpha: float = 0.1,
         timeout: float | None = None,
+        poll_interval_ms: int | None = None,
     ) -> None:
         self.name = name
         self.timeout = timeout
+        self.poll_interval_ms = poll_interval_ms
         self.max_error_rate = max_error_rate
         self.min_active_connections = min_active_connections
         self.ema_alpha = ema_alpha

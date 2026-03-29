@@ -25,11 +25,13 @@ class HttpProbe(BaseProbe):
         timeout: float = 5.0,
         name: str | None = None,
         expected_status: int = 200,
+        poll_interval_ms: int | None = None,
     ) -> None:
         self.url = url
         self.timeout = timeout
         self.expected_status = expected_status
         self.name = name if name is not None else (urlparse(url).netloc or url)
+        self.poll_interval_ms = poll_interval_ms
 
     async def check(self) -> ProbeResult:
         try:

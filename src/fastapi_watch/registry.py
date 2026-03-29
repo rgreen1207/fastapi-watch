@@ -1,11 +1,15 @@
 import asyncio
+import base64
+import json
 import logging
+import secrets
+import urllib.request
 from collections import deque
 from datetime import datetime
 from typing import AsyncGenerator, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from .dashboard import render_dashboard
@@ -28,63 +32,138 @@ def _normalize_interval(ms: int | None) -> int | None:
     return max(ms, _MIN_POLL_INTERVAL_MS)
 
 
+def _make_auth_checker(auth) -> Callable | None:
+    """Return a FastAPI dependency that enforces authentication, or ``None`` for open access.
+
+    *auth* may be:
+
+    - ``None`` — no authentication (default).
+    - ``{"type": "basic", "username": "x", "password": "y"}`` — HTTP Basic auth.
+    - ``{"type": "apikey", "key": "x", "header": "X-API-Key"}`` — API key header.
+    - A callable ``(request: Request) -> bool | Awaitable[bool]`` — custom check.
+      Return ``True`` to allow the request, ``False`` to reject with 403.
+    """
+    if auth is None:
+        return None
+
+    if callable(auth):
+        async def _custom(request: Request) -> None:
+            result = auth(request)
+            if asyncio.iscoroutine(result):
+                result = await result
+            if not result:
+                raise HTTPException(status_code=403, detail="Forbidden")
+        return _custom
+
+    if not isinstance(auth, dict):
+        raise ValueError(f"auth must be None, a callable, or a dict; got {type(auth)!r}")
+
+    auth_type = auth.get("type")
+    _realm = 'realm="health"'
+
+    if auth_type == "basic":
+        expected_user = auth["username"].encode()
+        expected_pass = auth["password"].encode()
+
+        async def _basic(request: Request) -> None:
+            header = request.headers.get("Authorization", "")
+            if not header.startswith("Basic "):
+                raise HTTPException(
+                    status_code=401,
+                    headers={"WWW-Authenticate": f"Basic {_realm}"},
+                    detail="Unauthorized",
+                )
+            try:
+                decoded = base64.b64decode(header[6:]).decode()
+                user, _, pwd = decoded.partition(":")
+            except Exception:
+                raise HTTPException(
+                    status_code=401,
+                    headers={"WWW-Authenticate": f"Basic {_realm}"},
+                )
+            if not (
+                secrets.compare_digest(user.encode(), expected_user)
+                and secrets.compare_digest(pwd.encode(), expected_pass)
+            ):
+                raise HTTPException(
+                    status_code=401,
+                    headers={"WWW-Authenticate": f"Basic {_realm}"},
+                    detail="Unauthorized",
+                )
+        return _basic
+
+    if auth_type == "apikey":
+        expected_key = auth["key"].encode()
+        header_name = auth.get("header", "X-API-Key")
+
+        async def _apikey(request: Request) -> None:
+            provided = request.headers.get(header_name, "").encode()
+            if not secrets.compare_digest(provided, expected_key):
+                raise HTTPException(status_code=403, detail="Forbidden")
+        return _apikey
+
+    raise ValueError(f"Unknown auth type {auth_type!r}. Supported: 'basic', 'apikey'.")
+
+
 class HealthRegistry:
     """Register health probes and mount health endpoints on a FastAPI app.
 
     Mounted routes (all customisable via *prefix*):
 
     - ``GET /health/live``          — liveness; always 200
-    - ``GET /health/ready``         — readiness; 200 if all probes pass, 503 otherwise
+    - ``GET /health/ready``         — readiness; 200 if all critical probes pass, 503 otherwise
     - ``GET /health/status``        — full probe detail; 200 / 207 (Multi-Status)
     - ``GET /health/history``       — rolling probe result history
-    - ``GET /health/dashboard``     — HTML dashboard with live SSE updates (disable with ``dashboard=False``)
-    - ``GET /health/ready/stream``  — SSE stream of readiness; polls while connected
-    - ``GET /health/status/stream`` — SSE stream of full probe detail; polls while connected
-
-    The background poll loop only runs while at least one SSE client is connected.
-    Regular ``GET`` endpoints serve from the last cached result when available,
-    or run probes on demand if no stream has been active.
+    - ``GET /health/startup``       — startup check; 503 until :meth:`set_started` is called
+    - ``GET /health/dashboard``     — HTML dashboard with live SSE (Server-Sent Events) updates
+    - ``GET /health/ready/stream``  — SSE (Server-Sent Events) stream of readiness
+    - ``GET /health/status/stream`` — SSE (Server-Sent Events) stream of full probe detail
 
     Args:
         app: FastAPI application.
         prefix: URL prefix for health routes (default ``/health``).
         tags: OpenAPI tags applied to all routes.
-        poll_interval_ms: How often (in milliseconds) to re-run all probes while
-            a streaming client is connected.  Defaults to ``60000`` (60 s).
-            Pass ``0`` or ``None`` to disable polling — each request will run
-            probes on demand and streaming endpoints return a single result then
-            close.  Values between 1 and 999 are clamped to 1000 ms.
-        logger: Optional :class:`logging.Logger` to use for warnings and probe
-            exception messages.  If ``None`` (default) no logging is emitted.
-        timezone: IANA timezone name used for all timestamps (default ``"UTC"``).
-            The value is reflected in the ``timezone`` field of every health
-            response so callers know how to interpret ``checked_at``.
-        dashboard: Controls the ``GET /health/dashboard`` route.
-
-            * ``True`` (default) — serve the built-in server-rendered HTML page
-              with live SSE updates.
-            * ``False`` — omit the route entirely (JSON endpoints only).
-            * *callable* — serve a custom dashboard.  The callable must accept a
-              single :class:`~fastapi_watch.models.HealthReport` argument and
-              return an HTML string.  Example::
-
-                  def my_dashboard(report: HealthReport) -> str:
-                      return f"<html><body>{report.status}</body></html>"
-
-                  registry = HealthRegistry(app, dashboard=my_dashboard)
+        poll_interval_ms: How often (ms) to re-run probes while a streaming client is
+            connected (default ``60000``).  ``0`` / ``None`` = single-fetch mode.
+            Values 1–999 are clamped to 1000.  Individual probes may override this
+            with their own ``poll_interval_ms``.
+        logger: Optional :class:`logging.Logger` for warnings and probe exceptions.
+        timezone: IANA timezone name for all timestamps (default ``"UTC"``).
+        grace_period_ms: Ignore probe failures for this many ms after startup
+            (affects ``/health/ready`` only).
+        history_size: Number of past results kept per probe (default 10).
+        routers: :class:`~fastapi_watch.ProbeRouter` instances to merge at startup.
+        dashboard: ``True`` (default) — built-in HTML dashboard.  ``False`` — omit the
+            route.  Callable ``(report: HealthReport) -> str`` — custom renderer.
+        circuit_breaker: Enable the circuit breaker (default ``True``).  When a probe
+            fails *circuit_breaker_threshold* times consecutively it is suspended for
+            *circuit_breaker_cooldown_ms* ms, avoiding repeated calls to a broken
+            dependency.  Individual probes may override threshold / cooldown via their
+            own ``circuit_breaker_threshold`` / ``circuit_breaker_cooldown_ms``
+            attributes.
+        circuit_breaker_threshold: Consecutive failures before opening the circuit
+            (default 5).
+        circuit_breaker_cooldown_ms: How long (ms) the circuit stays open before the
+            probe is retried (default ``600_000`` = 10 minutes).
+        webhook_url: HTTP(S) URL that receives a JSON ``POST`` whenever a probe
+            changes state.  The call is fire-and-forget and never blocks health checks.
+            Payload: ``{"probe", "old_status", "new_status", "timestamp"}``.
+        auth: Authentication for all health endpoints.  ``None`` (default) = open.
+            See :func:`_make_auth_checker` for accepted forms.
+        startup_probes: Probes that must pass for ``/health/startup`` to return 200.
+            These are separate from the main probe registry and are not shown in
+            ``/health/status``.
 
     Example::
 
-        registry = HealthRegistry(app, logger=logging.getLogger(__name__))
-        registry.add(RedisProbe(url="redis://localhost"))
-        registry.add(HttpProbe(url="https://api.example.com/health"))
-
-        # Declare probes in separate modules and include them in one line:
-        registry = HealthRegistry(app, routers=[db_router, cache_router])
-
-        # Change the interval at runtime:
-        registry.set_poll_interval(30_000)   # every 30 s
-        registry.set_poll_interval(0)        # back to single-fetch mode
+        registry = HealthRegistry(
+            app,
+            circuit_breaker_threshold=3,
+            webhook_url="https://hooks.example.com/health",
+            auth={"type": "apikey", "key": "s3cr3t"},
+        )
+        registry.add(RedisProbe(url="redis://localhost", poll_interval_ms=5_000))
+        registry.set_started()   # call once app init is complete
     """
 
     def __init__(
@@ -99,6 +178,12 @@ class HealthRegistry:
         timezone: str = "UTC",
         routers: list[ProbeRouter] | None = None,
         dashboard: bool | Callable[..., str] = True,
+        circuit_breaker: bool = True,
+        circuit_breaker_threshold: int = 5,
+        circuit_breaker_cooldown_ms: int = 600_000,
+        webhook_url: str | None = None,
+        auth: dict | Callable | None = None,
+        startup_probes: list[BaseProbe] | None = None,
     ) -> None:
         self.app = app
         self.prefix = prefix
@@ -109,42 +194,56 @@ class HealthRegistry:
         self._start_time: datetime = datetime.now(self._tzinfo)
         self._history_size: int = max(1, history_size)
         self._probe_history: dict[str, deque[ProbeResult]] = {}
-        self._probes: list[tuple[BaseProbe, bool]] = []  # (probe, critical)
+        self._probes: list[tuple[BaseProbe, bool]] = []
         self._poll_interval_ms: int | None = self._set_interval(poll_interval_ms)
-        self._cached_results: list[ProbeResult] | None = None
+
+        # Per-probe result cache and scheduling
+        self._probe_cache: dict[str, ProbeResult] = {}
+        self._probe_last_run: dict[str, float] = {}
         self._last_checked_at: datetime | None = None
+        self._cache_lock = asyncio.Lock()
+
+        # Circuit breaker state
+        self._circuit_breaker_enabled: bool = circuit_breaker
+        self._circuit_threshold: int = circuit_breaker_threshold
+        self._circuit_cooldown_ms: int = circuit_breaker_cooldown_ms
+        self._circuit_open_until: dict[str, float] = {}
+        self._circuit_err_count: dict[str, int] = {}
+
+        # Webhook
+        self._webhook_url: str | None = webhook_url
+
+        # Auth
+        self._auth = auth
+
+        # Startup
+        self._started: bool = False
+        self._startup_probes: list[BaseProbe] = list(startup_probes or [])
+
+        # State-change callbacks and streaming
         self._probe_states: dict[str, ProbeStatus] = {}
         self._state_change_callbacks: list[
             Callable[[str, ProbeStatus, ProbeStatus], None | Awaitable[None]]
         ] = []
         self._poll_task: asyncio.Task | None = None
         self._active_connections: int = 0
-        self._cache_lock = asyncio.Lock()
 
         self._register_routes(tags or ["health"], dashboard=dashboard)
         for router in routers or []:
             self.include_router(router)
 
+    # ------------------------------------------------------------------
+    # Public API — probe registration
+    # ------------------------------------------------------------------
+
     def include_router(self, router: ProbeRouter) -> "HealthRegistry":
-        """Include all probes from a :class:`~fastapi_watch.ProbeRouter`. Returns ``self`` for chaining.
-
-        Preserves each probe's criticality as declared on the router.
-
-        Args:
-            router: A :class:`~fastapi_watch.ProbeRouter` populated in another module.
-        """
+        """Include all probes from a :class:`~fastapi_watch.ProbeRouter`. Returns ``self``."""
         for probe, critical in router._probes:
             self.add(probe, critical=critical)
         return self
 
     def add(self, probe: BaseProbe, critical: bool = True) -> "HealthRegistry":
-        """Add a single probe to the registry. Returns ``self`` for chaining.
-
-        Args:
-            probe: The probe to register.
-            critical: When ``True`` (default) a failing probe marks the overall
-                status as unhealthy.  Non-critical probes appear in reports but
-                do not affect ``/health/ready`` or the top-level ``status``.
+        """Add a single probe. Returns ``self`` for chaining.
 
         Silently skips the probe if it is already registered (identity check).
         """
@@ -153,16 +252,18 @@ class HealthRegistry:
         return self
 
     def add_probes(self, probes: list[BaseProbe], critical: bool = True) -> "HealthRegistry":
-        """Add a list of probes to the registry. Returns ``self`` for chaining.
-
-        Args:
-            probes: Probes to register.
-            critical: Applies to all probes in the list.
-
-        Silently skips any probe that is already registered (identity check).
-        """
+        """Add a list of probes. Returns ``self`` for chaining."""
         for probe in probes:
             self.add(probe, critical=critical)
+        return self
+
+    def set_started(self) -> "HealthRegistry":
+        """Mark the application as fully initialised.
+
+        Until this is called ``GET /health/startup`` returns 503.
+        Returns ``self`` for chaining.
+        """
+        self._started = True
         return self
 
     def on_state_change(
@@ -172,11 +273,7 @@ class HealthRegistry:
         """Register a callback invoked when a probe's status changes.
 
         The callback receives ``(probe_name, old_status, new_status)`` and may
-        be a plain function or an async coroutine function.  It is called after
-        every ``run_all()`` for each probe whose status differs from the
-        previous run.
-
-        Returns ``self`` for chaining.
+        be sync or async.  Returns ``self`` for chaining.
         """
         self._state_change_callbacks.append(callback)
         return self
@@ -184,19 +281,14 @@ class HealthRegistry:
     def set_poll_interval(self, ms: int | None) -> None:
         """Update the polling interval at runtime.
 
-        Args:
-            ms: New interval in milliseconds.  Pass ``0`` or ``None`` to switch
-                to single-fetch mode.  Values between 1 and 999 are clamped to
-                1000 ms.
-
-        If streaming clients are connected the poll task is restarted immediately
-        with the new interval.  If polling is disabled the task is cancelled and
-        the cache is cleared.
+        ``0`` / ``None`` switches to single-fetch mode and clears the cache.
+        Values 1–999 are clamped to 1000 ms.
         """
         self._poll_interval_ms = self._set_interval(ms)
         if self._poll_interval_ms is None:
-            self._cached_results = None
-            self._cancel_poll_task()
+            self._probe_cache.clear()
+            if not self._has_custom_intervals():
+                self._cancel_poll_task()
         elif self._active_connections > 0:
             self._cancel_poll_task()
             try:
@@ -204,57 +296,150 @@ class HealthRegistry:
             except RuntimeError:
                 pass
 
+    # ------------------------------------------------------------------
+    # Probe execution
+    # ------------------------------------------------------------------
+
     async def run_all(self) -> list[ProbeResult]:
-        """Run all probes concurrently and return their results.
+        """Run all probes concurrently and return their results."""
+        return await self._execute_probes(self._probes)
 
-        A probe that raises an unhandled exception is recorded as unhealthy
-        rather than propagating the exception.
-        """
-        if not self._probes:
+    async def _execute_probes(self, pairs: list[tuple[BaseProbe, bool]]) -> list[ProbeResult]:
+        """Run a subset of probes, update the cache, history, and fire callbacks."""
+        if not pairs:
             return []
+        results = list(await asyncio.gather(*(self._safe_check(p, c) for p, c in pairs)))
+        now_dt = datetime.now(self._tzinfo)
+        run_time = asyncio.get_running_loop().time()
+        async with self._cache_lock:
+            for r in results:
+                self._probe_cache[r.name] = r
+                self._probe_last_run[r.name] = run_time
+            self._last_checked_at = now_dt
+        for r in results:
+            self._probe_history.setdefault(r.name, deque(maxlen=self._history_size)).append(r)
+        await self._fire_state_changes(results)
+        return results
 
-        async def _safe_check(probe: BaseProbe, critical: bool) -> ProbeResult:
-            try:
-                coro = probe.check()
-                result = (
-                    await asyncio.wait_for(coro, timeout=probe.timeout)
-                    if probe.timeout is not None
-                    else await coro
-                )
-                return result if result.critical == critical else result.model_copy(update={"critical": critical})
-            except Exception as exc:
-                if self._logger:
-                    self._logger.exception("Probe %r raised an exception", probe.name)
+    async def _safe_check(self, probe: BaseProbe, critical: bool) -> ProbeResult:
+        """Run one probe with circuit-breaker and timeout handling."""
+        loop = asyncio.get_running_loop()
+
+        # Circuit breaker — skip probe while circuit is open
+        if self._circuit_breaker_enabled:
+            open_until = self._circuit_open_until.get(probe.name, 0.0)
+            if loop.time() < open_until:
+                cached = self._probe_cache.get(probe.name)
+                if cached is not None:
+                    details = {**(cached.details or {}), "circuit_breaker_open": True}
+                    return cached.model_copy(update={"critical": critical, "details": details})
                 return ProbeResult(
                     name=probe.name,
                     status=ProbeStatus.UNHEALTHY,
                     critical=critical,
-                    error=f"{type(exc).__name__}: {exc}",
+                    error="circuit breaker open — probe temporarily suspended",
+                    details={"circuit_breaker_open": True},
                 )
 
-        results = await asyncio.gather(*(_safe_check(p, c) for p, c in self._probes))
-        self._last_checked_at = datetime.now(self._tzinfo)
-        for result in results:
-            self._probe_history.setdefault(result.name, deque(maxlen=self._history_size)).append(result)
-        await self._fire_state_changes(results)
-        return results
+        # Run the probe
+        try:
+            coro = probe.check()
+            result = (
+                await asyncio.wait_for(coro, timeout=probe.timeout)
+                if probe.timeout is not None
+                else await coro
+            )
+            result = (
+                result
+                if result.critical == critical
+                else result.model_copy(update={"critical": critical})
+            )
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception("Probe %r raised an exception", probe.name)
+            result = ProbeResult(
+                name=probe.name,
+                status=ProbeStatus.UNHEALTHY,
+                critical=critical,
+                error=f"{type(exc).__name__}: {exc}",
+            )
 
-    async def _fire_state_changes(self, results: list[ProbeResult]) -> None:
-        """Fire callbacks for any probe whose status changed since the last run."""
-        if not self._state_change_callbacks:
-            return
-        for result in results:
-            old = self._probe_states.get(result.name)
-            if old != result.status:
-                self._probe_states[result.name] = result.status
-                if old is not None:  # skip initial state — no prior state to compare
-                    for cb in self._state_change_callbacks:
-                        ret = cb(result.name, old, result.status)
-                        if asyncio.iscoroutine(ret):
-                            await ret
+        # Update circuit breaker state
+        if self._circuit_breaker_enabled:
+            if result.is_healthy:
+                self._circuit_err_count.pop(probe.name, None)
+                self._circuit_open_until.pop(probe.name, None)
+            else:
+                threshold = (
+                    probe.circuit_breaker_threshold
+                    if probe.circuit_breaker_threshold is not None
+                    else self._circuit_threshold
+                )
+                cooldown_ms = (
+                    probe.circuit_breaker_cooldown_ms
+                    if probe.circuit_breaker_cooldown_ms is not None
+                    else self._circuit_cooldown_ms
+                )
+                count = self._circuit_err_count.get(probe.name, 0) + 1
+                self._circuit_err_count[probe.name] = count
+                if count >= threshold:
+                    self._circuit_open_until[probe.name] = loop.time() + cooldown_ms / 1000
+                    if self._logger:
+                        self._logger.warning(
+                            "Probe %r circuit opened after %d failures; "
+                            "suspended for %.0f s",
+                            probe.name,
+                            count,
+                            cooldown_ms / 1000,
+                        )
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Per-probe scheduling helpers
+    # ------------------------------------------------------------------
+
+    def _effective_interval_s(self, probe: BaseProbe) -> float | None:
+        """Return effective poll interval for *probe* in seconds, or None (single-fetch)."""
+        ms = probe.poll_interval_ms if probe.poll_interval_ms is not None else self._poll_interval_ms
+        if ms is None or ms == 0:
+            return None
+        return max(ms, _MIN_POLL_INTERVAL_MS) / 1000
+
+    def _is_probe_due(self, probe: BaseProbe, now: float) -> bool:
+        """Return True if the probe should run now based on its schedule."""
+        interval_s = self._effective_interval_s(probe)
+        if interval_s is None:
+            return False  # single-fetch mode — not managed by the poll loop
+        last = self._probe_last_run.get(probe.name, -1.0)
+        return last < 0 or (now - last) >= interval_s
+
+    def _has_custom_intervals(self) -> bool:
+        return any(p.poll_interval_ms is not None for p, _ in self._probes)
+
+    # ------------------------------------------------------------------
+    # Caching / result retrieval
+    # ------------------------------------------------------------------
+
+    async def _get_results(self) -> list[ProbeResult]:
+        """Return current probe results.
+
+        Single-fetch probes always run fresh.  Polled probes are served from
+        the cache; uncached probes run once to warm it.
+        """
+        to_run = [
+            (p, c) for p, c in self._probes
+            if self._effective_interval_s(p) is None or p.name not in self._probe_cache
+        ]
+        if to_run:
+            await self._execute_probes(to_run)
+        return list(self._probe_cache.values())
+
+    # ------------------------------------------------------------------
+    # Polling loop
+    # ------------------------------------------------------------------
 
     def _set_interval(self, ms: int | None) -> int | None:
-        """Normalize a poll interval and warn if it was clamped."""
         normalized = _normalize_interval(ms)
         if self._logger and ms is not None and ms != 0 and ms < _MIN_POLL_INTERVAL_MS:
             self._logger.warning(
@@ -267,19 +452,14 @@ class HealthRegistry:
 
     async def _on_connect(self) -> None:
         self._active_connections += 1
-        if self._active_connections == 1 and self._poll_interval_ms is not None:
-            self._poll_task = asyncio.create_task(self._poll_loop())
+        if self._active_connections == 1 and self._poll_task is None:
+            if self._poll_interval_ms is not None or self._has_custom_intervals():
+                self._poll_task = asyncio.create_task(self._poll_loop())
 
     async def _on_disconnect(self) -> None:
         self._active_connections -= 1
-        if self._active_connections == 0:
+        if self._active_connections == 0 and not self._has_custom_intervals():
             self._cancel_poll_task()
-
-    def _in_grace_period(self) -> bool:
-        if not self._grace_period_ms:
-            return False
-        elapsed_ms = (datetime.now(self._tzinfo) - self._start_time).total_seconds() * 1000
-        return elapsed_ms < self._grace_period_ms
 
     def _cancel_poll_task(self) -> None:
         if self._poll_task is not None:
@@ -287,25 +467,27 @@ class HealthRegistry:
             self._poll_task = None
 
     async def _poll_loop(self) -> None:
+        """Background loop: run each probe when its interval elapses (1 s granularity)."""
+        loop = asyncio.get_running_loop()
         while True:
-            results = await self.run_all()
-            async with self._cache_lock:
-                self._cached_results = results
-            await asyncio.sleep(self._poll_interval_ms / 1000)
+            now = loop.time()
+            due = [(p, c) for p, c in self._probes if self._is_probe_due(p, now)]
+            if due:
+                await self._execute_probes(due)
+            await asyncio.sleep(1.0)
 
-    async def _get_results(self) -> list[ProbeResult]:
-        """Serve cached results for regular GET endpoints, running fresh if needed."""
-        if self._poll_interval_ms is None:
-            return await self.run_all()
-        if self._cached_results is not None:
-            return self._cached_results
-        async with self._cache_lock:
-            if self._cached_results is None:
-                self._cached_results = await self.run_all()
-            return self._cached_results
+    def _in_grace_period(self) -> bool:
+        if not self._grace_period_ms:
+            return False
+        elapsed_ms = (datetime.now(self._tzinfo) - self._start_time).total_seconds() * 1000
+        return elapsed_ms < self._grace_period_ms
+
+    # ------------------------------------------------------------------
+    # SSE (Server-Sent Events) streaming
+    # ------------------------------------------------------------------
 
     async def _wait_for_next_poll(self, request: Request) -> bool:
-        """Sleep for poll_interval_ms, checking for client disconnect every 500 ms.
+        """Sleep for poll_interval_ms, checking client disconnect every 500 ms.
 
         Returns True if the client disconnected before the interval elapsed.
         """
@@ -322,13 +504,17 @@ class HealthRegistry:
     async def _event_stream(
         self,
         request: Request,
-        make_report: Callable[[list[ProbeResult]], dict],
+        make_report: Callable[[list[ProbeResult]], str],
     ) -> AsyncGenerator[str, None]:
-        """Async generator that yields SSE events while the client is connected."""
+        """Async generator that yields SSE (Server-Sent Events) events while the client is connected."""
         await self._on_connect()
         try:
             while True:
-                results = self._cached_results or await self.run_all()
+                results = (
+                    list(self._probe_cache.values())
+                    if self._probe_cache
+                    else await self._execute_probes(self._probes)
+                )
                 yield f"data: {make_report(results)}\n\n"
                 if self._poll_interval_ms is None:
                     return
@@ -337,15 +523,89 @@ class HealthRegistry:
         finally:
             await self._on_disconnect()
 
-    def _register_routes(self, tags: list[str], dashboard: bool | Callable[..., str] = True) -> None:
+    # ------------------------------------------------------------------
+    # State-change callbacks and webhook
+    # ------------------------------------------------------------------
+
+    async def _fire_state_changes(self, results: list[ProbeResult]) -> None:
+        """Fire callbacks and webhook for any probe whose status changed."""
+        if not self._state_change_callbacks and self._webhook_url is None:
+            # Fast path — store states only
+            for r in results:
+                self._probe_states[r.name] = r.status
+            return
+
+        for result in results:
+            old = self._probe_states.get(result.name)
+            self._probe_states[result.name] = result.status
+            if old is not None and old != result.status:
+                for cb in self._state_change_callbacks:
+                    ret = cb(result.name, old, result.status)
+                    if asyncio.iscoroutine(ret):
+                        await ret
+                if self._webhook_url is not None:
+                    asyncio.create_task(
+                        self._post_webhook(result.name, old, result.status)
+                    )
+
+    async def _post_webhook(
+        self, probe_name: str, old: ProbeStatus, new: ProbeStatus
+    ) -> None:
+        """Fire-and-forget HTTP POST to the configured webhook URL."""
+        payload = json.dumps({
+            "probe": probe_name,
+            "old_status": old.value,
+            "new_status": new.value,
+            "timestamp": datetime.now(self._tzinfo).isoformat(),
+        }).encode()
+
+        def _post() -> None:
+            try:
+                req = urllib.request.Request(
+                    self._webhook_url,
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                urllib.request.urlopen(req, timeout=5)
+            except Exception:
+                if self._logger:
+                    self._logger.warning(
+                        "Webhook POST to %s failed", self._webhook_url
+                    )
+
+        await asyncio.get_running_loop().run_in_executor(None, _post)
+
+    # ------------------------------------------------------------------
+    # Route registration
+    # ------------------------------------------------------------------
+
+    def _register_routes(
+        self,
+        tags: list[str],
+        dashboard: bool | Callable[..., str] = True,
+    ) -> None:
         registry = self
         prefix = self.prefix
+
+        auth_checker = _make_auth_checker(self._auth)
+        auth_deps = [Depends(auth_checker)] if auth_checker else []
+
+        def _make_sse_report(results: list[ProbeResult]) -> str:
+            return HealthReport.from_results(
+                results,
+                checked_at=registry._last_checked_at,
+                timezone=registry._timezone_name,
+            ).model_dump_json()
+
+        sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
         @self.app.get(
             f"{prefix}/live",
             tags=tags,
             summary="Liveness check",
             description="Returns 200 while the process is running.",
+            dependencies=auth_deps,
         )
         async def liveness() -> Response:
             return JSONResponse({"status": "ok"})
@@ -354,39 +614,52 @@ class HealthRegistry:
             f"{prefix}/ready",
             tags=tags,
             summary="Readiness check",
-            description="Returns 200 if all probes pass, 503 if any fail.",
+            description="Returns 200 if all critical probes pass, 503 otherwise.",
+            dependencies=auth_deps,
         )
         async def readiness() -> Response:
             if registry._in_grace_period():
                 return JSONResponse({"status": "starting"}, status_code=503)
             results = await registry._get_results()
-            report = HealthReport.from_results(results, checked_at=registry._last_checked_at, timezone=registry._timezone_name)
+            report = HealthReport.from_results(
+                results,
+                checked_at=registry._last_checked_at,
+                timezone=registry._timezone_name,
+            )
             code = 200 if report.status == ProbeStatus.HEALTHY else 503
-            return Response(content=report.model_dump_json(), status_code=code, media_type="application/json")
+            return Response(
+                content=report.model_dump_json(),
+                status_code=code,
+                media_type="application/json",
+            )
 
         @self.app.get(
             f"{prefix}/status",
             tags=tags,
             summary="Detailed health status",
-            description=(
-                "Returns full probe results. "
-                "200 when all healthy, 207 Multi-Status when any probe fails."
-            ),
+            description="Returns full probe results. 200 when all healthy, 207 when any probe fails.",
+            dependencies=auth_deps,
         )
         async def health_status() -> Response:
             results = await registry._get_results()
-            report = HealthReport.from_results(results, checked_at=registry._last_checked_at, timezone=registry._timezone_name)
+            report = HealthReport.from_results(
+                results,
+                checked_at=registry._last_checked_at,
+                timezone=registry._timezone_name,
+            )
             code = 200 if report.status == ProbeStatus.HEALTHY else 207
-            return Response(content=report.model_dump_json(), status_code=code, media_type="application/json")
+            return Response(
+                content=report.model_dump_json(),
+                status_code=code,
+                media_type="application/json",
+            )
 
         @self.app.get(
             f"{prefix}/history",
             tags=tags,
             summary="Probe result history",
-            description=(
-                "Returns the last N results for each probe (N = history_size). "
-                "Results are ordered oldest-first."
-            ),
+            description="Returns the last N results for each probe (oldest-first).",
+            dependencies=auth_deps,
         )
         async def probe_history() -> Response:
             payload = {
@@ -395,19 +668,38 @@ class HealthRegistry:
             }
             return JSONResponse({"probes": payload})
 
-        def _make_sse_report(results: list[ProbeResult]) -> str:
-            return HealthReport.from_results(results, checked_at=registry._last_checked_at, timezone=registry._timezone_name).model_dump_json()
-
-        sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+        @self.app.get(
+            f"{prefix}/startup",
+            tags=tags,
+            summary="Startup check",
+            description=(
+                "Returns 503 until :meth:`set_started` is called (and any startup probes pass). "
+                "Use this as a Kubernetes startupProbe target."
+            ),
+            dependencies=auth_deps,
+        )
+        async def startup_check() -> Response:
+            if not registry._started:
+                return JSONResponse({"status": "starting"}, status_code=503)
+            if registry._startup_probes:
+                results = list(
+                    await asyncio.gather(*(p.check() for p in registry._startup_probes))
+                )
+                if not all(r.is_healthy for r in results):
+                    report = HealthReport.from_results(results)
+                    return Response(
+                        content=report.model_dump_json(),
+                        status_code=503,
+                        media_type="application/json",
+                    )
+            return JSONResponse({"status": "started"})
 
         @self.app.get(
             f"{prefix}/ready/stream",
             tags=tags,
             summary="Readiness stream",
-            description=(
-                "SSE stream of readiness. Polls probes while connected; "
-                "poll loop stops when the last client disconnects."
-            ),
+            description="SSE (Server-Sent Events) stream of readiness. Poll loop stops when last client disconnects.",
+            dependencies=auth_deps,
         )
         async def readiness_stream(request: Request) -> StreamingResponse:
             return StreamingResponse(
@@ -420,10 +712,8 @@ class HealthRegistry:
             f"{prefix}/status/stream",
             tags=tags,
             summary="Health status stream",
-            description=(
-                "SSE stream of full probe results. Polls probes while connected; "
-                "poll loop stops when the last client disconnects."
-            ),
+            description="SSE (Server-Sent Events) stream of full probe results. Poll loop stops when last client disconnects.",
+            dependencies=auth_deps,
         )
         async def status_stream(request: Request) -> StreamingResponse:
             return StreamingResponse(
@@ -447,6 +737,7 @@ class HealthRegistry:
                 summary="Health dashboard",
                 description="Server-rendered HTML dashboard with live SSE updates.",
                 response_class=HTMLResponse,
+                dependencies=auth_deps,
             )
             async def health_dashboard() -> HTMLResponse:
                 results = await registry._get_results()
