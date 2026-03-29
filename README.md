@@ -2,7 +2,7 @@
   <b>fastapi-watch</b>
 </p>
 <p align="center">
-  <em>Structured health and readiness check system for FastAPI</em>
+  <em>Structured health and readiness check system for [FastAPI](https://fastapi.tiangolo.com/).</em>
 </p>
 <p align="center">
   <a href="https://github.com/rgreen1207/fastapi-watch/actions/workflows/publish.yml">
@@ -17,8 +17,6 @@
 </p>
 
 ---
-
-Structured health and readiness check system for [FastAPI](https://fastapi.tiangolo.com/).
 
 Add `/health/live`, `/health/ready`, `/health/status`, `/health/history`, and `/health/dashboard` endpoints to any FastAPI app with a single registry call. All probes run concurrently, so a slow dependency never blocks the others. Each probe returns rich service-specific details alongside the pass/fail result.
 
