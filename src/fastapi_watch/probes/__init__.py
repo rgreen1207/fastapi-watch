@@ -1,4 +1,5 @@
 from .base import BaseProbe
+from .route import RouteProbe
 from .celery import CeleryProbe
 from .memory import MemoryProbe
 from .redis import RedisProbe
@@ -29,4 +30,6 @@ __all__ = [
     "MongoProbe",
     # http
     "HttpProbe",
+    # route instrumentation
+    "RouteProbe",
 ]

@@ -2,9 +2,15 @@
 
 Structured health and readiness check system for [FastAPI](https://fastapi.tiangolo.com/).
 
-Add `/health/live`, `/health/ready`, `/health/status`, and `/health/history` endpoints to any FastAPI app with a single registry call. All probes run concurrently, so a slow dependency never blocks the others. Each probe returns rich service-specific details alongside the pass/fail result.
+Add `/health/live`, `/health/ready`, `/health/status`, `/health/history`, and `/health/dashboard` endpoints to any FastAPI app with a single registry call. All probes run concurrently, so a slow dependency never blocks the others. Each probe returns rich service-specific details alongside the pass/fail result.
+
+Instrument individual FastAPI route handlers with `RouteProbe` to collect real-traffic metrics — latency percentiles, error rate, throughput, and consecutive failure counts — and surface them alongside your infrastructure probes in the same health report.
+
+Organize probes across your codebase using `ProbeRouter`, the same file-splitting pattern FastAPI uses for routes. Declare probes in any module, compose them into routers, and pass them to `HealthRegistry` in one line at startup.
 
 Connect a browser or monitoring tool to the SSE streaming endpoints (`/health/ready/stream`, `/health/status/stream`) and receive live updates as long as you stay connected — the background poll loop starts automatically on the first connection and stops when the last client disconnects.
+
+Open `/health/dashboard` for a live HTML page that shows all probe results, updates in real time over SSE, and requires no extra dependencies.
 
 ---
 
@@ -13,10 +19,12 @@ Connect a browser or monitoring tool to the SSE streaming endpoints (`/health/re
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Endpoints](#endpoints)
+- [Health Dashboard](#health-dashboard)
 - [Probe management](#probe-management)
   - [Adding probes](#adding-probes)
   - [Critical vs non-critical probes](#critical-vs-non-critical-probes)
   - [Per-probe timeout](#per-probe-timeout)
+- [ProbeRouter — organizing probes across files](#proberouter--organizing-probes-across-files)
 - [Live streaming](#live-streaming)
 - [Polling and caching](#polling-and-caching)
 - [State-change callbacks](#state-change-callbacks)
@@ -25,6 +33,7 @@ Connect a browser or monitoring tool to the SSE streaming endpoints (`/health/re
 - [Response format](#response-format)
 - [Writing a custom probe](#writing-a-custom-probe)
 - [Built-in probes](#built-in-probes)
+  - [Watching a FastAPI route](#watching-a-fastapi-route)
   - [Watching PostgreSQL](#watching-postgresql)
   - [Watching MySQL / MariaDB](#watching-mysql--mariadb)
   - [Watching Redis](#watching-redis)
@@ -62,7 +71,7 @@ pip install "fastapi-watch[rabbitmq]"     # RabbitMQ          (aio-pika + aiohtt
 pip install "fastapi-watch[kafka]"        # Kafka             (aiokafka)
 pip install "fastapi-watch[mongo]"        # MongoDB           (motor)
 pip install "fastapi-watch[http]"         # HTTP endpoint     (aiohttp)
-pip install "fastapi-watch[celery]"      # Celery workers    (celery)
+pip install "fastapi-watch[celery]"       # Celery workers    (celery)
 
 # Or pull everything in one shot
 pip install "fastapi-watch[all]"
@@ -90,10 +99,10 @@ app = FastAPI()
 
 registry = HealthRegistry(
     app,
-    poll_interval_ms=60_000,           # re-run probes every 60 s while streaming
+    poll_interval_ms=60_000,            # re-run probes every 60 s while streaming
     logger=logging.getLogger(__name__), # optional — omit to silence all logging
-    grace_period_ms=10_000,            # hold /ready for 10 s while the app warms up
-    history_size=20,                   # keep the last 20 results per probe
+    grace_period_ms=10_000,             # hold /ready for 10 s while the app warms up
+    history_size=20,                    # keep the last 20 results per probe
 )
 
 registry.add(PostgreSQLProbe(url="postgresql://user:pass@localhost/mydb"))
@@ -106,9 +115,51 @@ That's it. The following routes are now live:
 GET /health/live          → always 200
 GET /health/ready         → 200 / 503
 GET /health/status        → 200 / 207
+GET /health/history       → rolling probe history
+GET /health/dashboard     → HTML dashboard with live SSE updates
 GET /health/ready/stream  → SSE stream
 GET /health/status/stream → SSE stream
-GET /health/history       → rolling probe history
+```
+
+### Quick start with ProbeRouter
+
+For larger applications, define probes in each feature module and collect them all in `main.py` via `ProbeRouter`:
+
+```python
+# features/database/probes.py
+from fastapi_watch import ProbeRouter
+from fastapi_watch.probes import PostgreSQLProbe, RedisProbe
+
+router = ProbeRouter()
+router.add(PostgreSQLProbe(url="postgresql://..."))
+router.add(RedisProbe(url="redis://..."), critical=False)
+```
+
+```python
+# features/users/probes.py
+from fastapi_watch import ProbeRouter, RouteProbe
+
+router = ProbeRouter()
+
+users_probe = RouteProbe(name="users-api", max_error_rate=0.05)
+router.add(users_probe)
+```
+
+```python
+# main.py
+from fastapi import FastAPI
+from fastapi_watch import HealthRegistry
+from features.database.probes import router as db_router
+from features.users.probes import router as users_router, users_probe
+
+app = FastAPI()
+
+registry = HealthRegistry(app, routers=[db_router, users_router])
+
+@app.get("/users")
+@users_probe.watch
+async def list_users():
+    ...
 ```
 
 ---
@@ -120,9 +171,10 @@ GET /health/history       → rolling probe history
 | `GET /health/live` | **Liveness** — is the process alive? | `200 OK` | never fails |
 | `GET /health/ready` | **Readiness** — are all critical probes passing? | `200 OK` | `503 Service Unavailable` |
 | `GET /health/status` | **Status** — full detail on every probe | `200 OK` | `207 Multi-Status` |
+| `GET /health/history` | **History** — last N results per probe | `200 OK` | always `200` |
+| `GET /health/dashboard` | **Dashboard** — live HTML page | `200 OK` | `200 OK` (page shows degraded state) |
 | `GET /health/ready/stream` | **Readiness stream** — SSE; polls while connected | `200 OK` | stream of events |
 | `GET /health/status/stream` | **Status stream** — SSE; polls while connected | `200 OK` | stream of events |
-| `GET /health/history` | **History** — last N results per probe | `200 OK` | always `200` |
 
 The prefix defaults to `/health` and can be changed at construction time:
 
@@ -131,10 +183,45 @@ registry = HealthRegistry(app, prefix="/ops/health")
 # → /ops/health/live
 # → /ops/health/ready
 # → /ops/health/status
+# → /ops/health/history
+# → /ops/health/dashboard
 # → /ops/health/ready/stream
 # → /ops/health/status/stream
-# → /ops/health/history
 ```
+
+---
+
+## Health Dashboard
+
+`GET /health/dashboard` returns a server-rendered HTML page that shows all probe results in a card grid and updates live over SSE. No extra Python dependencies are required — the page is generated inline and all CSS and JavaScript are embedded.
+
+The dashboard is registered by default. Disable it with `dashboard=False` if you don't want to expose a human-readable view:
+
+```python
+registry = HealthRegistry(app)                  # dashboard on — GET /health/dashboard
+registry = HealthRegistry(app, dashboard=False) # dashboard off
+```
+
+### What the dashboard shows
+
+**Header bar** — the overall status is displayed prominently at the top. The bar is green when all critical probes are passing and red when any critical probe is failing. A pulsing animation signals active degradation. The "Last checked" timestamp and timezone are shown in the top right alongside a live connection indicator.
+
+**Probe cards** — one card per registered probe, arranged in a responsive grid. Each card contains:
+
+- A colored left border (green = healthy, red = unhealthy) that updates live
+- The probe name and an `optional` badge for non-critical probes
+- The probe's average latency in milliseconds
+- A status pill (`Healthy` / `Unhealthy`)
+- The error message, if the probe is failing
+- A details table with all service-specific metadata — connection counts, memory usage, error rates, latency percentiles, and so on
+
+**Footer links** — quick links to the raw JSON endpoints (`/health/status`, `/health/history`, `/health/ready`).
+
+### Live updates
+
+When the page loads, a small embedded JavaScript snippet opens an `EventSource` connection to `/health/status/stream`. Each SSE event surgically updates the DOM — colors, text, and detail table rows — without a full page reload or any visible flash. The live indicator in the header glows green when connected and goes grey on disconnect.
+
+No external JavaScript frameworks or CDN resources are used. The page is fully self-contained.
 
 ---
 
@@ -207,6 +294,93 @@ registry.add(probe)
 ```
 
 `timeout = None` (the default) means no limit. Timed-out probes produce an unhealthy result with `error: "TimeoutError: "`.
+
+---
+
+## ProbeRouter — organizing probes across files
+
+As an application grows, defining every probe in `main.py` becomes unwieldy. `ProbeRouter` mirrors the pattern FastAPI uses for `APIRouter`: declare probes in the modules that own them, and include all of them in the registry at startup.
+
+### Basic usage
+
+```python
+# features/database/probes.py
+from fastapi_watch import ProbeRouter
+from fastapi_watch.probes import PostgreSQLProbe, RedisProbe
+
+router = ProbeRouter()
+router.add(PostgreSQLProbe(url="postgresql://user:pass@db.internal/app"))
+router.add(RedisProbe(url="redis://cache.internal:6379"), critical=False)
+```
+
+```python
+# features/payments/probes.py
+from fastapi_watch import ProbeRouter
+from fastapi_watch.probes import HttpProbe
+
+router = ProbeRouter()
+router.add(HttpProbe(url="https://api.stripe.com/v1/health", name="stripe"))
+```
+
+```python
+# main.py
+from fastapi import FastAPI
+from fastapi_watch import HealthRegistry
+from features.database.probes import router as db_router
+from features.payments.probes import router as payments_router
+
+app = FastAPI()
+
+registry = HealthRegistry(app, routers=[db_router, payments_router])
+```
+
+The `routers=` parameter accepts a list of `ProbeRouter` instances. All probes from every router are registered in the order they were added, preserving each probe's `critical` setting.
+
+If you need to add individual probes alongside routers, `include_router()` is also available after construction and returns `self` for chaining:
+
+```python
+registry = HealthRegistry(app)
+registry.include_router(db_router).include_router(payments_router).add(some_extra_probe)
+```
+
+### Composing routers
+
+Routers can include other routers, letting you build a single top-level aggregator that collects probes from every submodule:
+
+```python
+# probes/__init__.py
+from fastapi_watch import ProbeRouter
+from .database import router as db_router
+from .payments import router as payments_router
+from .messaging import router as messaging_router
+
+router = ProbeRouter()
+router.include_router(db_router)
+router.include_router(payments_router)
+router.include_router(messaging_router)
+```
+
+```python
+# main.py — one import, one line
+from fastapi_watch import HealthRegistry
+from probes import router
+
+registry = HealthRegistry(app, routers=[router])
+```
+
+### ProbeRouter API
+
+`ProbeRouter` exposes the same fluent interface as `HealthRegistry`. All methods return `self` for chaining. Duplicate probe instances (same object, identity check) are silently skipped.
+
+```python
+router = ProbeRouter()
+
+router.add(probe)                          # single probe, critical by default
+router.add(probe, critical=False)          # mark as non-critical
+router.add_probes([probe_a, probe_b])      # multiple probes, same criticality
+router.add_probes([probe_c], critical=False)
+router.include_router(another_router)      # merge another router's probes
+```
 
 ---
 
@@ -416,6 +590,7 @@ Every response from `/health/ready`, `/health/status`, and the SSE streams share
 |-------|------|-------------|
 | `status` | `"healthy"` \| `"unhealthy"` | Overall result — determined by critical probes only |
 | `checked_at` | `string` \| `null` | UTC ISO 8601 timestamp of the last probe run; `null` before the first run |
+| `timezone` | `string` \| `null` | IANA timezone name used for `checked_at` |
 | `probes` | `array` | Individual probe results (see below) |
 
 ### Probe result
@@ -435,6 +610,7 @@ Every response from `/health/ready`, `/health/status`, and the SSE streams share
 {
   "status": "healthy",
   "checked_at": "2024-06-01T12:00:00.123456+00:00",
+  "timezone": "UTC",
   "probes": [
     {
       "name": "postgresql",
@@ -473,6 +649,7 @@ Every response from `/health/ready`, `/health/status`, and the SSE streams share
 {
   "status": "unhealthy",
   "checked_at": "2024-06-01T12:00:05.456789+00:00",
+  "timezone": "UTC",
   "probes": [
     {
       "name": "postgresql",
@@ -500,6 +677,7 @@ Every response from `/health/ready`, `/health/status`, and the SSE streams share
 {
   "status": "healthy",
   "checked_at": "2024-06-01T12:00:10.000000+00:00",
+  "timezone": "UTC",
   "probes": [
     {
       "name": "postgresql",
@@ -765,6 +943,165 @@ async def test_registry_run_all():
 ### Probe details
 
 Every built-in probe populates the `details` field with service-specific metadata. Details are always best-effort — if the metadata query fails after a successful connectivity check, `details` will contain whatever was collected up to that point. The probe status reflects connectivity only, not the completeness of `details`.
+
+---
+
+### Watching a FastAPI route
+
+`RouteProbe` is a passive observer — it instruments an existing route handler using the `@probe.watch` decorator and collects real-traffic metrics on every request. No test requests are made; the probe reports on what your actual users are hitting.
+
+No extra install is required. `RouteProbe` is included in the base package.
+
+```python
+from fastapi import FastAPI
+from fastapi_watch import HealthRegistry, RouteProbe
+
+app = FastAPI()
+
+users_probe = RouteProbe(name="users-api")
+
+@app.get("/users")
+@users_probe.watch
+async def list_users():
+    return {"users": [...]}
+
+registry = HealthRegistry(app)
+registry.add(users_probe)
+```
+
+The `@watch` decorator wraps the handler function and preserves its signature — FastAPI's dependency injection continues to work exactly as before.
+
+#### Metrics collected
+
+Every time the decorated handler is called, `RouteProbe` records:
+
+| Metric | Description |
+|--------|-------------|
+| `last_rtt_ms` | Handler execution time for the most recent request |
+| `avg_rtt_ms` | Exponential moving average RTT across all requests; also used as the probe's `latency_ms` |
+| `p95_rtt_ms` | 95th-percentile RTT calculated over the last `window_size` requests |
+| `min_rtt_ms` / `max_rtt_ms` | All-time RTT bounds |
+| `last_status_code` | HTTP status code of the most recent response |
+| `request_count` | Total requests observed since the probe was created |
+| `error_count` | Requests that returned a 4xx or 5xx status code |
+| `error_rate` | `error_count / request_count` |
+| `consecutive_errors` | Unbroken run of failing requests; resets to `0` on any success |
+| `requests_per_minute` | Throughput derived from the sliding request timestamp window; `null` until at least 2 requests have been observed |
+
+`HTTPException` is caught, its status code recorded, and then it is re-raised so FastAPI's normal exception handling is unaffected. Any other unhandled exception is recorded as a `500` and re-raised.
+
+#### Health thresholds
+
+`RouteProbe` declares itself `UNHEALTHY` when either configured threshold is exceeded:
+
+- **`max_error_rate`** (default `0.1`) — if more than 10 % of observed requests result in a 4xx/5xx, the probe fails.
+- **`max_avg_rtt_ms`** (default `None`) — if the exponential moving average latency exceeds this value in milliseconds, the probe fails.
+
+```python
+# Tighter thresholds for a latency-sensitive endpoint
+payments_probe = RouteProbe(
+    name="checkout",
+    max_error_rate=0.01,      # fail if >1% of requests error
+    max_avg_rtt_ms=200,       # fail if average latency exceeds 200 ms
+)
+
+@app.post("/checkout")
+@payments_probe.watch
+async def checkout(body: CheckoutRequest):
+    ...
+```
+
+#### Example probe result
+
+```json
+{
+  "name": "users-api",
+  "status": "healthy",
+  "critical": true,
+  "latency_ms": 45.23,
+  "error": null,
+  "details": {
+    "request_count": 1042,
+    "error_count": 3,
+    "error_rate": 0.0029,
+    "consecutive_errors": 0,
+    "last_status_code": 200,
+    "last_rtt_ms": 38.12,
+    "avg_rtt_ms": 45.23,
+    "p95_rtt_ms": 120.10,
+    "min_rtt_ms": 12.04,
+    "max_rtt_ms": 843.21,
+    "requests_per_minute": 142.7
+  }
+}
+```
+
+#### Before the first request
+
+Until at least one request has been handled, `RouteProbe.check()` returns `HEALTHY` with a `"no requests observed yet"` message in `details`. This prevents a fresh deployment from immediately showing as unhealthy simply because traffic hasn't arrived yet.
+
+#### Watching sync handlers
+
+`@watch` supports both `async def` and `def` route handlers — the wrapper detects the function type automatically.
+
+#### Constructor arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `name` | `"route"` | Probe label |
+| `max_error_rate` | `0.1` | Error-rate threshold above which the probe is UNHEALTHY (0–1) |
+| `max_avg_rtt_ms` | `None` | Average-RTT threshold in milliseconds. `None` disables this threshold |
+| `window_size` | `100` | Number of recent requests used for percentile and throughput calculations |
+| `ema_alpha` | `0.1` | Smoothing factor for the exponential moving average (0–1). Higher = reacts faster to changes |
+| `timeout` | `None` | Passed to the registry for the `check()` call; not used internally |
+
+#### Using RouteProbe with ProbeRouter
+
+Because `RouteProbe` is both a probe and a decorator, the instance needs to be accessible in both the module that owns the route and the module that owns the router. The most ergonomic pattern is to declare the probe in a `probes.py` alongside the routes and import it in both places:
+
+```python
+# features/users/probes.py
+from fastapi_watch import ProbeRouter, RouteProbe
+
+router = ProbeRouter()
+
+users_list_probe = RouteProbe(name="users-list", max_error_rate=0.05)
+users_detail_probe = RouteProbe(name="users-detail", max_avg_rtt_ms=150)
+
+router.add(users_list_probe)
+router.add(users_detail_probe)
+```
+
+```python
+# features/users/routes.py
+from fastapi import APIRouter
+from .probes import users_list_probe, users_detail_probe
+
+router = APIRouter(prefix="/users")
+
+@router.get("/")
+@users_list_probe.watch
+async def list_users():
+    ...
+
+@router.get("/{user_id}")
+@users_detail_probe.watch
+async def get_user(user_id: int):
+    ...
+```
+
+```python
+# main.py
+from fastapi import FastAPI
+from fastapi_watch import HealthRegistry
+from features.users.probes import router as users_health_router
+from features.users.routes import router as users_api_router
+
+app = FastAPI()
+app.include_router(users_api_router)
+
+registry = HealthRegistry(app, routers=[users_health_router])
+```
 
 ---
 
@@ -1255,16 +1592,14 @@ registry.add(CeleryProbe(celery, min_workers=1))
 registry.add(CeleryProbe(celery, min_workers=2))
 ```
 
-The `min_workers` threshold only matters when `workers_online < min_workers`. Once enough workers are online, the probe is healthy regardless of the setting.
-
 **Constructor arguments:**
 
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `app` | required | Your Celery application instance |
 | `name` | `"celery"` | Probe label |
-| `timeout` | `1.0` | Seconds to wait for each inspector broadcast reply. Workers that are alive respond well within 1 s; the timeout only matters when workers are unreachable. |
-| `min_workers` | `0` | Minimum number of workers that must be online. `0` means workers are optional (scale-to-zero); any positive value requires at least that many workers to be live. |
+| `timeout` | `1.0` | Seconds to wait for each inspector broadcast reply |
+| `min_workers` | `0` | Minimum number of workers that must be online. `0` means scale-to-zero is acceptable |
 
 ---
 
@@ -1305,6 +1640,12 @@ registry.add(SqlAlchemyProbe(engine=engine, name="primary-db"))
 ---
 
 ### All built-in probes
+
+#### Application routes
+
+| Probe | Extra | Key constructor args | Details fields |
+|-------|-------|---------------------|----------------|
+| `RouteProbe` | built-in | `name`, `max_error_rate`, `max_avg_rtt_ms`, `window_size`, `ema_alpha` | `request_count`, `error_count`, `error_rate`, `consecutive_errors`, `last_status_code`, `last_rtt_ms`, `avg_rtt_ms`, `p95_rtt_ms`, `min_rtt_ms`, `max_rtt_ms`, `requests_per_minute` |
 
 #### Databases
 
@@ -1362,6 +1703,9 @@ registry.add(SqlAlchemyProbe(engine=engine, name="primary-db"))
 | `logger` | `logging.Logger \| None` | `None` | Logger for warnings (e.g. clamped interval) and probe exception messages. Pass `None` to emit no logs. |
 | `grace_period_ms` | `int` | `0` | How long (ms) after startup to return `503 {"status": "starting"}` from `/ready`. `0` disables the grace period. |
 | `history_size` | `int` | `10` | Number of past probe results to retain per probe. Retrieved via `GET /health/history`. Minimum `1`. |
+| `timezone` | `str` | `"UTC"` | IANA timezone name for all `checked_at` timestamps. Reflected in the `timezone` field of every response. |
+| `routers` | `list[ProbeRouter] \| None` | `None` | One or more `ProbeRouter` instances to include at startup. Equivalent to calling `include_router()` for each. |
+| `dashboard` | `bool` | `True` | When `True`, registers `GET /health/dashboard` — a server-rendered HTML page with live SSE updates. Pass `False` to omit the route. |
 
 ### `HealthRegistry.add(probe, critical=True)`
 
@@ -1372,6 +1716,14 @@ Adds a single probe. Returns `self` for chaining. Adding the same instance more 
 ### `HealthRegistry.add_probes(probes, critical=True)`
 
 Adds a list of probes. The `critical` flag applies to every probe in the list. Returns `self` for chaining. Duplicate instances are silently skipped.
+
+### `HealthRegistry.include_router(router)`
+
+Includes all probes from a `ProbeRouter`, preserving each probe's criticality setting. Returns `self` for chaining. Duplicate instances are silently skipped.
+
+```python
+registry.include_router(db_router).include_router(payments_router)
+```
 
 ### `HealthRegistry.on_state_change(callback)`
 
@@ -1396,12 +1748,45 @@ for r in results:
     print(r.name, r.status, r.latency_ms, r.details)
 ```
 
+---
+
+### `ProbeRouter`
+
+Collects probe registrations defined across multiple modules so they can be passed to `HealthRegistry` at startup. Mirrors the `APIRouter` pattern from FastAPI.
+
+| Method | Description |
+|--------|-------------|
+| `add(probe, critical=True)` | Add a single probe. Returns `self`. Duplicate instances are silently skipped. |
+| `add_probes(probes, critical=True)` | Add multiple probes with the same criticality. Returns `self`. |
+| `include_router(router)` | Merge another `ProbeRouter`'s probes into this one, preserving each probe's criticality. Returns `self`. |
+
+---
+
+### `RouteProbe`
+
+Instruments a FastAPI route handler via the `@probe.watch` decorator and reports real-traffic metrics as a `ProbeResult`.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `name` | `str` | `"route"` | Probe label shown in health reports |
+| `max_error_rate` | `float` | `0.1` | Error-rate threshold (0–1). The probe becomes UNHEALTHY when exceeded. |
+| `max_avg_rtt_ms` | `float \| None` | `None` | Average-RTT threshold in milliseconds. `None` disables this threshold. |
+| `window_size` | `int` | `100` | Number of recent requests kept for percentile and throughput calculations |
+| `ema_alpha` | `float` | `0.1` | EMA smoothing factor (0–1). Higher values make `avg_rtt_ms` react faster to changes. |
+| `timeout` | `float \| None` | `None` | Passed to the registry for the `check()` call; not used internally |
+
+**`RouteProbe.watch(func)`** — decorator that wraps an `async def` or `def` route handler. Preserves the function's signature so FastAPI dependency injection continues to work. `HTTPException` is caught, its status code recorded, and then re-raised. Any other exception is recorded as a 500 and re-raised.
+
+---
+
 ### `BaseProbe`
 
 | Attribute | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `name` | `str` | `"unnamed"` | Label used in health reports. Override as a class attribute or set in `__init__`. |
 | `timeout` | `float \| None` | `None` | Per-probe timeout in seconds. The check is cancelled and recorded as unhealthy if it exceeds this value. `None` means no limit. |
+
+---
 
 ### `ProbeResult`
 
@@ -1460,3 +1845,7 @@ registry = HealthRegistry(app, grace_period_ms=30_000)
 ## License
 
 MIT
+
+---
+
+*Claude used to write README, code annotation, help with test case coverage, and clean up my messy thoughts into readable code.*
