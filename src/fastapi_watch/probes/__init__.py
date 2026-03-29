@@ -16,20 +16,14 @@ __all__ = [
     "BaseProbe",
     "CeleryProbe",
     "MemoryProbe",
-    # databases
     "SqlAlchemyProbe",
     "PostgreSQLProbe",
     "MySQLProbe",
-    # caching
     "RedisProbe",
     "MemcachedProbe",
-    # messaging / queues
     "RabbitMQProbe",
     "KafkaProbe",
-    # document stores
     "MongoProbe",
-    # http
     "HttpProbe",
-    # route instrumentation
     "RouteProbe",
 ]
