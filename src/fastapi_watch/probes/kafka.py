@@ -1,3 +1,4 @@
+import asyncio
 import time
 
 from ..models import ProbeResult, ProbeStatus
@@ -52,16 +53,14 @@ class KafkaProbe(BaseProbe):
 
             details: dict = {}
             try:
-                topics = await client.list_topics()
-                cluster = await client.describe_cluster()
+                topics, cluster = await asyncio.gather(
+                    client.list_topics(),
+                    client.describe_cluster(),
+                )
                 details["broker_count"] = len(cluster.brokers)
                 details["controller_id"] = cluster.controller_id
-                details["topics"] = sorted(
-                    t for t in topics if not t.startswith("__")
-                )
-                details["internal_topics"] = sorted(
-                    t for t in topics if t.startswith("__")
-                )
+                details["topics"] = sorted(t for t in topics if not t.startswith("__"))
+                details["internal_topics"] = sorted(t for t in topics if t.startswith("__"))
             except Exception:
                 pass  # details are best-effort
 
@@ -83,6 +82,6 @@ class KafkaProbe(BaseProbe):
         finally:
             if client is not None:
                 try:
-                    await client.close()
+                    await asyncio.wait_for(client.close(), timeout=5.0)
                 except Exception:
                     pass

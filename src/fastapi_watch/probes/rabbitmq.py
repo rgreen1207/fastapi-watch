@@ -1,3 +1,4 @@
+import asyncio
 import time
 from urllib.parse import urlparse
 
@@ -91,10 +92,17 @@ class RabbitMQProbe(BaseProbe):
 
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5.0)) as session:
-                # --- Overview ------------------------------------------------
-                async with session.get(f"{base}/overview", auth=auth) as resp:
-                    resp.raise_for_status()
-                    overview = await resp.json()
+
+                async def _get_json(path: str) -> dict | list:
+                    async with session.get(f"{base}/{path}", auth=auth) as resp:
+                        resp.raise_for_status()
+                        return await resp.json()
+
+                # Fetch overview and queues in parallel.
+                overview, queues_data = await asyncio.gather(
+                    _get_json("overview"),
+                    _get_json("queues"),
+                )
 
                 totals = overview.get("queue_totals", {})
                 stats = overview.get("message_stats", {})
@@ -119,11 +127,6 @@ class RabbitMQProbe(BaseProbe):
                     "deliver_rate": stats.get("deliver_get_details", {}).get("rate", 0),
                     "ack_rate": stats.get("ack_details", {}).get("rate", 0),
                 }
-
-                # --- Per-queue details ----------------------------------------
-                async with session.get(f"{base}/queues", auth=auth) as resp:
-                    resp.raise_for_status()
-                    queues_data = await resp.json()
 
                 queues = {}
                 for q in queues_data:

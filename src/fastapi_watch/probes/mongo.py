@@ -21,6 +21,7 @@ class MongoProbe(BaseProbe):
         self.url = url
         self.name = name
         self._timeout_ms = server_selection_timeout_ms
+        self._client = None  # reused across checks
 
     async def check(self) -> ProbeResult:
         try:
@@ -31,13 +32,13 @@ class MongoProbe(BaseProbe):
             ) from exc
 
         start = time.perf_counter()
-        client = None
         try:
-            client = motor.AsyncIOMotorClient(
-                self.url,
-                serverSelectionTimeoutMS=self._timeout_ms,
-            )
-            status = await client.admin.command("serverStatus")
+            if self._client is None:
+                self._client = motor.AsyncIOMotorClient(
+                    self.url,
+                    serverSelectionTimeoutMS=self._timeout_ms,
+                )
+            status = await self._client.admin.command("serverStatus")
             latency = (time.perf_counter() - start) * 1000
 
             connections = status.get("connections", {})
@@ -63,12 +64,13 @@ class MongoProbe(BaseProbe):
             )
         except Exception as exc:
             latency = (time.perf_counter() - start) * 1000
+            # Reset the client so it is recreated on the next check.
+            if self._client is not None:
+                self._client.close()
+                self._client = None
             return ProbeResult(
                 name=self.name,
                 status=ProbeStatus.UNHEALTHY,
                 latency_ms=round(latency, 2),
                 error=str(exc),
             )
-        finally:
-            if client is not None:
-                client.close()

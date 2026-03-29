@@ -101,11 +101,11 @@ async def test_redis_probe_cluster_breakdown():
     from fastapi_watch.probes.redis import RedisProbe
     mock_redis = _make_mock_redis()
     mock_redis.scan_iter = MagicMock(return_value=_async_iter(["sess:abc", "sess:def", "cache:xyz"]))
-    mock_redis.ttl = AsyncMock(return_value=300)
     with patch("redis.asyncio.from_url", return_value=mock_redis):
         probe = RedisProbe()
         result = await probe.check()
     clusters = result.details.get("clusters", {})
-    assert clusters["sess"]["keys"] == 2
-    assert clusters["cache"]["keys"] == 1
-    assert clusters["sess"]["ttl_seconds"] == 300
+    assert clusters["sess"] == 2
+    assert clusters["cache"] == 1
+    # truncation flag is absent when under the scan limit
+    assert "clusters_truncated" not in result.details
