@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
-from ._dashboard import render_dashboard
+from .dashboard import render_dashboard
 from .models import HealthReport, ProbeResult, ProbeStatus
 from .probe_router import ProbeRouter
 from .probes.base import BaseProbe
@@ -59,9 +59,19 @@ class HealthRegistry:
         timezone: IANA timezone name used for all timestamps (default ``"UTC"``).
             The value is reflected in the ``timezone`` field of every health
             response so callers know how to interpret ``checked_at``.
-        dashboard: When ``True`` (default) registers ``GET /health/dashboard``,
-            a server-rendered HTML page that shows all probe results and updates
-            live via SSE.  Pass ``False`` to omit the route entirely.
+        dashboard: Controls the ``GET /health/dashboard`` route.
+
+            * ``True`` (default) — serve the built-in server-rendered HTML page
+              with live SSE updates.
+            * ``False`` — omit the route entirely (JSON endpoints only).
+            * *callable* — serve a custom dashboard.  The callable must accept a
+              single :class:`~fastapi_watch.models.HealthReport` argument and
+              return an HTML string.  Example::
+
+                  def my_dashboard(report: HealthReport) -> str:
+                      return f"<html><body>{report.status}</body></html>"
+
+                  registry = HealthRegistry(app, dashboard=my_dashboard)
 
     Example::
 
@@ -88,7 +98,7 @@ class HealthRegistry:
         history_size: int = 10,
         timezone: str = "UTC",
         routers: list[ProbeRouter] | None = None,
-        dashboard: bool = True,
+        dashboard: bool | Callable[..., str] = True,
     ) -> None:
         self.app = app
         self.prefix = prefix
@@ -325,7 +335,7 @@ class HealthRegistry:
         finally:
             await self._on_disconnect()
 
-    def _register_routes(self, tags: list[str], dashboard: bool = True) -> None:
+    def _register_routes(self, tags: list[str], dashboard: bool | Callable[..., str] = True) -> None:
         registry = self
         prefix = self.prefix
 
@@ -420,7 +430,15 @@ class HealthRegistry:
                 headers=sse_headers,
             )
 
-        if dashboard:
+        if dashboard is not False:
+            if callable(dashboard):
+                _renderer: Callable[..., str] = dashboard
+            else:
+                _stream_url = f"{prefix}/status/stream"
+
+                def _renderer(report: HealthReport) -> str:
+                    return render_dashboard(report, stream_url=_stream_url)
+
             @self.app.get(
                 f"{prefix}/dashboard",
                 tags=tags,
@@ -435,5 +453,4 @@ class HealthRegistry:
                     checked_at=registry._last_checked_at,
                     timezone=registry._timezone_name,
                 )
-                html = render_dashboard(report, stream_url=f"{prefix}/status/stream")
-                return HTMLResponse(content=html)
+                return HTMLResponse(content=_renderer(report))

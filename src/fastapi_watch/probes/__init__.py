@@ -1,5 +1,6 @@
 from .base import BaseProbe
 from .route import RouteProbe
+from .websocket import WebSocketProbe
 from .celery import CeleryProbe
 from .memory import MemoryProbe
 from .redis import RedisProbe
@@ -26,4 +27,5 @@ __all__ = [
     "MongoProbe",
     "HttpProbe",
     "RouteProbe",
+    "WebSocketProbe",
 ]
