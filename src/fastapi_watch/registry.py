@@ -6,9 +6,11 @@ from typing import AsyncGenerator, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
+from ._dashboard import render_dashboard
 from .models import HealthReport, ProbeResult, ProbeStatus
+from .probe_router import ProbeRouter
 from .probes.base import BaseProbe
 
 _MIN_POLL_INTERVAL_MS = 1000
@@ -34,6 +36,8 @@ class HealthRegistry:
     - ``GET /health/live``          — liveness; always 200
     - ``GET /health/ready``         — readiness; 200 if all probes pass, 503 otherwise
     - ``GET /health/status``        — full probe detail; 200 / 207 (Multi-Status)
+    - ``GET /health/history``       — rolling probe result history
+    - ``GET /health/dashboard``     — HTML dashboard with live SSE updates (disable with ``dashboard=False``)
     - ``GET /health/ready/stream``  — SSE stream of readiness; polls while connected
     - ``GET /health/status/stream`` — SSE stream of full probe detail; polls while connected
 
@@ -55,12 +59,18 @@ class HealthRegistry:
         timezone: IANA timezone name used for all timestamps (default ``"UTC"``).
             The value is reflected in the ``timezone`` field of every health
             response so callers know how to interpret ``checked_at``.
+        dashboard: When ``True`` (default) registers ``GET /health/dashboard``,
+            a server-rendered HTML page that shows all probe results and updates
+            live via SSE.  Pass ``False`` to omit the route entirely.
 
     Example::
 
         registry = HealthRegistry(app, logger=logging.getLogger(__name__))
         registry.add(RedisProbe(url="redis://localhost"))
         registry.add(HttpProbe(url="https://api.example.com/health"))
+
+        # Declare probes in separate modules and include them in one line:
+        registry = HealthRegistry(app, routers=[db_router, cache_router])
 
         # Change the interval at runtime:
         registry.set_poll_interval(30_000)   # every 30 s
@@ -77,6 +87,8 @@ class HealthRegistry:
         grace_period_ms: int = 0,
         history_size: int = 10,
         timezone: str = "UTC",
+        routers: list[ProbeRouter] | None = None,
+        dashboard: bool = True,
     ) -> None:
         self.app = app
         self.prefix = prefix
@@ -99,7 +111,21 @@ class HealthRegistry:
         self._active_connections: int = 0
         self._cache_lock = asyncio.Lock()
 
-        self._register_routes(tags or ["health"])
+        self._register_routes(tags or ["health"], dashboard=dashboard)
+        for router in routers or []:
+            self.include_router(router)
+
+    def include_router(self, router: ProbeRouter) -> "HealthRegistry":
+        """Include all probes from a :class:`~fastapi_watch.ProbeRouter`. Returns ``self`` for chaining.
+
+        Preserves each probe's criticality as declared on the router.
+
+        Args:
+            router: A :class:`~fastapi_watch.ProbeRouter` populated in another module.
+        """
+        for probe, critical in router._probes:
+            self.add(probe, critical=critical)
+        return self
 
     def add(self, probe: BaseProbe, critical: bool = True) -> "HealthRegistry":
         """Add a single probe to the registry. Returns ``self`` for chaining.
@@ -299,7 +325,7 @@ class HealthRegistry:
         finally:
             await self._on_disconnect()
 
-    def _register_routes(self, tags: list[str]) -> None:
+    def _register_routes(self, tags: list[str], dashboard: bool = True) -> None:
         registry = self
         prefix = self.prefix
 
@@ -393,3 +419,21 @@ class HealthRegistry:
                 media_type="text/event-stream",
                 headers=sse_headers,
             )
+
+        if dashboard:
+            @self.app.get(
+                f"{prefix}/dashboard",
+                tags=tags,
+                summary="Health dashboard",
+                description="Server-rendered HTML dashboard with live SSE updates.",
+                response_class=HTMLResponse,
+            )
+            async def health_dashboard() -> HTMLResponse:
+                results = await registry._get_results()
+                report = HealthReport.from_results(
+                    results,
+                    checked_at=registry._last_checked_at,
+                    timezone=registry._timezone_name,
+                )
+                html = render_dashboard(report, stream_url=f"{prefix}/status/stream")
+                return HTMLResponse(content=html)
