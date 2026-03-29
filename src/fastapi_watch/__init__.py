@@ -5,4 +5,4 @@ from .probes.websocket import WebSocketProbe
 from .dashboard import render_dashboard
 
 __all__ = ["HealthRegistry", "ProbeRouter", "RouteProbe", "WebSocketProbe", "render_dashboard"]
-__version__ = "1.1.0"
+__version__ = "1.2.0"
