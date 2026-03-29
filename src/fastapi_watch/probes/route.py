@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -71,6 +72,7 @@ class RouteProbe(BaseProbe):
         self.max_avg_rtt_ms = max_avg_rtt_ms
         self.ema_alpha = ema_alpha
 
+        self._lock = threading.Lock()
         self._request_count: int = 0
         self._error_count: int = 0
         self._consecutive_errors: int = 0
@@ -87,30 +89,31 @@ class RouteProbe(BaseProbe):
     # ------------------------------------------------------------------
 
     def _record(self, status_code: int, rtt_ms: float) -> None:
-        self._request_count += 1
-        self._last_status_code = status_code
-        self._last_rtt_ms = rtt_ms
-        self._request_timestamps.append(datetime.now(timezone.utc).timestamp())
+        with self._lock:
+            self._request_count += 1
+            self._last_status_code = status_code
+            self._last_rtt_ms = rtt_ms
+            self._request_timestamps.append(datetime.now(timezone.utc).timestamp())
 
-        is_error = status_code >= 400
-        if is_error:
-            self._error_count += 1
-            self._consecutive_errors += 1
-        else:
-            self._consecutive_errors = 0
+            is_error = status_code >= 400
+            if is_error:
+                self._error_count += 1
+                self._consecutive_errors += 1
+            else:
+                self._consecutive_errors = 0
 
-        # Exponential moving average
-        if self._avg_rtt_ms is None:
-            self._avg_rtt_ms = rtt_ms
-        else:
-            self._avg_rtt_ms = self.ema_alpha * rtt_ms + (1 - self.ema_alpha) * self._avg_rtt_ms
+            # Exponential moving average
+            if self._avg_rtt_ms is None:
+                self._avg_rtt_ms = rtt_ms
+            else:
+                self._avg_rtt_ms = self.ema_alpha * rtt_ms + (1 - self.ema_alpha) * self._avg_rtt_ms
 
-        if self._min_rtt_ms is None or rtt_ms < self._min_rtt_ms:
-            self._min_rtt_ms = rtt_ms
-        if self._max_rtt_ms is None or rtt_ms > self._max_rtt_ms:
-            self._max_rtt_ms = rtt_ms
+            if self._min_rtt_ms is None or rtt_ms < self._min_rtt_ms:
+                self._min_rtt_ms = rtt_ms
+            if self._max_rtt_ms is None or rtt_ms > self._max_rtt_ms:
+                self._max_rtt_ms = rtt_ms
 
-        self._rtt_window.append(rtt_ms)
+            self._rtt_window.append(rtt_ms)
 
     # ------------------------------------------------------------------
     # Computed properties

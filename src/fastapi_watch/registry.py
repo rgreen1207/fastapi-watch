@@ -288,7 +288,9 @@ class HealthRegistry:
 
     async def _poll_loop(self) -> None:
         while True:
-            self._cached_results = await self.run_all()
+            results = await self.run_all()
+            async with self._cache_lock:
+                self._cached_results = results
             await asyncio.sleep(self._poll_interval_ms / 1000)
 
     async def _get_results(self) -> list[ProbeResult]:

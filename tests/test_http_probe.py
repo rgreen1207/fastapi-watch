@@ -12,9 +12,11 @@ except ImportError:
 pytestmark = pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
 
 
-def _make_mock_session(status: int):
+def _make_mock_session(status: int, body: bytes = b"OK"):
     mock_response = AsyncMock()
     mock_response.status = status
+    mock_response.headers = {"Content-Type": "text/plain", "Content-Length": str(len(body))}
+    mock_response.read = AsyncMock(return_value=body)
     mock_response.__aenter__ = AsyncMock(return_value=mock_response)
     mock_response.__aexit__ = AsyncMock(return_value=False)
 

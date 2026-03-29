@@ -44,12 +44,17 @@ class HttpProbe(BaseProbe):
             timeout = aiohttp.ClientTimeout(total=self.timeout)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(self.url) as response:
-                    body = await response.read()
                     latency = (time.perf_counter() - start) * 1000
+                    # Prefer Content-Length to avoid reading the full body.
+                    cl = response.headers.get("Content-Length")
+                    if cl is not None:
+                        response_bytes = int(cl)
+                    else:
+                        response_bytes = len(await response.read())
                     details = {
                         "status_code": response.status,
                         "content_type": response.headers.get("Content-Type"),
-                        "response_bytes": len(body),
+                        "response_bytes": response_bytes,
                     }
                     if response.status == self.expected_status:
                         return ProbeResult(

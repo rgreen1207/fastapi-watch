@@ -128,7 +128,7 @@ class CeleryProbe(BaseProbe):
     async def check(self) -> ProbeResult:
         start = time.perf_counter()
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             data = await loop.run_in_executor(None, self._inspect)
             latency = (time.perf_counter() - start) * 1000
 
