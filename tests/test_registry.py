@@ -211,10 +211,10 @@ def test_set_poll_interval_updates_value():
 def test_set_poll_interval_to_zero_clears_cache():
     app = FastAPI()
     registry = HealthRegistry(app)
-    registry._cached_results = [ProbeResult(name="x", status=ProbeStatus.HEALTHY)]
+    registry._probe_cache["x"] = ProbeResult(name="x", status=ProbeStatus.HEALTHY)
     registry.set_poll_interval(0)
     assert registry._poll_interval_ms is None
-    assert registry._cached_results is None
+    assert len(registry._probe_cache) == 0
 
 
 def test_set_poll_interval_below_minimum_is_clamped():
@@ -329,9 +329,9 @@ async def test_poll_loop_populates_cache():
     registry.add(MemoryProbe(name="mem"))
 
     # Simulate startup then run the poll loop once manually.
-    registry._cached_results = await registry.run_all()
-    assert registry._cached_results is not None
-    assert registry._cached_results[0].name == "mem"
+    await registry.run_all()
+    assert len(registry._probe_cache) > 0
+    assert "mem" in registry._probe_cache
 
 
 @pytest.mark.asyncio
@@ -339,11 +339,14 @@ async def test_get_results_uses_cache_in_poll_mode():
     app = FastAPI()
     registry = HealthRegistry(app, poll_interval_ms=60_000)
 
-    cached = [ProbeResult(name="cached", status=ProbeStatus.HEALTHY)]
-    registry._cached_results = cached
+    cached_result = ProbeResult(name="cached", status=ProbeStatus.HEALTHY)
+    registry._probes.append((MemoryProbe(name="cached"), True))
+    registry._probe_cache["cached"] = cached_result
 
     results = await registry._get_results()
-    assert results is cached
+    assert any(r.name == "cached" for r in results)
+    # Polled probe with warm cache should not have been re-run
+    assert registry._probe_cache["cached"] is cached_result
 
 
 @pytest.mark.asyncio
@@ -938,3 +941,451 @@ def test_history_default_size_is_10():
     app = FastAPI()
     registry = HealthRegistry(app)
     assert registry._history_size == 10
+
+
+# ---------------------------------------------------------------------------
+# Per-probe poll frequency
+# ---------------------------------------------------------------------------
+
+
+def test_probe_poll_interval_overrides_registry_default():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=60_000)
+    probe = MemoryProbe(name="mem")
+    probe.poll_interval_ms = 5_000
+    registry.add(probe)
+    assert registry._effective_interval_s(probe) == 5.0
+
+
+def test_probe_poll_interval_falls_back_to_registry():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=30_000)
+    probe = MemoryProbe(name="mem")
+    # poll_interval_ms is None by default
+    assert registry._effective_interval_s(probe) == 30.0
+
+
+def test_probe_poll_interval_none_in_single_fetch_mode():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    probe = MemoryProbe(name="mem")
+    assert registry._effective_interval_s(probe) is None
+
+
+def test_is_probe_due_when_never_run():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=60_000)
+    probe = MemoryProbe(name="mem")
+    registry.add(probe)
+    assert registry._is_probe_due(probe, now=1000.0) is True
+
+
+def test_is_probe_due_after_interval_elapsed():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=10_000)
+    probe = MemoryProbe(name="mem")
+    registry.add(probe)
+    registry._probe_last_run["mem"] = 1000.0
+    assert registry._is_probe_due(probe, now=1010.1) is True
+
+
+def test_is_probe_not_due_before_interval():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=10_000)
+    probe = MemoryProbe(name="mem")
+    registry.add(probe)
+    registry._probe_last_run["mem"] = 1000.0
+    assert registry._is_probe_due(probe, now=1005.0) is False
+
+
+def test_has_custom_intervals_true():
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    probe = MemoryProbe(name="mem")
+    probe.poll_interval_ms = 5_000
+    registry.add(probe)
+    assert registry._has_custom_intervals() is True
+
+
+def test_has_custom_intervals_false():
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    registry.add(MemoryProbe(name="mem"))
+    assert registry._has_custom_intervals() is False
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_circuit_opens_after_threshold():
+    class AlwaysFail(MemoryProbe):
+        async def check(self):
+            return ProbeResult(name=self.name, status=ProbeStatus.UNHEALTHY, error="fail")
+
+    app = FastAPI()
+    registry = HealthRegistry(app, circuit_breaker_threshold=3, circuit_breaker_cooldown_ms=60_000)
+    probe = AlwaysFail(name="bad")
+    registry.add(probe)
+
+    for _ in range(3):
+        await registry._safe_check(probe, critical=True)
+
+    assert probe.name in registry._circuit_open_until
+
+
+@pytest.mark.asyncio
+async def test_circuit_returns_cached_when_open():
+    class AlwaysFail(MemoryProbe):
+        async def check(self):
+            return ProbeResult(name=self.name, status=ProbeStatus.UNHEALTHY, error="fail")
+
+    app = FastAPI()
+    registry = HealthRegistry(app, circuit_breaker_threshold=2, circuit_breaker_cooldown_ms=60_000)
+    probe = AlwaysFail(name="bad")
+    registry.add(probe)
+
+    # Trip the circuit
+    for _ in range(2):
+        await registry._safe_check(probe, critical=True)
+
+    # Next call should be served from cache with circuit_breaker_open flag
+    result = await registry._safe_check(probe, critical=True)
+    assert result.details is not None
+    assert result.details.get("circuit_breaker_open") is True
+
+
+@pytest.mark.asyncio
+async def test_circuit_resets_on_success():
+    call_count = 0
+
+    class SometimesFail(MemoryProbe):
+        async def check(self):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 3:
+                return ProbeResult(name=self.name, status=ProbeStatus.UNHEALTHY, error="fail")
+            return ProbeResult(name=self.name, status=ProbeStatus.HEALTHY)
+
+    app = FastAPI()
+    registry = HealthRegistry(app, circuit_breaker_threshold=3, circuit_breaker_cooldown_ms=0)
+    probe = SometimesFail(name="flaky")
+    registry.add(probe)
+
+    # Trip the circuit
+    for _ in range(3):
+        await registry._safe_check(probe, critical=True)
+    assert probe.name in registry._circuit_open_until
+
+    # Force the circuit open_until to the past so it's eligible to retry
+    registry._circuit_open_until[probe.name] = 0.0
+
+    # Next run should succeed and clear the circuit
+    result = await registry._safe_check(probe, critical=True)
+    assert result.is_healthy
+    assert probe.name not in registry._circuit_open_until
+    assert probe.name not in registry._circuit_err_count
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_disabled():
+    call_count = 0
+
+    class AlwaysFail(MemoryProbe):
+        async def check(self):
+            nonlocal call_count
+            call_count += 1
+            return ProbeResult(name=self.name, status=ProbeStatus.UNHEALTHY, error="fail")
+
+    app = FastAPI()
+    registry = HealthRegistry(app, circuit_breaker=False, circuit_breaker_threshold=2)
+    probe = AlwaysFail(name="bad")
+    registry.add(probe)
+
+    for _ in range(5):
+        await registry._safe_check(probe, critical=True)
+
+    # Circuit is disabled — probe should have been called every time
+    assert call_count == 5
+    assert probe.name not in registry._circuit_open_until
+
+
+@pytest.mark.asyncio
+async def test_circuit_per_probe_threshold_override():
+    class AlwaysFail(MemoryProbe):
+        async def check(self):
+            return ProbeResult(name=self.name, status=ProbeStatus.UNHEALTHY, error="fail")
+
+    app = FastAPI()
+    registry = HealthRegistry(app, circuit_breaker_threshold=10, circuit_breaker_cooldown_ms=60_000)
+    probe = AlwaysFail(name="bad")
+    probe.circuit_breaker_threshold = 2  # per-probe override
+    registry.add(probe)
+
+    for _ in range(2):
+        await registry._safe_check(probe, critical=True)
+
+    # Should have opened after 2, not 10
+    assert probe.name in registry._circuit_open_until
+
+
+# ---------------------------------------------------------------------------
+# Webhook on state change
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_webhook_fired_on_state_change(monkeypatch):
+    posted = []
+
+    async def fake_post_webhook(self, probe_name, old, new):
+        posted.append((probe_name, old.value, new.value))
+
+    monkeypatch.setattr("fastapi_watch.registry.HealthRegistry._post_webhook", fake_post_webhook)
+
+    app = FastAPI()
+    registry = HealthRegistry(app, webhook_url="http://hooks.example.com/health")
+
+    # Seed initial state as healthy
+    registry._probe_states["svc"] = ProbeStatus.HEALTHY
+
+    # Fire a state change: healthy → unhealthy
+    results = [ProbeResult(name="svc", status=ProbeStatus.UNHEALTHY, error="down")]
+    await registry._fire_state_changes(results)
+
+    # yield to the event loop so the create_task coroutine runs
+    await asyncio.sleep(0)
+
+    assert len(posted) == 1
+    assert posted[0] == ("svc", "healthy", "unhealthy")
+
+
+@pytest.mark.asyncio
+async def test_webhook_not_fired_when_status_unchanged(monkeypatch):
+    posted = []
+
+    async def fake_post_webhook(self, probe_name, old, new):
+        posted.append((probe_name, old.value, new.value))
+
+    monkeypatch.setattr("fastapi_watch.registry.HealthRegistry._post_webhook", fake_post_webhook)
+
+    app = FastAPI()
+    registry = HealthRegistry(app, webhook_url="http://hooks.example.com/health")
+
+    registry._probe_states["svc"] = ProbeStatus.HEALTHY
+    results = [ProbeResult(name="svc", status=ProbeStatus.HEALTHY)]
+    await registry._fire_state_changes(results)
+
+    assert posted == []
+
+
+@pytest.mark.asyncio
+async def test_webhook_not_fired_without_url():
+    called = False
+
+    app = FastAPI()
+    registry = HealthRegistry(app)  # no webhook_url
+
+    registry._probe_states["svc"] = ProbeStatus.HEALTHY
+    results = [ProbeResult(name="svc", status=ProbeStatus.UNHEALTHY, error="down")]
+    # _fire_state_changes fast-path: no callbacks, no webhook_url
+    await registry._fire_state_changes(results)
+
+    # Nothing raised and _webhook_url is None
+    assert registry._webhook_url is None
+
+
+@pytest.mark.asyncio
+async def test_webhook_not_fired_on_first_run():
+    """First run seeds state — no callbacks until a *subsequent* run shows a change."""
+    posted = []
+
+    async def fake_post_webhook(self, probe_name, old, new):
+        posted.append((probe_name,))
+
+    import fastapi_watch.registry as reg_module
+    original = reg_module.HealthRegistry._post_webhook
+
+    app = FastAPI()
+    registry = HealthRegistry(app, webhook_url="http://hooks.example.com/health")
+    # _probe_states is empty — old will be None, so no webhook
+    results = [ProbeResult(name="svc", status=ProbeStatus.UNHEALTHY, error="down")]
+    await registry._fire_state_changes(results)
+
+    # State seeded but no webhook because there was no *previous* state to compare
+    assert posted == []
+    assert registry._probe_states["svc"] == ProbeStatus.UNHEALTHY
+
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+
+def test_auth_basic_missing_credentials():
+    app = FastAPI()
+    HealthRegistry(app, auth={"type": "basic", "username": "admin", "password": "secret"})
+    client = TestClient(app, raise_server_exceptions=False)
+    resp = client.get("/health/live")
+    assert resp.status_code == 401
+    assert "WWW-Authenticate" in resp.headers
+
+
+def test_auth_basic_wrong_credentials():
+    app = FastAPI()
+    HealthRegistry(app, auth={"type": "basic", "username": "admin", "password": "secret"})
+    client = TestClient(app, raise_server_exceptions=False)
+    import base64
+    creds = base64.b64encode(b"admin:wrong").decode()
+    resp = client.get("/health/live", headers={"Authorization": f"Basic {creds}"})
+    assert resp.status_code == 401
+
+
+def test_auth_basic_correct_credentials():
+    app = FastAPI()
+    HealthRegistry(app, auth={"type": "basic", "username": "admin", "password": "secret"})
+    client = TestClient(app, raise_server_exceptions=False)
+    import base64
+    creds = base64.b64encode(b"admin:secret").decode()
+    resp = client.get("/health/live", headers={"Authorization": f"Basic {creds}"})
+    assert resp.status_code == 200
+
+
+def test_auth_apikey_missing():
+    app = FastAPI()
+    HealthRegistry(app, auth={"type": "apikey", "key": "mykey"})
+    client = TestClient(app, raise_server_exceptions=False)
+    resp = client.get("/health/live")
+    assert resp.status_code == 403
+
+
+def test_auth_apikey_wrong_key():
+    app = FastAPI()
+    HealthRegistry(app, auth={"type": "apikey", "key": "mykey"})
+    client = TestClient(app, raise_server_exceptions=False)
+    resp = client.get("/health/live", headers={"X-API-Key": "wrong"})
+    assert resp.status_code == 403
+
+
+def test_auth_apikey_correct_key():
+    app = FastAPI()
+    HealthRegistry(app, auth={"type": "apikey", "key": "mykey"})
+    client = TestClient(app, raise_server_exceptions=False)
+    resp = client.get("/health/live", headers={"X-API-Key": "mykey"})
+    assert resp.status_code == 200
+
+
+def test_auth_apikey_custom_header():
+    app = FastAPI()
+    HealthRegistry(app, auth={"type": "apikey", "key": "mykey", "header": "X-Token"})
+    client = TestClient(app, raise_server_exceptions=False)
+    resp = client.get("/health/live", headers={"X-Token": "mykey"})
+    assert resp.status_code == 200
+
+
+def test_auth_no_auth_open_access():
+    app = FastAPI()
+    HealthRegistry(app)  # no auth
+    client = TestClient(app)
+    resp = client.get("/health/live")
+    assert resp.status_code == 200
+
+
+def test_auth_custom_callable_allows():
+    from fastapi import Request
+
+    def always_allow(request: Request) -> bool:
+        return True
+
+    app = FastAPI()
+    HealthRegistry(app, auth=always_allow)
+    client = TestClient(app, raise_server_exceptions=False)
+    resp = client.get("/health/live")
+    assert resp.status_code == 200
+
+
+def test_auth_custom_callable_denies():
+    from fastapi import Request
+
+    def always_deny(request: Request) -> bool:
+        return False
+
+    app = FastAPI()
+    HealthRegistry(app, auth=always_deny)
+    client = TestClient(app, raise_server_exceptions=False)
+    resp = client.get("/health/live")
+    assert resp.status_code == 403
+
+
+def test_auth_invalid_type_raises():
+    app = FastAPI()
+    import pytest
+    with pytest.raises(ValueError, match="Unknown auth type"):
+        HealthRegistry(app, auth={"type": "oauth2"})
+
+
+# ---------------------------------------------------------------------------
+# Startup probe
+# ---------------------------------------------------------------------------
+
+
+def test_startup_returns_503_before_set_started():
+    app = FastAPI()
+    HealthRegistry(app)
+    client = TestClient(app)
+    resp = client.get("/health/startup")
+    assert resp.status_code == 503
+    assert resp.json()["status"] == "starting"
+
+
+def test_startup_returns_200_after_set_started():
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    registry.set_started()
+    client = TestClient(app)
+    resp = client.get("/health/startup")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "started"
+
+
+def test_startup_503_when_startup_probe_fails():
+    class FailingProbe(MemoryProbe):
+        async def check(self):
+            return ProbeResult(name=self.name, status=ProbeStatus.UNHEALTHY, error="not ready")
+
+    app = FastAPI()
+    registry = HealthRegistry(app, startup_probes=[FailingProbe(name="db-init")])
+    registry.set_started()
+    client = TestClient(app)
+    resp = client.get("/health/startup")
+    assert resp.status_code == 503
+
+
+def test_startup_200_when_startup_probe_passes():
+    app = FastAPI()
+    registry = HealthRegistry(app, startup_probes=[MemoryProbe(name="db-init")])
+    registry.set_started()
+    client = TestClient(app)
+    resp = client.get("/health/startup")
+    assert resp.status_code == 200
+
+
+def test_startup_set_started_returns_self():
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    result = registry.set_started()
+    assert result is registry
+
+
+def test_startup_probes_not_in_status():
+    """Startup probes must not appear in /health/status."""
+    app = FastAPI()
+    startup_probe = MemoryProbe(name="db-init")
+    registry = HealthRegistry(app, startup_probes=[startup_probe])
+    registry.set_started()
+    client = TestClient(app)
+    resp = client.get("/health/status")
+    names = {p["name"] for p in resp.json()["probes"]}
+    assert "db-init" not in names

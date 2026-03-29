@@ -14,9 +14,10 @@ class RedisProbe(BaseProbe):
     Install with: ``pip install fastapi-watch[redis]``
     """
 
-    def __init__(self, url: str = "redis://localhost", name: str = "redis") -> None:
+    def __init__(self, url: str = "redis://localhost", name: str = "redis", poll_interval_ms: int | None = None) -> None:
         self.url = url
         self.name = name
+        self.poll_interval_ms = poll_interval_ms
 
     async def check(self) -> ProbeResult:
         try:

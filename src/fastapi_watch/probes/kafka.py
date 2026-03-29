@@ -26,12 +26,14 @@ class KafkaProbe(BaseProbe):
         bootstrap_servers: str | list[str] = "localhost:9092",
         name: str = "kafka",
         request_timeout_ms: int = 5000,
+        poll_interval_ms: int | None = None,
     ) -> None:
         if isinstance(bootstrap_servers, list):
             self.bootstrap_servers = ",".join(bootstrap_servers)
         else:
             self.bootstrap_servers = bootstrap_servers
         self.name = name
+        self.poll_interval_ms = poll_interval_ms
         self._timeout_ms = request_timeout_ms
 
     async def check(self) -> ProbeResult:

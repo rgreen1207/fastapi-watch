@@ -13,6 +13,9 @@ class BaseProbe(ABC):
 
     name: str = "unnamed"
     timeout: float | None = None  # seconds; None means no timeout
+    poll_interval_ms: int | None = None
+    circuit_breaker_threshold: int | None = None
+    circuit_breaker_cooldown_ms: int | None = None
 
     @abstractmethod
     async def check(self) -> ProbeResult:
