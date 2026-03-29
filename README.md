@@ -1,4 +1,22 @@
-# fastapi-watch
+<p align="center">
+  <b>fastapi-watch</b>
+</p>
+<p align="center">
+  <em>Structured health and readiness check system for FastAPI</em>
+</p>
+<p align="center">
+  <a href="https://github.com/rgreen1207/fastapi-watch/actions/workflows/publish.yml">
+    <img src="https://github.com/rgreen1207/fastapi-watch/actions/workflows/publish.yml/badge.svg" alt="Test, Build & Publish">
+  </a>
+  <a href="https://pypi.org/project/fastapi-watch/">
+    <img src="https://img.shields.io/pypi/v/fastapi-watch" alt="PyPI version">
+  </a>
+  <a href="https://pypi.org/project/fastapi-watch/">
+    <img src="https://img.shields.io/pypi/pyversions/fastapi-watch" alt="Supported Python versions">
+  </a>
+</p>
+
+---
 
 Structured health and readiness check system for [FastAPI](https://fastapi.tiangolo.com/).
 
