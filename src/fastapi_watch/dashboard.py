@@ -10,9 +10,32 @@ and served at ``<prefix>/dashboard``.  Pass ``dashboard=False`` to disable it,
 or pass a custom renderer callable to replace the default design.
 """
 import html as _html
+import json as _json
 from typing import Any
 
 from .models import HealthReport, ProbeResult, ProbeStatus
+
+# ---------------------------------------------------------------------------
+# Detail field tooltips
+# ---------------------------------------------------------------------------
+
+_DETAIL_TOOLTIPS: dict[str, str] = {
+    "message":             "General status note from the probe.",
+    "description":         "Label identifying the route or operation this probe covers.",
+    "request_count":       "Total requests observed by this probe since startup.",
+    "error_count":         "Requests that returned a status code at or above the error threshold.",
+    "error_rate":          "Fraction of requests counted as errors (error_count ÷ request_count).",
+    "consecutive_errors":  "Unbroken run of error responses since the last success; resets to 0 on any success.",
+    "last_status_code":    "HTTP status code returned by the most recent request.",
+    "last_rtt_ms":         "Handler execution time for the most recent request.",
+    "avg_rtt_ms":          "Exponential moving average of response time; smoothed to reduce noise from outliers.",
+    "p95_rtt_ms":          "95th-percentile response time over the last window of requests.",
+    "min_rtt_ms":          "Fastest response time ever recorded by this probe.",
+    "max_rtt_ms":          "Slowest response time ever recorded by this probe.",
+    "requests_per_minute": "Estimated throughput computed from recent request timestamps.",
+    "circuit_breaker":     "Counts consecutive failures; suspends the probe after repeated failures to avoid hammering a broken service, then retries after a cooldown.",
+    "routes":              "Per-route request metrics collected by RequestMetricsMiddleware (per_route=True).",
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -38,11 +61,28 @@ def _fmt_detail_value(key: str, value: Any) -> str:
         return s
     if isinstance(value, int) and key.endswith("_ms"):
         return f"{value} ms"
+    if key == "circuit_breaker" and isinstance(value, dict):
+        failures = value.get("consecutive_failures", 0)
+        trips = value.get("trips_total", 0)
+        trip_str = f", {trips} trip{'s' if trips != 1 else ''} total" if trips else ""
+        if value.get("open"):
+            return _e(f"open — suspended ({failures} consecutive failure{'s' if failures != 1 else ''}{trip_str})")
+        return _e(f"closed{trip_str}")
+    if isinstance(value, dict):
+        return "—"
     return _e(value)
 
 
 def _fmt_detail_key(key: str) -> str:
     return key.replace("_", " ").title()
+
+
+def _detail_label_cell(key: str) -> str:
+    label = _fmt_detail_key(key)
+    tip = _DETAIL_TOOLTIPS.get(key)
+    if tip:
+        return f'<td data-tip="{_html.escape(tip, quote=True)}">{label}</td>'
+    return f"<td>{label}</td>"
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +359,36 @@ body {
   padding-bottom: 14px;
 }
 
+/* ── Detail tooltips ─────────────────────────────────────────── */
+
+.details-table td[data-tip] {
+  cursor: default;
+  position: relative;
+}
+.details-table td[data-tip]::after {
+  content: attr(data-tip);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  background: #1e293b;
+  color: #f8fafc;
+  font-size: 11px;
+  line-height: 1.5;
+  padding: 5px 9px;
+  border-radius: 5px;
+  white-space: nowrap;
+  width: max-content;
+  max-width: 300px;
+  white-space: normal;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s;
+  z-index: 100;
+}
+.details-table td[data-tip]:hover::after {
+  opacity: 1;
+}
+
 /* ── Footer ──────────────────────────────────────────────────── */
 
 .footer {
@@ -380,6 +450,16 @@ _JS = r"""
       var s = val.toFixed(4).replace(/\.?0+$/, '');
       return s;
     }
+    if (key === 'circuit_breaker' && typeof val === 'object' && val !== null) {
+      var failures = val.consecutive_failures || 0;
+      var trips = val.trips_total || 0;
+      var tripStr = trips ? ', ' + trips + ' trip' + (trips !== 1 ? 's' : '') + ' total' : '';
+      if (val.open) {
+        return 'open \u2014 suspended (' + failures + ' consecutive failure' + (failures !== 1 ? 's' : '') + tripStr + ')';
+      }
+      return 'closed' + tripStr;
+    }
+    if (typeof val === 'object') return '—';
     return String(val);
   }
 
@@ -423,7 +503,11 @@ _JS = r"""
         var k = kv[0], v = kv[1];
         if (v == null) return;
         var label = k.replace(/_/g, ' ').replace(/\b\w/g, function(c) { return c.toUpperCase(); });
-        rows += '<tr><td>' + label + '</td><td>' + fmtDetailVal(k, v) + '</td></tr>';
+        var tip = (window.DETAIL_TIPS || {})[k];
+        var labelCell = tip
+          ? '<td data-tip="' + tip.replace(/&/g, '&amp;').replace(/"/g, '&quot;') + '">' + label + '</td>'
+          : '<td>' + label + '</td>';
+        rows += '<tr>' + labelCell + '<td>' + fmtDetailVal(k, v) + '</td></tr>';
       });
       tbody.innerHTML = rows;
     }
@@ -512,7 +596,7 @@ def _probe_card(probe: ProbeResult) -> str:
     details_html = ""
     if probe.details:
         rows = "".join(
-            f"<tr><td>{_fmt_detail_key(k)}</td><td>{_fmt_detail_value(k, v)}</td></tr>"
+            f"<tr>{_detail_label_cell(k)}<td>{_fmt_detail_value(k, v)}</td></tr>"
             for k, v in probe.details.items()
             if v is not None
         )
@@ -566,6 +650,7 @@ def render_dashboard(
         summary = f"{healthy_count} / {probe_count} probe{'s' if probe_count != 1 else ''} healthy"
 
     probe_cards = "\n".join(_probe_card(p) for p in report.probes)
+    tips_json = _json.dumps(_DETAIL_TOOLTIPS)
 
     maint_html = (
         '<div class="maintenance-banner">&#128679; Scheduled maintenance in progress — '
@@ -619,6 +704,7 @@ def render_dashboard(
     </div>
   </div>
 
+  <script>window.DETAIL_TIPS = {tips_json};</script>
   <script>{_JS}</script>
 </body>
 </html>"""

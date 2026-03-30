@@ -63,18 +63,11 @@ def test_clear_maintenance_returns_self():
 
 
 def test_set_maintenance_indefinite_until_none():
-    """set_maintenance() with no args means indefinite (None)."""
+    """set_maintenance() with no args activates indefinite maintenance mode."""
     app = FastAPI()
     registry = HealthRegistry(app)
     registry.set_maintenance()
-    # _maintenance_until is None → _in_maintenance must handle this as active
-    # Actually per implementation: None means not active. So set_maintenance()
-    # with no args clears the mode. Let me check:
-    # _in_maintenance returns False if _maintenance_until is None.
-    # This means the user must pass a future datetime to activate maintenance.
-    # set_maintenance() with no args is a no-op / clear.
-    # This is correct API behavior — document it.
-    assert registry._in_maintenance() is False
+    assert registry._in_maintenance() is True
 
 
 # ---------------------------------------------------------------------------

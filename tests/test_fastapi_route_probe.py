@@ -142,7 +142,8 @@ async def test_http_exception_status_code_captured():
     await _call(handler)
     result = await probe.check()
     assert result.details["last_status_code"] == 404
-    assert result.details["error_count"] == 1
+    # 404 is below the default min_error_status of 500, so it does not count as an error
+    assert result.details["error_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -444,7 +445,7 @@ def test_decorated_route_records_stats_via_real_requests():
 
 
 def test_decorated_route_records_http_exception_status_code():
-    probe = FastAPIRouteProbe(name="items", max_error_rate=1.0)  # never unhealthy
+    probe = FastAPIRouteProbe(name="items", max_error_rate=1.0, min_error_status=400)  # never unhealthy; count 4xx
     app = FastAPI()
 
     @app.get("/items/{item_id}")
