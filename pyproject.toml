@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fastapi-watch"
-version = "1.2.0"
+version = "1.4.0"
 description = "Structured health and readiness check system for FastAPI"
 readme = "README.md"
 license = {text = "MIT"}
