@@ -22,7 +22,7 @@ Probes report one of three states: **healthy** (all clear), **degraded** (under 
 
 Instrument individual FastAPI route handlers with `FastAPIRouteProbe` to collect real-traffic metrics — latency percentiles, error rate, throughput, and consecutive failure counts — or attach `RequestMetricsMiddleware` to capture the same metrics for every route in your app without touching individual handlers.
 
-Organize probes across your codebase using `ProbeRouter`, the same file-splitting pattern FastAPI uses for routes. Declare probes in any module, compose them into routers, and pass them to `HealthRegistry` in one line at startup.
+Organize probes across your codebase using `ProbeGroup`, the same file-splitting pattern FastAPI uses for routes. Declare probes in any module, compose them into groups, and pass them to `HealthRegistry` in one line at startup.
 
 Connect a browser or monitoring tool to the Server-Sent Events (SSE) streaming endpoints (`/health/ready/stream`, `/health/status/stream`) and receive live updates as long as you stay connected — the background poll loop starts automatically on the first connection and stops when the last client disconnects.
 
@@ -40,7 +40,7 @@ Open `/health/dashboard` for a live HTML page that shows all probe results, upda
   - [Adding probes](#adding-probes)
   - [Critical vs non-critical probes](#critical-vs-non-critical-probes)
   - [Per-probe timeout](#per-probe-timeout)
-- [ProbeRouter — organizing probes across files](#proberouter--organizing-probes-across-files)
+- [ProbeGroup — organizing probes across files](#probegroup--organizing-probes-across-files)
 - [Live streaming](#live-streaming)
 - [Polling and caching](#polling-and-caching)
 - [Per-probe poll frequency](#per-probe-poll-frequency)
@@ -158,25 +158,25 @@ GET /health/ready/stream  → SSE stream
 GET /health/status/stream → SSE stream
 ```
 
-### Quick start with ProbeRouter
+### Quick start with ProbeGroup
 
-For larger applications, define probes in each feature module and collect them all in `main.py` via `ProbeRouter`:
+For larger applications, define probes in each feature module and collect them all in `main.py` via `ProbeGroup`:
 
 ```python
 # features/database/probes.py
-from fastapi_watch import ProbeRouter
+from fastapi_watch import ProbeGroup
 from fastapi_watch.probes import PostgreSQLProbe, RedisProbe
 
-router = ProbeRouter()
+router = ProbeGroup()
 router.add(PostgreSQLProbe(url="postgresql://..."))
 router.add(RedisProbe(url="redis://..."), critical=False)
 ```
 
 ```python
 # features/users/probes.py
-from fastapi_watch import ProbeRouter, FastAPIRouteProbe
+from fastapi_watch import ProbeGroup, FastAPIRouteProbe
 
-router = ProbeRouter()
+router = ProbeGroup()
 
 users_probe = FastAPIRouteProbe(name="users-api", max_error_rate=0.05)
 router.add(users_probe)
@@ -191,7 +191,7 @@ from features.users.probes import router as users_router, users_probe
 
 app = FastAPI()
 
-registry = HealthRegistry(app, routers=[db_router, users_router])
+registry = HealthRegistry(app, groups=[db_router, users_router])
 
 @app.get("/users")
 @users_probe.watch
@@ -340,28 +340,28 @@ registry.add(probe)
 
 ---
 
-## ProbeRouter — organizing probes across files
+## ProbeGroup — organizing probes across files
 
-As an application grows, defining every probe in `main.py` becomes unwieldy. `ProbeRouter` mirrors the pattern FastAPI uses for `APIRouter`: declare probes in the modules that own them, and include all of them in the registry at startup.
+As an application grows, defining every probe in `main.py` becomes unwieldy. `ProbeGroup` mirrors the pattern FastAPI uses for `APIRouter`: declare probes in the modules that own them, and include all of them in the registry at startup.
 
 ### Basic usage
 
 ```python
 # features/database/probes.py
-from fastapi_watch import ProbeRouter
+from fastapi_watch import ProbeGroup
 from fastapi_watch.probes import PostgreSQLProbe, RedisProbe
 
-router = ProbeRouter()
+router = ProbeGroup()
 router.add(PostgreSQLProbe(url="postgresql://user:pass@db.internal/app"))
 router.add(RedisProbe(url="redis://cache.internal:6379"), critical=False)
 ```
 
 ```python
 # features/payments/probes.py
-from fastapi_watch import ProbeRouter
+from fastapi_watch import ProbeGroup
 from fastapi_watch.probes import HttpProbe
 
-router = ProbeRouter()
+router = ProbeGroup()
 router.add(HttpProbe(url="https://api.stripe.com/v1/health", name="stripe"))
 ```
 
@@ -374,33 +374,33 @@ from features.payments.probes import router as payments_router
 
 app = FastAPI()
 
-registry = HealthRegistry(app, routers=[db_router, payments_router])
+registry = HealthRegistry(app, groups=[db_router, payments_router])
 ```
 
-The `routers=` parameter accepts a list of `ProbeRouter` instances. All probes from every router are registered in the order they were added, preserving each probe's `critical` setting.
+The `groups=` parameter accepts a list of `ProbeGroup` instances. All probes from every group are registered in the order they were added, preserving each probe's `critical` setting.
 
-If you need to add individual probes alongside routers, `include_router()` is also available after construction and returns `self` for chaining:
+If you need to add individual probes alongside groups, `include(` is also available after construction and returns `self` for chaining:
 
 ```python
 registry = HealthRegistry(app)
-registry.include_router(db_router).include_router(payments_router).add(some_extra_probe)
+registry.include(db_router).include(payments_router).add(some_extra_probe)
 ```
 
-### Composing routers
+### Composing groups
 
-Routers can include other routers, letting you build a single top-level aggregator that collects probes from every submodule:
+Groups can include other groups, letting you build a single top-level aggregator that collects probes from every submodule:
 
 ```python
 # probes/__init__.py
-from fastapi_watch import ProbeRouter
+from fastapi_watch import ProbeGroup
 from .database import router as db_router
 from .payments import router as payments_router
 from .messaging import router as messaging_router
 
-router = ProbeRouter()
-router.include_router(db_router)
-router.include_router(payments_router)
-router.include_router(messaging_router)
+router = ProbeGroup()
+router.include(db_router)
+router.include(payments_router)
+router.include(messaging_router)
 ```
 
 ```python
@@ -408,21 +408,21 @@ router.include_router(messaging_router)
 from fastapi_watch import HealthRegistry
 from probes import router
 
-registry = HealthRegistry(app, routers=[router])
+registry = HealthRegistry(app, groups=[router])
 ```
 
-### ProbeRouter API
+### ProbeGroup API
 
-`ProbeRouter` exposes the same fluent interface as `HealthRegistry`. All methods return `self` for chaining. Duplicate probe instances (same object, identity check) are silently skipped.
+`ProbeGroup` exposes the same fluent interface as `HealthRegistry`. All methods return `self` for chaining. Duplicate probe instances (same object, identity check) are silently skipped.
 
 ```python
-router = ProbeRouter()
+router = ProbeGroup()
 
 router.add(probe)                          # single probe, critical by default
 router.add(probe, critical=False)          # mark as non-critical
 router.add_probes([probe_a, probe_b])      # multiple probes, same criticality
 router.add_probes([probe_c], critical=False)
-router.include_router(another_router)      # merge another router's probes
+router.include(another_router)             # merge another group's probes
 ```
 
 ---
@@ -794,27 +794,44 @@ Set `per_route=False` to collect only the aggregate totals (lower memory overhea
 
 ## Webhook on state change
 
-Pass `webhook_url` to receive an HTTP POST every time a probe's status changes. The call is fire-and-forget — it never blocks health check execution and failures are logged silently.
+Pass one or more alerters to `HealthRegistry` to receive notifications when a probe's status changes. Alerts are fire-and-forget — they never block health-check execution and failures are logged silently.
 
 ```python
+from fastapi_watch.alerts import SlackAlerter, TeamsAlerter, PagerDutyAlerter, WebhookAlerter
+
 registry = HealthRegistry(
     app,
-    webhook_url="https://hooks.example.com/health",
+    alerters=[
+        SlackAlerter(
+            webhook_url="https://hooks.slack.com/services/T.../B.../...",
+            channel="#ops-alerts",
+        ),
+        TeamsAlerter(webhook_url="https://outlook.office.com/webhook/..."),
+        PagerDutyAlerter(routing_key="your-32-char-routing-key"),
+    ],
 )
 ```
 
-**Payload:**
+| Alerter | Description |
+|---|---|
+| `WebhookAlerter(url, headers)` | Generic JSON POST to any HTTP endpoint |
+| `SlackAlerter(webhook_url, channel, username)` | Slack Incoming Webhook with color-coded attachments |
+| `TeamsAlerter(webhook_url)` | Microsoft Teams MessageCard |
+| `PagerDutyAlerter(routing_key, source)` | PagerDuty Events API v2; auto-resolves on HEALTHY |
 
-```json
-{
-  "probe": "postgresql",
-  "old_status": "healthy",
-  "new_status": "unhealthy",
-  "timestamp": "2024-06-01T12:05:00.000000+00:00"
-}
+`webhook_url` on `HealthRegistry` is still accepted for backwards compatibility and wraps into a `WebhookAlerter` internally.
+
+Custom alerter:
+
+```python
+from fastapi_watch.alerts import BaseAlerter
+from fastapi_watch.models import AlertRecord
+
+class SMSAlerter(BaseAlerter):
+    async def notify(self, alert: AlertRecord) -> None:
+        message = f"[health] {alert.probe}: {alert.old_status.value} → {alert.new_status.value}"
+        # send via your SMS provider ...
 ```
-
-The `Content-Type` header is `application/json`. The webhook is called with a 5-second timeout. If the call fails (network error, non-2xx response), the failure is logged via the registry logger and silently discarded — the health check result is unaffected.
 
 ---
 
@@ -1630,15 +1647,15 @@ Until at least one request has been handled, `FastAPIRouteProbe.check()` returns
 | `ema_alpha` | `0.1` | Smoothing factor for the exponential moving average (0–1). Higher = reacts faster to changes |
 | `timeout` | `None` | Passed to the registry for the `check()` call; not used internally |
 
-#### Using FastAPIRouteProbe with ProbeRouter
+#### Using FastAPIRouteProbe with ProbeGroup
 
-Because `FastAPIRouteProbe` is both a probe and a decorator, the instance needs to be accessible in both the module that owns the route and the module that owns the router. The most ergonomic pattern is to declare the probe in a `probes.py` alongside the routes and import it in both places:
+Because `FastAPIRouteProbe` is both a probe and a decorator, the instance needs to be accessible in both the module that owns the route and the module that owns the group. The most ergonomic pattern is to declare the probe in a `probes.py` alongside the routes and import it in both places:
 
 ```python
 # features/users/probes.py
-from fastapi_watch import ProbeRouter, FastAPIRouteProbe
+from fastapi_watch import ProbeGroup, FastAPIRouteProbe
 
-router = ProbeRouter()
+router = ProbeGroup()
 
 users_list_probe = FastAPIRouteProbe(name="users-list", max_error_rate=0.05)
 users_detail_probe = FastAPIRouteProbe(name="users-detail", max_avg_rtt_ms=150)
@@ -1675,7 +1692,7 @@ from features.users.routes import router as users_api_router
 app = FastAPI()
 app.include_router(users_api_router)
 
-registry = HealthRegistry(app, routers=[users_health_router])
+registry = HealthRegistry(app, groups=[users_health_router])
 ```
 
 ---
@@ -1957,43 +1974,18 @@ registry.add(ThresholdProbe(
 pip install "fastapi-watch[postgres]"
 ```
 
-`PostgreSQLProbe` uses `asyncpg` directly — no SQLAlchemy required. It opens a connection, runs `SELECT version()` and a set of metadata queries concurrently, then closes the connection.
+`PostgreSQLProbe` passively observes outgoing PostgreSQL calls via `@probe.watch`. Instruments the functions in your code that query PostgreSQL, recording latency and errors from real traffic rather than opening a synthetic connection on a poll timer.
 
 ```python
-from fastapi_watch.probes import PostgreSQLProbe
+pg_probe = PostgreSQLProbe(name="primary-db", max_error_rate=0.01)
 
-registry.add(
-    PostgreSQLProbe(
-        url="postgresql://app_user:secret@localhost:5432/mydb",
-        name="primary-db",  # default: "postgresql"
-    )
-)
+@pg_probe.watch
+async def get_user(user_id: int) -> dict | None:
+    async with pool.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
+
+registry.add(pg_probe)
 ```
-
-**Details returned:**
-
-```json
-{
-  "version": "PostgreSQL 16.2 on aarch64-unknown-linux-gnu, compiled by gcc 12.2.0",
-  "active_connections": 5,
-  "max_connections": 100,
-  "database_size": "42 MB"
-}
-```
-
-**Checking a read replica separately:**
-
-```python
-registry.add(PostgreSQLProbe(url="postgresql://reader:secret@replica.host/mydb", name="replica-db"))
-```
-
-**With a connection timeout** (default 5 seconds):
-
-```python
-registry.add(PostgreSQLProbe(url="postgresql://...", timeout=2.0))
-```
-
-> If you are already using SQLAlchemy, see [SQLAlchemy engine probe](#sqlalchemy-engine-probe) to reuse your existing engine instead.
 
 ---
 
@@ -2003,41 +1995,20 @@ registry.add(PostgreSQLProbe(url="postgresql://...", timeout=2.0))
 pip install "fastapi-watch[mysql]"
 ```
 
-`MySQLProbe` accepts either a URL or explicit connection kwargs.
+`MySQLProbe` passively observes outgoing MySQL / MariaDB calls via `@probe.watch`. Records latency and errors from real traffic rather than opening a synthetic connection on a poll timer.
 
 ```python
-from fastapi_watch.probes import MySQLProbe
+mysql_probe = MySQLProbe(name="mysql", max_error_rate=0.01)
 
-# URL form
-registry.add(MySQLProbe(url="mysql://app_user:secret@localhost:3306/mydb"))
+@mysql_probe.watch
+async def get_product(product_id: int) -> dict | None:
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT * FROM products WHERE id = %s", (product_id,))
+            return await cur.fetchone()
 
-# Keyword form
-registry.add(MySQLProbe(host="localhost", port=3306, user="app_user", password="secret", db="mydb"))
+registry.add(mysql_probe)
 ```
-
-**Details returned:**
-
-```json
-{
-  "version": "8.0.36",
-  "connected_threads": 4,
-  "uptime_seconds": 172800,
-  "max_used_connections": 12
-}
-```
-
-**Constructor arguments:**
-
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `url` | `None` | Full DSN — overrides all other kwargs when set |
-| `host` | `"localhost"` | |
-| `port` | `3306` | |
-| `user` | `"root"` | |
-| `password` | `""` | |
-| `db` | `""` | |
-| `name` | `"mysql"` | Probe label |
-| `connect_timeout` | `5` | Seconds |
 
 ---
 
@@ -2047,48 +2018,16 @@ registry.add(MySQLProbe(host="localhost", port=3306, user="app_user", password="
 pip install "fastapi-watch[redis]"
 ```
 
-`RedisProbe` sends `PING`, then collects server info and scans key prefixes to build a cluster breakdown.
+`RedisProbe` passively observes outgoing Redis calls via `@probe.watch`. Records latency and errors from real traffic rather than sending synthetic PING commands on a poll timer.
 
 ```python
-from fastapi_watch.probes import RedisProbe
+redis_probe = RedisProbe(name="cache", max_error_rate=0.05)
 
-registry.add(RedisProbe(url="redis://localhost:6379"))
-```
+@redis_probe.watch
+async def get_session(session_id: str) -> dict | None:
+    return await redis.hgetall(f"session:{session_id}")
 
-**Details returned:**
-
-```json
-{
-  "version": "7.2.4",
-  "uptime_seconds": 86400,
-  "used_memory_human": "2.50M",
-  "connected_clients": 8,
-  "role": "master",
-  "total_keys": 312,
-  "clusters": {
-    "session": 150,
-    "cache":   162
-  }
-}
-```
-
-`clusters` groups keys by the segment before the first `:` and reports a key count per group. For example, a key named `session:abc123` falls into the `session` cluster. Up to 1000 keys are scanned; if the keyspace exceeds that limit a `"clusters_truncated": true` field is added.
-
-**Common URL forms:**
-
-```python
-# Password-protected
-RedisProbe(url="redis://:mypassword@localhost:6379")
-
-# Specific database index
-RedisProbe(url="redis://localhost:6379/2", name="task-queue")
-
-# TLS
-RedisProbe(url="rediss://redis.internal:6380")
-
-# Watching Redis as both a cache and a queue
-registry.add(RedisProbe(url="redis://localhost:6379/0", name="cache"))
-registry.add(RedisProbe(url="redis://localhost:6379/1", name="task-queue"))
+registry.add(redis_probe)
 ```
 
 ---
@@ -2277,40 +2216,17 @@ registry.add(KafkaProbe(bootstrap_servers=["b1:9092", "b2:9092", "b3:9092"]))
 pip install "fastapi-watch[mongo]"
 ```
 
-`MongoProbe` runs `serverStatus` on the `admin` database to collect version, connection pool stats, memory, and storage engine.
+`MongoProbe` passively observes outgoing MongoDB calls via `@probe.watch`. Records latency and errors from real traffic rather than issuing a synthetic `serverStatus` command on a poll timer.
 
 ```python
-from fastapi_watch.probes import MongoProbe
+mongo_probe = MongoProbe(name="mongodb", max_error_rate=0.02)
 
-registry.add(MongoProbe(url="mongodb://localhost:27017"))
+@mongo_probe.watch
+async def get_document(doc_id: str) -> dict | None:
+    return await db.documents.find_one({"_id": doc_id})
+
+registry.add(mongo_probe)
 ```
-
-**Details returned:**
-
-```json
-{
-  "version": "7.0.5",
-  "uptime_seconds": 172800,
-  "connections": {
-    "current": 12,
-    "available": 838,
-    "total_created": 150
-  },
-  "memory_mb": {
-    "resident": 128,
-    "virtual": 1024
-  },
-  "storage_engine": "wiredTiger"
-}
-```
-
-**Constructor arguments:**
-
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `url` | `"mongodb://localhost:27017"` | MongoDB connection URI |
-| `name` | `"mongodb"` | Probe label |
-| `server_selection_timeout_ms` | `2000` | How long to wait for a server before giving up |
 
 ---
 
@@ -2463,33 +2379,18 @@ registry.add(CeleryProbe(celery, min_workers=1, detailed=True))
 pip install "fastapi-watch[sqlalchemy]"
 ```
 
-`SqlAlchemyProbe` reuses your existing `AsyncEngine` so no extra connections are opened. Works with any database SQLAlchemy supports (PostgreSQL, MySQL, SQLite, etc.).
+`SqlAlchemyProbe` passively observes outgoing SQLAlchemy calls via `@probe.watch`. Works with any database SQLAlchemy supports. Records latency and errors from real traffic rather than running a synthetic query on a poll timer.
 
 ```python
-from sqlalchemy.ext.asyncio import create_async_engine
-from fastapi_watch.probes import SqlAlchemyProbe
+db_probe = SqlAlchemyProbe(name="postgres", max_error_rate=0.01)
 
-engine = create_async_engine("postgresql+asyncpg://app_user:secret@localhost/mydb")
+@db_probe.watch
+async def get_user(user_id: int) -> User | None:
+    async with async_session() as session:
+        return await session.get(User, user_id)
 
-registry.add(SqlAlchemyProbe(engine=engine, name="primary-db"))
+registry.add(db_probe)
 ```
-
-**Details returned:**
-
-```json
-{
-  "dialect": "postgresql",
-  "driver": "asyncpg",
-  "server_version": "16.2.0"
-}
-```
-
-**Constructor arguments:**
-
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `engine` | required | A SQLAlchemy 2.x `AsyncEngine` instance |
-| `name` | `"database"` | Probe label |
 
 ---
 
@@ -2511,15 +2412,15 @@ registry.add(SqlAlchemyProbe(engine=engine, name="primary-db"))
 
 | Probe | Extra | Key constructor args | Details fields |
 |-------|-------|---------------------|----------------|
-| `PostgreSQLProbe` | `postgres` | `url`, `name`, `timeout` | `version`, `active_connections`, `max_connections`, `database_size` |
-| `MySQLProbe` | `mysql` | `url` or `host`/`port`/`user`/`password`/`db`, `name`, `connect_timeout` | `version`, `connected_threads`, `uptime_seconds`, `max_used_connections` |
-| `SqlAlchemyProbe` | `sqlalchemy` | `engine`, `name` | `dialect`, `driver`, `server_version` |
+| `PostgreSQLProbe` | `postgres` | `name`, `max_error_rate`, `max_avg_rtt_ms`, `window_size`, `ema_alpha` | `call_count`, `error_count`, `error_rate`, `consecutive_errors`, `last_rtt_ms`, `avg_rtt_ms`, `p95_rtt_ms`, `min_rtt_ms`, `max_rtt_ms` |
+| `MySQLProbe` | `mysql` | `name`, `max_error_rate`, `max_avg_rtt_ms`, `window_size`, `ema_alpha` | `call_count`, `error_count`, `error_rate`, `consecutive_errors`, `last_rtt_ms`, `avg_rtt_ms`, `p95_rtt_ms`, `min_rtt_ms`, `max_rtt_ms` |
+| `SqlAlchemyProbe` | `sqlalchemy` | `name`, `max_error_rate`, `max_avg_rtt_ms`, `window_size`, `ema_alpha` | `call_count`, `error_count`, `error_rate`, `consecutive_errors`, `last_rtt_ms`, `avg_rtt_ms`, `p95_rtt_ms`, `min_rtt_ms`, `max_rtt_ms` |
 
 #### Caches
 
 | Probe | Extra | Key constructor args | Details fields |
 |-------|-------|---------------------|----------------|
-| `RedisProbe` | `redis` | `url`, `name` | `version`, `uptime_seconds`, `used_memory_human`, `connected_clients`, `role`, `total_keys`, `clusters` |
+| `RedisProbe` | `redis` | `name`, `max_error_rate`, `max_avg_rtt_ms`, `window_size`, `ema_alpha` | `call_count`, `error_count`, `error_rate`, `consecutive_errors`, `last_rtt_ms`, `avg_rtt_ms`, `p95_rtt_ms`, `min_rtt_ms`, `max_rtt_ms` |
 | `MemcachedProbe` | `memcached` | `host`, `port`, `name`, `pool_size` | — |
 
 #### Queues / messaging
@@ -2534,7 +2435,7 @@ registry.add(SqlAlchemyProbe(engine=engine, name="primary-db"))
 
 | Probe | Extra | Key constructor args | Details fields |
 |-------|-------|---------------------|----------------|
-| `MongoProbe` | `mongo` | `url`, `name`, `server_selection_timeout_ms` | `version`, `uptime_seconds`, `connections`, `memory_mb`, `storage_engine` |
+| `MongoProbe` | `mongo` | `name`, `max_error_rate`, `max_avg_rtt_ms`, `window_size`, `ema_alpha` | `call_count`, `error_count`, `error_rate`, `consecutive_errors`, `last_rtt_ms`, `avg_rtt_ms`, `p95_rtt_ms`, `min_rtt_ms`, `max_rtt_ms` |
 
 #### HTTP
 
@@ -2568,7 +2469,7 @@ registry.add(SqlAlchemyProbe(engine=engine, name="primary-db"))
 | `max_alerts` | `int` | `120` | Hard cap on stored alert records. When full, the oldest alert is dropped before the new one is appended. |
 | `storage` | `ProbeStorage \| None` | `None` | Custom storage backend. `None` uses `InMemoryProbeStorage`. When supplied, `history_size`, `result_ttl_seconds`, `alert_ttl_seconds`, and `max_alerts` are ignored — configure limits inside the backend. |
 | `timezone` | `str` | `"UTC"` | IANA timezone name for all `checked_at` timestamps. Reflected in the `timezone` field of every response. |
-| `routers` | `list[ProbeRouter] \| None` | `None` | One or more `ProbeRouter` instances to include at startup. Equivalent to calling `include_router()` for each. |
+| `groups` | `list[ProbeGroup] \| None` | `None` | One or more `ProbeGroup` instances to include at startup. Equivalent to calling `include()` for each. |
 | `dashboard` | `bool \| Callable` | `True` | `True` — built-in HTML dashboard at `GET /health/dashboard`. `False` — omit the route. Callable `(report: HealthReport) -> str` — custom renderer. |
 | `circuit_breaker` | `bool` | `True` | Enable the circuit breaker. When a probe fails `circuit_breaker_threshold` consecutive times it is suspended for `circuit_breaker_cooldown_ms` ms. |
 | `circuit_breaker_threshold` | `int` | `5` | Consecutive failures before the circuit opens. |
@@ -2595,12 +2496,12 @@ Adds a single probe. Returns `self` for chaining. Adding the same instance more 
 
 Adds a list of probes. The `critical` flag applies to every probe in the list. Returns `self` for chaining. Duplicate instances are silently skipped.
 
-### `HealthRegistry.include_router(router)`
+### `HealthRegistry.include(router)`
 
-Includes all probes from a `ProbeRouter`, preserving each probe's criticality setting. Returns `self` for chaining. Duplicate instances are silently skipped.
+Includes all probes from a `ProbeGroup`, preserving each probe's criticality setting. Returns `self` for chaining. Duplicate instances are silently skipped.
 
 ```python
-registry.include_router(db_router).include_router(payments_router)
+registry.include(db_router).include(payments_router)
 ```
 
 ### `HealthRegistry.on_state_change(callback)`
@@ -2632,7 +2533,7 @@ for r in results:
 
 ---
 
-### `ProbeRouter`
+### `ProbeGroup`
 
 Collects probe registrations defined across multiple modules so they can be passed to `HealthRegistry` at startup. Mirrors the `APIRouter` pattern from FastAPI.
 
@@ -2640,7 +2541,7 @@ Collects probe registrations defined across multiple modules so they can be pass
 |--------|-------------|
 | `add(probe, critical=True)` | Add a single probe. Returns `self`. Duplicate instances are silently skipped. |
 | `add_probes(probes, critical=True)` | Add multiple probes with the same criticality. Returns `self`. |
-| `include_router(router)` | Merge another `ProbeRouter`'s probes into this one, preserving each probe's criticality. Returns `self`. |
+| `include(router)` | Merge another `ProbeGroup`'s probes into this one, preserving each probe's criticality. Returns `self`. |
 
 ---
 

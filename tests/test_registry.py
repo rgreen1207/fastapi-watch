@@ -1146,10 +1146,10 @@ async def test_circuit_per_probe_threshold_override():
 async def test_webhook_fired_on_state_change(monkeypatch):
     posted = []
 
-    async def fake_post_webhook(self, probe_name, old, new):
-        posted.append((probe_name, old.value, new.value))
+    async def fake_dispatch(self, alert):
+        posted.append((alert.probe, alert.old_status.value, alert.new_status.value))
 
-    monkeypatch.setattr("fastapi_watch.registry.HealthRegistry._post_webhook", fake_post_webhook)
+    monkeypatch.setattr("fastapi_watch.registry.HealthRegistry._dispatch_alert", fake_dispatch)
 
     app = FastAPI()
     registry = HealthRegistry(app, webhook_url="http://hooks.example.com/health")
@@ -1172,10 +1172,10 @@ async def test_webhook_fired_on_state_change(monkeypatch):
 async def test_webhook_not_fired_when_status_unchanged(monkeypatch):
     posted = []
 
-    async def fake_post_webhook(self, probe_name, old, new):
-        posted.append((probe_name, old.value, new.value))
+    async def fake_dispatch(self, alert):
+        posted.append((alert.probe, alert.old_status.value, alert.new_status.value))
 
-    monkeypatch.setattr("fastapi_watch.registry.HealthRegistry._post_webhook", fake_post_webhook)
+    monkeypatch.setattr("fastapi_watch.registry.HealthRegistry._dispatch_alert", fake_dispatch)
 
     app = FastAPI()
     registry = HealthRegistry(app, webhook_url="http://hooks.example.com/health")
@@ -1189,38 +1189,35 @@ async def test_webhook_not_fired_when_status_unchanged(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_webhook_not_fired_without_url():
-    called = False
-
     app = FastAPI()
-    registry = HealthRegistry(app)  # no webhook_url
+    registry = HealthRegistry(app)  # no webhook_url, no alerters
 
     registry._probe_states["svc"] = ProbeStatus.HEALTHY
     results = [ProbeResult(name="svc", status=ProbeStatus.UNHEALTHY, error="down")]
-    # _fire_state_changes fast-path: no callbacks, no webhook_url
     await registry._fire_state_changes(results)
 
-    # Nothing raised and _webhook_url is None
-    assert registry._webhook_url is None
+    # No alerters registered when no webhook_url provided
+    assert registry._alerters == []
 
 
 @pytest.mark.asyncio
 async def test_webhook_not_fired_on_first_run():
-    """First run seeds state — no callbacks until a *subsequent* run shows a change."""
+    """First run seeds state — no alerters called until a *subsequent* run shows a change."""
     posted = []
 
-    async def fake_post_webhook(self, probe_name, old, new):
-        posted.append((probe_name,))
+    async def fake_dispatch(self, alert):
+        posted.append(alert.probe)
 
     import fastapi_watch.registry as reg_module
-    original = reg_module.HealthRegistry._post_webhook
+    monkeypatch_attr = reg_module.HealthRegistry._dispatch_alert
 
     app = FastAPI()
     registry = HealthRegistry(app, webhook_url="http://hooks.example.com/health")
-    # _probe_states is empty — old will be None, so no webhook
+    # _probe_states is empty — old will be None, so no alert dispatched
     results = [ProbeResult(name="svc", status=ProbeStatus.UNHEALTHY, error="down")]
     await registry._fire_state_changes(results)
 
-    # State seeded but no webhook because there was no *previous* state to compare
+    # State seeded but no alert because there was no *previous* state to compare
     assert posted == []
     assert registry._probe_states["svc"] == ProbeStatus.UNHEALTHY
 

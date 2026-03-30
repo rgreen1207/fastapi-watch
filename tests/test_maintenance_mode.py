@@ -121,10 +121,10 @@ def test_ready_resumes_normal_after_maintenance_cleared():
 async def test_webhook_suppressed_during_maintenance(monkeypatch):
     posted = []
 
-    async def fake_post(self, probe_name, old, new):
-        posted.append(probe_name)
+    async def fake_dispatch(self, alert):
+        posted.append(alert.probe)
 
-    monkeypatch.setattr("fastapi_watch.registry.HealthRegistry._post_webhook", fake_post)
+    monkeypatch.setattr("fastapi_watch.registry.HealthRegistry._dispatch_alert", fake_dispatch)
 
     app = FastAPI()
     registry = HealthRegistry(app, webhook_url="http://hooks.example.com/health")
@@ -143,10 +143,10 @@ async def test_webhook_suppressed_during_maintenance(monkeypatch):
 async def test_webhook_fires_after_maintenance_ends(monkeypatch):
     posted = []
 
-    async def fake_post(self, probe_name, old, new):
-        posted.append(probe_name)
+    async def fake_dispatch(self, alert):
+        posted.append(alert.probe)
 
-    monkeypatch.setattr("fastapi_watch.registry.HealthRegistry._post_webhook", fake_post)
+    monkeypatch.setattr("fastapi_watch.registry.HealthRegistry._dispatch_alert", fake_dispatch)
 
     app = FastAPI()
     registry = HealthRegistry(app, webhook_url="http://hooks.example.com/health")

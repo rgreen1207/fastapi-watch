@@ -9,7 +9,7 @@ async def test_no_sends_returns_healthy():
     probe = SMTPProbe(name="sendgrid")
     result = await probe.check()
     assert result.status == ProbeStatus.HEALTHY
-    assert result.details["message"] == "no sends observed yet"
+    assert result.details["message"] == "no calls observed yet"
 
 
 @pytest.mark.asyncio
