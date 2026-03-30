@@ -3,8 +3,18 @@
 No ``prometheus_client`` dependency required.  Implements the text exposition
 format 0.0.4 which Prometheus and most compatible scrapers understand.
 
-The ``/metrics`` endpoint on :class:`~fastapi_watch.HealthRegistry` calls
-:func:`render_prometheus` automatically.  Exposed metrics:
+:class:`~fastapi_watch.HealthRegistry` serves the rendered output at
+``GET <prefix>/metrics`` (default: ``GET /health/metrics``).  Point your
+Prometheus scrape config at that URL::
+
+    # prometheus.yml
+    scrape_configs:
+      - job_name: fastapi-watch
+        static_configs:
+          - targets: ["my-service:8000"]
+        metrics_path: /health/metrics
+
+Exposed metrics (all carry ``name`` and ``critical`` labels):
 
 * ``probe_healthy`` — 1 if the probe is HEALTHY, 0 otherwise
 * ``probe_degraded`` — 1 if the probe is DEGRADED, 0 otherwise
@@ -12,8 +22,6 @@ The ``/metrics`` endpoint on :class:`~fastapi_watch.HealthRegistry` calls
 * ``probe_circuit_open`` — 1 if the circuit breaker is currently open
 * ``probe_circuit_consecutive_failures`` — current consecutive failure count
 * ``probe_circuit_trips_total`` — lifetime circuit-breaker trip count
-
-All metrics carry ``name`` and ``critical`` labels.
 """
 from .models import ProbeResult, ProbeStatus
 
