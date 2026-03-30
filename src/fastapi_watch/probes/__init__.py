@@ -1,6 +1,6 @@
 from .base import BaseProbe
-from .route import RouteProbe
-from .websocket import WebSocketProbe
+from .route import FastAPIRouteProbe
+from .websocket import FastAPIWebSocketProbe
 from .celery import CeleryProbe
 from .noop import NoOpProbe
 from .redis import RedisProbe
@@ -30,10 +30,10 @@ __all__ = [
     "PostgreSQLProbe",
     "RabbitMQProbe",
     "RedisProbe",
-    "RouteProbe",
+    "FastAPIRouteProbe",
     "SMTPProbe",
     "SqlAlchemyProbe",
     "TCPProbe",
     "ThresholdProbe",
-    "WebSocketProbe",
+    "FastAPIWebSocketProbe",
 ]

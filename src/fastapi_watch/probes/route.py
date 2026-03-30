@@ -10,7 +10,7 @@ from ..models import ProbeResult, ProbeStatus
 from .base import BaseProbe, _calc_p95, _update_ema
 
 
-class RouteProbe(BaseProbe):
+class FastAPIRouteProbe(BaseProbe):
     """Health probe that instruments a FastAPI route handler via the :meth:`watch` decorator.
 
     Collects per-route traffic stats from real requests and reports them as a
@@ -37,7 +37,7 @@ class RouteProbe(BaseProbe):
 
     Usage::
 
-        route_probe = RouteProbe(name="users", max_error_rate=0.05, max_avg_rtt_ms=300)
+        route_probe = FastAPIRouteProbe(name="users", max_error_rate=0.05, max_avg_rtt_ms=300)
 
         @app.get("/users")
         @route_probe.watch

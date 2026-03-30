@@ -1,7 +1,7 @@
 from .registry import HealthRegistry
 from .probe_router import ProbeRouter
-from .probes.route import RouteProbe
-from .probes.websocket import WebSocketProbe
+from .probes.route import FastAPIRouteProbe
+from .probes.websocket import FastAPIWebSocketProbe
 from .probes.event_loop import EventLoopProbe
 from .probes.tcp import TCPProbe
 from .probes.smtp import SMTPProbe
@@ -14,8 +14,8 @@ from .storage import InMemoryProbeStorage, ProbeStorage
 __all__ = [
     "HealthRegistry",
     "ProbeRouter",
-    "RouteProbe",
-    "WebSocketProbe",
+    "FastAPIRouteProbe",
+    "FastAPIWebSocketProbe",
     "EventLoopProbe",
     "TCPProbe",
     "SMTPProbe",
