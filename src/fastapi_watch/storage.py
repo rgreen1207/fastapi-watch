@@ -1,3 +1,12 @@
+"""Storage backends for probe results and alert history.
+
+:class:`ProbeStorage` is the protocol every backend must satisfy.
+:class:`InMemoryProbeStorage` is the default in-process implementation with
+TTL-based expiry and per-collection size caps.
+
+Pass a custom backend to ``HealthRegistry(app, storage=my_storage)`` to store
+probe results and alerts in an external system (e.g. Redis, PostgreSQL).
+"""
 import time
 from collections import deque
 from typing import Protocol, runtime_checkable

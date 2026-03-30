@@ -1,3 +1,9 @@
+"""Probe router for organising probes across modules.
+
+:class:`ProbeRouter` mirrors the FastAPI ``APIRouter`` pattern: declare probes
+in submodules, then include the routers in :class:`~fastapi_watch.HealthRegistry`
+at application startup.  Routers can also be nested inside other routers.
+"""
 from .probes.base import BaseProbe
 
 
