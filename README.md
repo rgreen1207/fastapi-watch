@@ -18,15 +18,17 @@
 
 ---
 
-Add `/health/live`, `/health/ready`, `/health/status`, `/health/history`, and `/health/dashboard` endpoints to any FastAPI app with a single registry call. All probes run concurrently, so a slow dependency never blocks the others. Each probe returns rich service-specific details alongside the pass/fail result.
+Add `/health/live`, `/health/ready`, `/health/status`, `/health/history`, `/health/metrics`, and `/health/dashboard` endpoints to any FastAPI app with a single registry call. All probes run concurrently, so a slow dependency never blocks the others. Each probe returns rich service-specific details alongside the pass/fail result.
 
-Instrument individual FastAPI route handlers with `RouteProbe` to collect real-traffic metrics — latency percentiles, error rate, throughput, and consecutive failure counts — and surface them alongside your infrastructure probes in the same health report.
+Probes report one of three states: **healthy** (all clear), **degraded** (under stress but still serving traffic), or **unhealthy** (critical failure — stop routing traffic). A degraded critical probe returns 200 on `/health/ready` so load balancers keep sending requests while you investigate.
+
+Instrument individual FastAPI route handlers with `RouteProbe` to collect real-traffic metrics — latency percentiles, error rate, throughput, and consecutive failure counts — or attach `RequestMetricsMiddleware` to capture the same metrics for every route in your app without touching individual handlers.
 
 Organize probes across your codebase using `ProbeRouter`, the same file-splitting pattern FastAPI uses for routes. Declare probes in any module, compose them into routers, and pass them to `HealthRegistry` in one line at startup.
 
 Connect a browser or monitoring tool to the Server-Sent Events (SSE) streaming endpoints (`/health/ready/stream`, `/health/status/stream`) and receive live updates as long as you stay connected — the background poll loop starts automatically on the first connection and stops when the last client disconnects.
 
-Open `/health/dashboard` for a live HTML page that shows all probe results, updates in real time over SSE, and requires no extra dependencies.
+Open `/health/dashboard` for a live HTML page that shows all probe results, updates in real time over SSE, and requires no extra dependencies. Scrape `/health/metrics` for a Prometheus-compatible text export of every probe's health, latency, and circuit breaker state.
 
 ---
 
@@ -44,7 +46,12 @@ Open `/health/dashboard` for a live HTML page that shows all probe results, upda
 - [Live streaming](#live-streaming)
 - [Polling and caching](#polling-and-caching)
 - [Per-probe poll frequency](#per-probe-poll-frequency)
+- [Three-state health (DEGRADED)](#three-state-health-degraded)
 - [Circuit breaker](#circuit-breaker)
+- [Circuit breaker metrics](#circuit-breaker-metrics)
+- [Maintenance mode](#maintenance-mode)
+- [Prometheus metrics](#prometheus-metrics)
+- [App-wide request metrics](#app-wide-request-metrics)
 - [Webhook on state change](#webhook-on-state-change)
 - [Authentication](#authentication)
 - [Startup probe](#startup-probe)
@@ -54,7 +61,13 @@ Open `/health/dashboard` for a live HTML page that shows all probe results, upda
 - [Response format](#response-format)
 - [Writing a custom probe](#writing-a-custom-probe)
 - [Built-in probes](#built-in-probes)
+  - [App-wide request metrics probe](#app-wide-request-metrics-probe)
   - [Watching a FastAPI route](#watching-a-fastapi-route)
+  - [Event loop lag](#event-loop-lag)
+  - [Disk space](#disk-space)
+  - [TCP / DNS reachability](#tcp--dns-reachability)
+  - [SMTP](#smtp)
+  - [Threshold wrapper](#threshold-wrapper)
   - [Watching PostgreSQL](#watching-postgresql)
   - [Watching MySQL / MariaDB](#watching-mysql--mariadb)
   - [Watching Redis](#watching-redis)
@@ -134,9 +147,10 @@ That's it. The following routes are now live:
 
 ```
 GET /health/live          → always 200
-GET /health/ready         → 200 / 503
+GET /health/ready         → 200 (healthy/degraded) / 503 (unhealthy)
 GET /health/status        → 200 / 207
 GET /health/history       → rolling probe history
+GET /health/metrics       → Prometheus text format
 GET /health/startup       → 200 after set_started(); 503 before
 GET /health/dashboard     → HTML dashboard with live SSE updates
 GET /health/ready/stream  → SSE stream
@@ -188,16 +202,17 @@ async def list_users():
 
 ## Endpoints
 
-| Endpoint | Purpose | Healthy | Degraded |
-|---|---|---|---|
-| `GET /health/live` | **Liveness** — is the process alive? | `200 OK` | never fails |
-| `GET /health/ready` | **Readiness** — are all critical probes passing? | `200 OK` | `503 Service Unavailable` |
-| `GET /health/status` | **Status** — full detail on every probe | `200 OK` | `207 Multi-Status` |
-| `GET /health/history` | **History** — last N results per probe | `200 OK` | always `200` |
-| `GET /health/startup` | **Startup** — has `set_started()` been called and do startup probes pass? | `200 OK` | `503 Service Unavailable` |
-| `GET /health/dashboard` | **Dashboard** — live HTML page | `200 OK` | `200 OK` (page shows degraded state) |
-| `GET /health/ready/stream` | **Readiness stream** — SSE; polls while connected | `200 OK` | stream of events |
-| `GET /health/status/stream` | **Status stream** — SSE; polls while connected | `200 OK` | stream of events |
+| Endpoint | Purpose | Healthy | Degraded | Unhealthy |
+|---|---|---|---|---|
+| `GET /health/live` | **Liveness** — is the process alive? | `200 OK` | `200 OK` | `200 OK` |
+| `GET /health/ready` | **Readiness** — are all critical probes passing or degraded? | `200 OK` | `200 OK` | `503 Service Unavailable` |
+| `GET /health/status` | **Status** — full detail on every probe | `200 OK` | `207 Multi-Status` | `207 Multi-Status` |
+| `GET /health/history` | **History** — last N results per probe | `200 OK` | `200 OK` | `200 OK` |
+| `GET /health/metrics` | **Prometheus metrics** — text format 0.0.4 | `200 OK` | `200 OK` | `200 OK` |
+| `GET /health/startup` | **Startup** — has `set_started()` been called and do startup probes pass? | `200 OK` | — | `503 Service Unavailable` |
+| `GET /health/dashboard` | **Dashboard** — live HTML page | `200 OK` | `200 OK` (amber banner) | `200 OK` (red header) |
+| `GET /health/ready/stream` | **Readiness stream** — SSE; polls while connected | `200 OK` | stream of events | stream of events |
+| `GET /health/status/stream` | **Status stream** — SSE; polls while connected | `200 OK` | stream of events | stream of events |
 
 The prefix defaults to `/health` and can be changed at construction time:
 
@@ -207,6 +222,7 @@ registry = HealthRegistry(app, prefix="/ops/health")
 # → /ops/health/ready
 # → /ops/health/status
 # → /ops/health/history
+# → /ops/health/metrics
 # → /ops/health/startup
 # → /ops/health/dashboard
 # → /ops/health/ready/stream
@@ -228,14 +244,14 @@ registry = HealthRegistry(app, dashboard=False) # dashboard off
 
 ### What the dashboard shows
 
-**Header bar** — the overall status is displayed prominently at the top. The bar is green when all critical probes are passing and red when any critical probe is failing. A pulsing animation signals active degradation. The "Last checked" timestamp and timezone are shown in the top right alongside a live connection indicator.
+**Header bar** — the overall status is displayed prominently at the top. The bar is green when all critical probes are healthy, amber when any critical probe is degraded, and red when any critical probe is unhealthy. A pulsing animation signals active degradation or failure. The "Last checked" timestamp and timezone are shown in the top right alongside a live connection indicator. When maintenance mode is active, an amber banner appears below the header.
 
 **Probe cards** — one card per registered probe, arranged in a responsive grid. Each card contains:
 
-- A colored left border (green = healthy, red = unhealthy) that updates live
+- A colored left border (green = healthy, amber = degraded, red = unhealthy) that updates live
 - The probe name and an `optional` badge for non-critical probes
 - The probe's average latency in milliseconds
-- A status pill (`Healthy` / `Unhealthy`)
+- A status pill (`Healthy` / `Degraded` / `Unhealthy`)
 - The error message, if the probe is failing
 - A details table with all service-specific metadata — connection counts, memory usage, error rates, latency percentiles, and so on
 
@@ -504,6 +520,49 @@ class MyServiceProbe(BaseProbe):
 
 ---
 
+## Three-state health (DEGRADED)
+
+Every probe result and the overall health report can be in one of three states:
+
+| State | Meaning | `/health/ready` | `/health/status` |
+|-------|---------|-----------------|------------------|
+| `"healthy"` | All clear | `200 OK` | `200 OK` |
+| `"degraded"` | Under stress — still serving traffic | `200 OK` | `207 Multi-Status` |
+| `"unhealthy"` | Critical failure — stop routing traffic | `503 Service Unavailable` | `207 Multi-Status` |
+
+**DEGRADED is a first-class signal.** It lets probes communicate "something is wrong but the service is still responding" without triggering an emergency. Load balancers keep routing traffic (200), the dashboard shows an amber card, and Prometheus scrapes surface a `probe_degraded` gauge.
+
+Built-in probes that emit DEGRADED: `EventLoopProbe`, `DiskProbe`, `ThresholdProbe`. Custom probes can return it at any time:
+
+```python
+from fastapi_watch.models import ProbeResult, ProbeStatus
+
+return ProbeResult(
+    name=self.name,
+    status=ProbeStatus.DEGRADED,
+    details={"queue_depth": 950, "threshold": 800},
+)
+```
+
+**Overall status rules (critical probes only):**
+
+- Any UNHEALTHY critical probe → overall `"unhealthy"`
+- Any DEGRADED critical probe (no UNHEALTHY) → overall `"degraded"`
+- All healthy → overall `"healthy"`
+- Non-critical probes never affect the overall status.
+
+**Circuit breaker interaction:** DEGRADED counts as a passing result for the circuit breaker (`is_passing = True`). A probe oscillating between healthy and degraded never trips its own circuit.
+
+**`ProbeResult` properties:**
+
+| Property | Returns `True` when |
+|----------|---------------------|
+| `is_healthy` | `status == "healthy"` (strict) |
+| `is_degraded` | `status == "degraded"` |
+| `is_passing` | `status != "unhealthy"` (healthy or degraded) |
+
+---
+
 ## Circuit breaker
 
 The circuit breaker prevents a broken dependency from being called repeatedly when it is clearly failing. After a probe fails a configurable number of consecutive times, the circuit opens and the probe is suspended — it returns the last known result with a `"circuit_breaker_open": true` flag in `details` until the cooldown period expires.
@@ -534,16 +593,197 @@ probe.circuit_breaker_cooldown_ms = 60_000  # shorter cooldown — retry after 1
 registry.add(probe)
 ```
 
-When the circuit is open, `details` includes:
+All other fields (`status`, `error`, `latency_ms`) reflect the last result before the circuit opened. Once the cooldown expires the probe runs again — if it succeeds, the circuit closes and the error counter resets.
+
+---
+
+## Circuit breaker metrics
+
+When the circuit breaker is enabled (the default), a `circuit_breaker` dict is injected into every probe result's `details` on every check — whether the circuit is open or closed. This gives you live visibility into failure accumulation before a trip occurs.
 
 ```json
 {
-  "circuit_breaker_open": true,
-  "version": "7.2.4"
+  "circuit_breaker": {
+    "open": false,
+    "consecutive_failures": 3,
+    "trips_total": 1
+  }
 }
 ```
 
-All other fields (`status`, `error`, `latency_ms`) reflect the last result before the circuit opened. Once the cooldown expires the probe runs again — if it succeeds, the circuit closes and the error counter resets.
+| Field | Description |
+|-------|-------------|
+| `open` | `true` when the circuit is open and the probe is suspended |
+| `consecutive_failures` | Unbroken run of failures since the last success; resets to `0` on any passing result |
+| `trips_total` | Lifetime count of times this probe's circuit has tripped |
+
+When the circuit is open, the probe is not called — the dict reflects the state at the time the circuit tripped:
+
+```json
+{
+  "circuit_breaker": {
+    "open": true,
+    "consecutive_failures": 5,
+    "trips_total": 2
+  }
+}
+```
+
+These fields are also exported via `/health/metrics` as Prometheus gauges (`probe_circuit_open`, `probe_circuit_consecutive_failures`) and a counter (`probe_circuit_trips_total`).
+
+Disable circuit breaker metrics injection with `circuit_breaker=False`:
+
+```python
+registry = HealthRegistry(app, circuit_breaker=False)
+# → no "circuit_breaker" key in any probe result's details
+```
+
+---
+
+## Maintenance mode
+
+Signal to the health system that your application is undergoing planned maintenance. While active:
+
+- `/health/ready` returns `200 {"status": "maintenance"}` regardless of probe results — load balancers keep routing traffic and alerts stay quiet.
+- State-change webhooks are suppressed — probe flaps during maintenance don't trigger pages.
+- The dashboard shows an amber maintenance banner.
+
+```python
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+# Maintenance until a specific time
+registry.set_maintenance(until=datetime.now(ZoneInfo("UTC")) + timedelta(hours=2))
+
+# Clear maintenance early
+registry.clear_maintenance()
+```
+
+Both `set_maintenance()` and `clear_maintenance()` return `self` for chaining.
+
+The `until` datetime must be timezone-aware. Once the `until` time passes, maintenance mode deactivates automatically — no explicit `clear_maintenance()` call is needed.
+
+```python
+# Check programmatically
+if registry._in_maintenance():
+    ...
+```
+
+---
+
+## Prometheus metrics
+
+`GET /health/metrics` returns a Prometheus text format 0.0.4 export of every probe's current state. Scrape it from your Prometheus instance like any other target — no extra dependencies are required.
+
+```
+# HELP probe_healthy 1 if the probe is healthy, 0 otherwise
+# TYPE probe_healthy gauge
+probe_healthy{name="postgresql",critical="true"} 1
+probe_healthy{name="redis",critical="false"} 0
+
+# HELP probe_degraded 1 if the probe is degraded, 0 otherwise
+# TYPE probe_degraded gauge
+probe_degraded{name="postgresql",critical="true"} 0
+
+# HELP probe_latency_ms Last probe latency in milliseconds
+# TYPE probe_latency_ms gauge
+probe_latency_ms{name="postgresql",critical="true"} 1.83
+
+# HELP probe_circuit_open 1 if the circuit breaker is open
+# TYPE probe_circuit_open gauge
+probe_circuit_open{name="redis",critical="false"} 1
+
+# HELP probe_circuit_consecutive_failures Consecutive failure count
+# TYPE probe_circuit_consecutive_failures gauge
+probe_circuit_consecutive_failures{name="redis",critical="false"} 5
+
+# HELP probe_circuit_trips_total Total circuit breaker trips
+# TYPE probe_circuit_trips_total counter
+probe_circuit_trips_total{name="redis",critical="false"} 2
+```
+
+The endpoint always returns `200 OK` with `Content-Type: text/plain; version=0.0.4; charset=utf-8`.
+
+**Prometheus scrape config:**
+
+```yaml
+scrape_configs:
+  - job_name: myapp_health
+    static_configs:
+      - targets: ["localhost:8000"]
+    metrics_path: /health/metrics
+```
+
+---
+
+## App-wide request metrics
+
+`RequestMetricsMiddleware` wraps your entire FastAPI app at the ASGI layer and records aggregate request statistics across all routes — no decorator needed on individual handlers. Pair it with `RequestMetricsProbe` to surface those statistics as a health probe.
+
+```python
+from fastapi import FastAPI
+from fastapi_watch import HealthRegistry, RequestMetricsMiddleware, RequestMetricsProbe
+
+app = FastAPI()
+
+# ... define your routes ...
+
+registry = HealthRegistry(app, poll_interval_ms=None)
+
+# Create the middleware manually so the probe shares the same instance
+middleware = RequestMetricsMiddleware(app, per_route=True)
+probe = RequestMetricsProbe(
+    middleware,
+    max_error_rate=0.05,     # fail if >5% of requests error
+    max_avg_rtt_ms=500,      # fail if average RTT exceeds 500 ms
+)
+registry.add(probe)
+
+# Use the middleware as the ASGI app so TestClient / uvicorn see the same instance
+# In production: uvicorn myapp:middleware
+```
+
+> **Important:** Create the middleware yourself rather than using `app.add_middleware()`. `add_middleware()` creates a new internal instance that the probe cannot see. Pass the same `middleware` object to both `RequestMetricsProbe` and your ASGI server.
+
+**Per-route breakdown**
+
+Set `per_route=True` (the default) to track stats broken down by route template. Path parameters are normalized so `/users/1` and `/users/2` both count under `/users/{user_id}`:
+
+```json
+{
+  "request_count": 1500,
+  "error_count": 12,
+  "error_rate": 0.008,
+  "avg_rtt_ms": 45.2,
+  "consecutive_errors": 0,
+  "routes": {
+    "GET /users": { "request_count": 900, "error_count": 2, "error_rate": 0.0022, "avg_rtt_ms": 38.1 },
+    "GET /users/{user_id}": { "request_count": 550, "error_count": 8, "error_rate": 0.0145, "avg_rtt_ms": 61.4 },
+    "POST /users": { "request_count": 50, "error_count": 2, "error_rate": 0.04, "avg_rtt_ms": 120.7 }
+  }
+}
+```
+
+Set `per_route=False` to collect only the aggregate totals (lower memory overhead for apps with many routes).
+
+**Constructor arguments — `RequestMetricsMiddleware`:**
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `app` | required | The FastAPI (or any ASGI) app to wrap |
+| `per_route` | `True` | Track per-route-template breakdown in addition to aggregate stats |
+| `window_size` | `200` | Sliding window size for RTT tracking |
+| `ema_alpha` | `0.1` | EMA smoothing factor for `avg_rtt_ms` |
+
+**Constructor arguments — `RequestMetricsProbe`:**
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `middleware` | required | The `RequestMetricsMiddleware` instance to read from |
+| `name` | `"request_metrics"` | Probe label |
+| `max_error_rate` | `0.1` | Error-rate threshold (0–1) above which the probe is UNHEALTHY |
+| `max_avg_rtt_ms` | `None` | Average-RTT threshold in milliseconds. `None` disables the threshold |
+| `poll_interval_ms` | `None` | Per-probe poll interval; `None` uses the registry default |
 
 ---
 
@@ -832,7 +1072,7 @@ Every response from `/health/ready`, `/health/status`, and the SSE streams share
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `status` | `"healthy"` \| `"unhealthy"` | Overall result — determined by critical probes only |
+| `status` | `"healthy"` \| `"degraded"` \| `"unhealthy"` | Overall result — determined by critical probes only |
 | `checked_at` | `string` \| `null` | UTC ISO 8601 timestamp of the last probe run; `null` before the first run |
 | `timezone` | `string` \| `null` | IANA timezone name used for `checked_at` |
 | `probes` | `array` | Individual probe results (see below) |
@@ -842,7 +1082,7 @@ Every response from `/health/ready`, `/health/status`, and the SSE streams share
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | `string` | Probe identifier |
-| `status` | `"healthy"` \| `"unhealthy"` | Pass/fail for this probe |
+| `status` | `"healthy"` \| `"degraded"` \| `"unhealthy"` | State for this probe |
 | `critical` | `boolean` | `true` if the probe affects overall status and readiness |
 | `latency_ms` | `number` | How long the check took in milliseconds |
 | `error` | `string` \| `null` | Error message; only present on failure |
@@ -1190,6 +1430,22 @@ Every built-in probe populates the `details` field with service-specific metadat
 
 ---
 
+### App-wide request metrics probe
+
+See [App-wide request metrics](#app-wide-request-metrics) above for full documentation. Quick reference:
+
+```python
+from fastapi_watch import RequestMetricsMiddleware, RequestMetricsProbe
+
+middleware = RequestMetricsMiddleware(app, per_route=True)
+probe = RequestMetricsProbe(middleware, max_error_rate=0.05)
+registry.add(probe)
+```
+
+No extra install required. `RequestMetricsMiddleware` and `RequestMetricsProbe` are included in the base package.
+
+---
+
 ### Watching a FastAPI route
 
 `RouteProbe` is a passive observer — it instruments an existing route handler using the `@probe.watch` decorator and collects real-traffic metrics on every request. No test requests are made; the probe reports on what your actual users are hitting.
@@ -1346,6 +1602,221 @@ app.include_router(users_api_router)
 
 registry = HealthRegistry(app, routers=[users_health_router])
 ```
+
+---
+
+### Event loop lag
+
+`EventLoopProbe` measures how long the asyncio event loop was blocked by scheduling a zero-delay coroutine (`asyncio.sleep(0)`) and timing how long it actually takes to resume. A lag spike means CPU-bound work or slow synchronous calls are blocking the loop.
+
+No extra install required.
+
+```python
+from fastapi_watch.probes import EventLoopProbe
+
+registry.add(EventLoopProbe(
+    name="event_loop",   # default
+    warn_ms=5.0,         # DEGRADED if lag >= 5 ms (default)
+    fail_ms=20.0,        # UNHEALTHY if lag >= 20 ms (default)
+))
+```
+
+**Details returned:**
+
+```json
+{ "lag_ms": 2.4 }
+```
+
+**Constructor arguments:**
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `name` | `"event_loop"` | Probe label |
+| `warn_ms` | `5.0` | Lag threshold for DEGRADED in milliseconds |
+| `fail_ms` | `20.0` | Lag threshold for UNHEALTHY in milliseconds |
+| `poll_interval_ms` | `None` | Uses registry default |
+
+---
+
+### Disk space
+
+`DiskProbe` checks available disk space at a given path using `shutil.disk_usage`. It runs in a thread-pool executor so it never blocks the event loop.
+
+No extra install required.
+
+```python
+from fastapi_watch.probes import DiskProbe
+
+registry.add(DiskProbe(
+    path="/",            # default
+    warn_percent=80.0,   # DEGRADED if used >= 80% (default)
+    fail_percent=90.0,   # UNHEALTHY if used >= 90% (default)
+))
+```
+
+**Details returned:**
+
+```json
+{
+  "path": "/",
+  "total_gb": 500.1,
+  "used_gb": 423.5,
+  "free_gb": 76.6,
+  "used_percent": 84.7
+}
+```
+
+**Constructor arguments:**
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `path` | `"/"` | Filesystem path to check |
+| `warn_percent` | `80.0` | Usage % threshold for DEGRADED |
+| `fail_percent` | `90.0` | Usage % threshold for UNHEALTHY |
+| `name` | `"disk"` | Probe label |
+| `poll_interval_ms` | `None` | Uses registry default |
+
+---
+
+### TCP / DNS reachability
+
+`TCPProbe` resolves a hostname and opens a TCP connection to verify that a host and port are reachable. Both DNS resolution and the TCP connect run in an executor so they never block the event loop. No extra install required — uses only the standard library.
+
+```python
+from fastapi_watch.probes import TCPProbe
+
+registry.add(TCPProbe(host="db.internal", port=5432))
+registry.add(TCPProbe(host="redis.internal", port=6379, name="redis-tcp", timeout=2.0))
+```
+
+The default probe name is `"tcp:{host}:{port}"`.
+
+**Details returned:**
+
+```json
+{
+  "host": "db.internal",
+  "port": 5432,
+  "resolved_ip": "10.0.1.5"
+}
+```
+
+**Constructor arguments:**
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `host` | required | Hostname or IP address |
+| `port` | required | TCP port |
+| `timeout` | `5.0` | Connection timeout in seconds |
+| `name` | `"tcp:{host}:{port}"` | Probe label |
+| `poll_interval_ms` | `None` | Uses registry default |
+
+---
+
+### SMTP
+
+`SMTPProbe` connects to an SMTP server, sends `EHLO`, and optionally negotiates STARTTLS and authenticates. The connection is opened and closed on every check — no persistent session is held. Runs in a thread-pool executor. No extra install required — uses only the standard library.
+
+```python
+from fastapi_watch.probes import SMTPProbe
+
+# Connectivity only — EHLO handshake
+registry.add(SMTPProbe(host="smtp.internal", port=25))
+
+# With STARTTLS
+registry.add(SMTPProbe(host="smtp.gmail.com", port=587, starttls=True))
+
+# With STARTTLS and authentication
+registry.add(SMTPProbe(
+    host="smtp.sendgrid.net",
+    port=587,
+    starttls=True,
+    username="apikey",
+    password="SG.xxxxx",
+    name="sendgrid",
+))
+```
+
+**Details returned:**
+
+```json
+{
+  "host": "smtp.sendgrid.net",
+  "port": 587,
+  "banner": "220 smtp.sendgrid.net ESMTP service ready",
+  "tls": true,
+  "extensions": ["STARTTLS", "AUTH LOGIN PLAIN", "SIZE 31457280"]
+}
+```
+
+**Constructor arguments:**
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `host` | required | SMTP server hostname |
+| `port` | `25` | SMTP port |
+| `timeout` | `5.0` | Connection + handshake timeout in seconds |
+| `starttls` | `False` | Upgrade to TLS with STARTTLS after EHLO |
+| `username` | `None` | SMTP auth username. `None` skips authentication |
+| `password` | `None` | SMTP auth password |
+| `name` | `"smtp"` | Probe label |
+| `poll_interval_ms` | `None` | Uses registry default |
+
+---
+
+### Threshold wrapper
+
+`ThresholdProbe` wraps any existing probe and promotes or overrides its result based on values in the probe's `details` dict. This is the right tool when you want a probe to go DEGRADED or UNHEALTHY based on a metric it already reports — without modifying the probe itself.
+
+No extra install required.
+
+```python
+from fastapi_watch.probes import ThresholdProbe, RedisProbe
+
+redis = RedisProbe(url="redis://localhost:6379")
+
+registry.add(ThresholdProbe(
+    probe=redis,
+    name="redis-keys",
+    warn_if=lambda d: d.get("total_keys", 0) > 500_000,   # DEGRADED
+    fail_if=lambda d: d.get("total_keys", 0) > 1_000_000, # UNHEALTHY
+))
+```
+
+**Semantics:**
+
+- If the inner probe returns UNHEALTHY, the result passes through unchanged — `fail_if` and `warn_if` are not evaluated.
+- If `fail_if(details)` returns `True`, the result is UNHEALTHY.
+- If `warn_if(details)` returns `True` (and `fail_if` was `False`), the result is DEGRADED.
+- If both return `False`, the inner probe's status is preserved.
+- If either callable raises an exception, it is swallowed and treated as `False`.
+
+```python
+# Monitor Celery queue depth
+from fastapi_watch.probes import CeleryProbe, ThresholdProbe
+
+celery_probe = CeleryProbe(celery_app)
+
+registry.add(ThresholdProbe(
+    probe=celery_probe,
+    name="celery-queue",
+    warn_if=lambda d: sum(
+        w.get("active_tasks", 0) + w.get("reserved_tasks", 0)
+        for w in d.get("workers", {}).values()
+    ) > 100,
+    fail_if=lambda d: d.get("workers_online", 1) == 0,
+))
+```
+
+**Constructor arguments:**
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `probe` | required | Any `BaseProbe` instance to wrap |
+| `name` | inner probe's name | Probe label for the wrapper |
+| `warn_if` | `None` | Callable `(details: dict) -> bool`; `True` → DEGRADED |
+| `fail_if` | `None` | Callable `(details: dict) -> bool`; `True` → UNHEALTHY |
+| `poll_interval_ms` | `None` | Uses registry default |
 
 ---
 
@@ -1885,11 +2356,17 @@ registry.add(SqlAlchemyProbe(engine=engine, name="primary-db"))
 
 ### All built-in probes
 
-#### Application routes
+#### Application / infrastructure
 
 | Probe | Extra | Key constructor args | Details fields |
 |-------|-------|---------------------|----------------|
+| `RequestMetricsMiddleware` + `RequestMetricsProbe` | built-in | `per_route`, `max_error_rate`, `max_avg_rtt_ms` | `request_count`, `error_count`, `error_rate`, `avg_rtt_ms`, `consecutive_errors`; + `routes` dict when `per_route=True` |
 | `RouteProbe` | built-in | `name`, `max_error_rate`, `max_avg_rtt_ms`, `window_size`, `ema_alpha` | `request_count`, `error_count`, `error_rate`, `consecutive_errors`, `last_status_code`, `last_rtt_ms`, `avg_rtt_ms`, `p95_rtt_ms`, `min_rtt_ms`, `max_rtt_ms`, `requests_per_minute` |
+| `EventLoopProbe` | built-in | `name`, `warn_ms`, `fail_ms` | `lag_ms` |
+| `DiskProbe` | built-in | `path`, `warn_percent`, `fail_percent`, `name` | `path`, `total_gb`, `used_gb`, `free_gb`, `used_percent` |
+| `TCPProbe` | built-in | `host`, `port`, `timeout`, `name` | `host`, `port`, `resolved_ip` |
+| `SMTPProbe` | built-in | `host`, `port`, `timeout`, `starttls`, `username`, `password`, `name` | `host`, `port`, `banner`, `tls`, `extensions` |
+| `ThresholdProbe` | built-in | `probe`, `name`, `warn_if`, `fail_if` | (delegates to inner probe) |
 
 #### Databases
 
@@ -1953,9 +2430,17 @@ registry.add(SqlAlchemyProbe(engine=engine, name="primary-db"))
 | `circuit_breaker` | `bool` | `True` | Enable the circuit breaker. When a probe fails `circuit_breaker_threshold` consecutive times it is suspended for `circuit_breaker_cooldown_ms` ms. |
 | `circuit_breaker_threshold` | `int` | `5` | Consecutive failures before the circuit opens. |
 | `circuit_breaker_cooldown_ms` | `int` | `600000` | How long (ms) the circuit stays open before the probe is retried (default 10 minutes). |
-| `webhook_url` | `str \| None` | `None` | HTTP(S) URL that receives a JSON `POST` whenever a probe changes state. Fire-and-forget; never blocks health checks. |
+| `webhook_url` | `str \| None` | `None` | HTTP(S) URL that receives a JSON `POST` whenever a probe changes state. Fire-and-forget; never blocks health checks. Suppressed during maintenance mode. |
 | `auth` | `dict \| Callable \| None` | `None` | Authentication for all health endpoints. `None` = open. See [Authentication](#authentication) for accepted forms. |
 | `startup_probes` | `list[BaseProbe] \| None` | `None` | Probes that must pass for `/health/startup` to return 200. Evaluated separately from the main registry. |
+
+### `HealthRegistry.set_maintenance(until=None)`
+
+Activates maintenance mode until the given timezone-aware `datetime`. While active, `/health/ready` returns `200 {"status": "maintenance"}` and state-change webhooks are suppressed. Pass `until=None` (default) to set no expiry — use `clear_maintenance()` to exit. Returns `self`.
+
+### `HealthRegistry.clear_maintenance()`
+
+Deactivates maintenance mode immediately. Returns `self`.
 
 ### `HealthRegistry.add(probe, critical=True)`
 
@@ -2050,12 +2535,14 @@ Instruments a FastAPI route handler via the `@probe.watch` decorator and reports
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | `str` | Probe identifier |
-| `status` | `ProbeStatus` | `"healthy"` or `"unhealthy"` |
+| `status` | `ProbeStatus` | `"healthy"`, `"degraded"`, or `"unhealthy"` |
 | `critical` | `bool` | `True` if the probe was registered as critical; affects overall status and readiness |
 | `latency_ms` | `float` | Duration of the check in milliseconds |
 | `error` | `str \| None` | Error message; only present on failure |
 | `details` | `dict \| None` | Service-specific metadata |
-| `is_healthy` | `bool` (property) | `True` when `status == "healthy"` |
+| `is_healthy` | `bool` (property) | `True` when `status == "healthy"` (strict) |
+| `is_degraded` | `bool` (property) | `True` when `status == "degraded"` |
+| `is_passing` | `bool` (property) | `True` when `status != "unhealthy"` (healthy or degraded) |
 
 ---
 

@@ -1051,10 +1051,11 @@ async def test_circuit_returns_cached_when_open():
     for _ in range(2):
         await registry._safe_check(probe, critical=True)
 
-    # Next call should be served from cache with circuit_breaker_open flag
+    # Next call should be served from cache with circuit_breaker dict showing open=True
     result = await registry._safe_check(probe, critical=True)
     assert result.details is not None
-    assert result.details.get("circuit_breaker_open") is True
+    cb = result.details.get("circuit_breaker", {})
+    assert cb.get("open") is True
 
 
 @pytest.mark.asyncio

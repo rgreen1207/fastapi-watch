@@ -58,8 +58,20 @@ body {
   padding: 28px 32px 24px;
   transition: background 0.4s;
 }
-.header.healthy  { background: #15803d; }
+.header.healthy   { background: #15803d; }
+.header.degraded  { background: #b45309; }
 .header.unhealthy { background: #b91c1c; }
+
+.maintenance-banner {
+  background: #fef3c7;
+  color: #92400e;
+  border-bottom: 1px solid #fde68a;
+  text-align: center;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 10px 16px;
+  letter-spacing: .01em;
+}
 
 .header-inner {
   max-width: 1200px;
@@ -99,7 +111,13 @@ body {
   flex-shrink: 0;
 }
 .healthy  .status-dot { box-shadow: 0 0 0 4px rgba(255,255,255,.25); }
+.degraded .status-dot { animation: pulse-amber 1.4s ease-in-out infinite; }
 .unhealthy .status-dot { animation: pulse-red 1.4s ease-in-out infinite; }
+
+@keyframes pulse-amber {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255,255,255,.5); }
+  50%       { box-shadow: 0 0 0 7px rgba(255,255,255,0); }
+}
 
 @keyframes pulse-red {
   0%, 100% { box-shadow: 0 0 0 0 rgba(255,255,255,.5); }
@@ -188,6 +206,7 @@ body {
   transition: border-left-color .3s;
 }
 .probe-card.healthy   { border-left-color: #16a34a; }
+.probe-card.degraded  { border-left-color: #d97706; }
 .probe-card.unhealthy { border-left-color: #dc2626; }
 
 .probe-card-header {
@@ -205,6 +224,7 @@ body {
   transition: background .3s;
 }
 .probe-card.healthy   .probe-indicator { background: #16a34a; }
+.probe-card.degraded  .probe-indicator { background: #d97706; }
 .probe-card.unhealthy .probe-indicator { background: #dc2626; }
 
 .probe-name {
@@ -230,6 +250,10 @@ body {
 .badge-healthy {
   background: #dcfce7;
   color: #15803d;
+}
+.badge-degraded {
+  background: #fef3c7;
+  color: #92400e;
 }
 .badge-unhealthy {
   background: #fee2e2;
@@ -328,9 +352,11 @@ _JS = r"""
   var checkedEl = document.getElementById('checked-at');
 
   var H_COLOR  = '#15803d';
+  var D_COLOR  = '#b45309';
   var U_COLOR  = '#b91c1c';
   var H_LABEL  = 'All Systems Operational';
-  var U_LABEL  = 'Degraded — one or more probes failing';
+  var D_LABEL  = 'Degraded — one or more probes warning';
+  var U_LABEL  = 'Unhealthy — one or more probes failing';
 
   function fmtMs(val) {
     if (val == null) return '—';
@@ -349,6 +375,13 @@ _JS = r"""
     return String(val);
   }
 
+  function statusLabel(s) {
+    return s === 'healthy' ? 'Healthy' : s === 'degraded' ? 'Degraded' : 'Unhealthy';
+  }
+  function statusBadgeCls(s) {
+    return s === 'healthy' ? 'badge-healthy' : s === 'degraded' ? 'badge-degraded' : 'badge-unhealthy';
+  }
+
   function updateCard(probe) {
     var card = document.querySelector('[data-probe="' + probe.name + '"]');
     if (!card) return;
@@ -359,8 +392,8 @@ _JS = r"""
     // status badge
     var badgeEl = card.querySelector('.badge-status');
     if (badgeEl) {
-      badgeEl.textContent = ok ? 'Healthy' : 'Unhealthy';
-      badgeEl.className = 'badge badge-status ' + (ok ? 'badge-healthy' : 'badge-unhealthy');
+      badgeEl.textContent = statusLabel(probe.status);
+      badgeEl.className = 'badge badge-status ' + statusBadgeCls(probe.status);
     }
 
     // latency
@@ -389,13 +422,14 @@ _JS = r"""
   }
 
   function applyReport(report) {
-    var ok = report.status === 'healthy';
+    var ok  = report.status === 'healthy';
+    var deg = report.status === 'degraded';
 
     // header
     header.className = 'header ' + report.status;
-    header.style.background = ok ? H_COLOR : U_COLOR;
-    if (badge)    badge.textContent    = ok ? 'All Systems Operational' : 'Service Degraded';
-    if (subtitle) subtitle.textContent = ok ? H_LABEL : U_LABEL;
+    header.style.background = ok ? H_COLOR : (deg ? D_COLOR : U_COLOR);
+    if (badge)    badge.textContent    = ok ? 'All Systems Operational' : (deg ? 'Degraded' : 'Unhealthy');
+    if (subtitle) subtitle.textContent = ok ? H_LABEL : (deg ? D_LABEL : U_LABEL);
 
     // timestamp
     if (checkedEl && report.checked_at) {
@@ -428,10 +462,16 @@ _JS = r"""
 # ---------------------------------------------------------------------------
 
 def _probe_card(probe: ProbeResult) -> str:
-    ok = probe.status == ProbeStatus.HEALTHY
-    status_cls = probe.status.value           # "healthy" | "unhealthy"
-    status_label = "Healthy" if ok else "Unhealthy"
-    badge_cls = "badge-healthy" if ok else "badge-unhealthy"
+    status_cls = probe.status.value  # "healthy" | "degraded" | "unhealthy"
+    if probe.status == ProbeStatus.HEALTHY:
+        status_label = "Healthy"
+        badge_cls = "badge-healthy"
+    elif probe.status == ProbeStatus.DEGRADED:
+        status_label = "Degraded"
+        badge_cls = "badge-degraded"
+    else:
+        status_label = "Unhealthy"
+        badge_cls = "badge-unhealthy"
 
     latency = f"{probe.latency_ms:.2f} ms" if probe.latency_ms else "—"
 
@@ -486,15 +526,21 @@ def _probe_card(probe: ProbeResult) -> str:
 # Full page renderer
 # ---------------------------------------------------------------------------
 
-def render_dashboard(report: HealthReport, stream_url: str) -> str:
-    ok = report.status == ProbeStatus.HEALTHY
-    header_cls = "healthy" if ok else "unhealthy"
-    status_text = "All Systems Operational" if ok else "Service Degraded"
-    status_subtitle = (
-        "All probes are passing."
-        if ok
-        else "One or more probes are failing."
-    )
+def render_dashboard(
+    report: HealthReport,
+    stream_url: str,
+    maintenance_banner: bool = False,
+) -> str:
+    header_cls = report.status.value  # "healthy" | "degraded" | "unhealthy"
+    if report.status == ProbeStatus.HEALTHY:
+        status_text = "All Systems Operational"
+        status_subtitle = "All probes are passing."
+    elif report.status == ProbeStatus.DEGRADED:
+        status_text = "Degraded"
+        status_subtitle = "One or more probes are warning."
+    else:
+        status_text = "Unhealthy"
+        status_subtitle = "One or more probes are failing."
 
     if report.checked_at:
         tz = report.timezone or "UTC"
@@ -505,9 +551,24 @@ def render_dashboard(report: HealthReport, stream_url: str) -> str:
 
     probe_count = len(report.probes)
     healthy_count = sum(1 for p in report.probes if p.is_healthy)
-    summary = f"{healthy_count} / {probe_count} probe{'s' if probe_count != 1 else ''} healthy"
+    degraded_count = sum(1 for p in report.probes if p.is_degraded)
+    unhealthy_count = probe_count - healthy_count - degraded_count
+    if degraded_count or unhealthy_count:
+        summary = (
+            f"{healthy_count} healthy, {degraded_count} degraded, {unhealthy_count} unhealthy"
+            f" / {probe_count} probe{'s' if probe_count != 1 else ''}"
+        )
+    else:
+        summary = f"{healthy_count} / {probe_count} probe{'s' if probe_count != 1 else ''} healthy"
 
     probe_cards = "\n".join(_probe_card(p) for p in report.probes)
+
+    maint_html = (
+        '<div class="maintenance-banner">&#128679; Scheduled maintenance in progress — '
+        'probe failures are suppressed.</div>'
+        if maintenance_banner
+        else ""
+    )
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -519,6 +580,7 @@ def render_dashboard(report: HealthReport, stream_url: str) -> str:
 </head>
 <body data-stream-url="{_e(stream_url)}">
 
+  {maint_html}
   <header class="header {header_cls}">
     <div class="header-inner">
       <div class="header-left">
@@ -548,7 +610,8 @@ def render_dashboard(report: HealthReport, stream_url: str) -> str:
     <div class="footer">
       <a href="status">JSON status</a> &nbsp;·&nbsp;
       <a href="history">History</a> &nbsp;·&nbsp;
-      <a href="ready">Readiness</a>
+      <a href="ready">Readiness</a> &nbsp;·&nbsp;
+      <a href="metrics">Metrics</a>
     </div>
   </div>
 

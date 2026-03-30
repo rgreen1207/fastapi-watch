@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 class ProbeStatus(str, Enum):
     HEALTHY = "healthy"
+    DEGRADED = "degraded"
     UNHEALTHY = "unhealthy"
 
 
@@ -20,7 +21,22 @@ class ProbeResult(BaseModel):
 
     @property
     def is_healthy(self) -> bool:
+        """True only when status is HEALTHY (strict check)."""
         return self.status == ProbeStatus.HEALTHY
+
+    @property
+    def is_degraded(self) -> bool:
+        """True when status is DEGRADED."""
+        return self.status == ProbeStatus.DEGRADED
+
+    @property
+    def is_passing(self) -> bool:
+        """True when status is HEALTHY or DEGRADED (not UNHEALTHY).
+
+        Used by the circuit breaker to determine whether to reset the failure
+        counter — a DEGRADED probe is still answering, just under stress.
+        """
+        return self.status != ProbeStatus.UNHEALTHY
 
 
 class HealthReport(BaseModel):
@@ -36,10 +52,11 @@ class HealthReport(BaseModel):
         checked_at: datetime | None = None,
         timezone: str | None = None,
     ) -> "HealthReport":
-        critical_results = [r for r in results if r.critical]
-        overall = (
-            ProbeStatus.HEALTHY
-            if all(r.is_healthy for r in critical_results)
-            else ProbeStatus.UNHEALTHY
-        )
+        critical = [r for r in results if r.critical]
+        if any(r.status == ProbeStatus.UNHEALTHY for r in critical):
+            overall = ProbeStatus.UNHEALTHY
+        elif any(r.status == ProbeStatus.DEGRADED for r in critical):
+            overall = ProbeStatus.DEGRADED
+        else:
+            overall = ProbeStatus.HEALTHY
         return cls(status=overall, checked_at=checked_at, timezone=timezone, probes=results)
