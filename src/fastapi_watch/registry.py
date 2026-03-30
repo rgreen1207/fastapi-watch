@@ -253,6 +253,7 @@ class HealthRegistry:
         self._active_connections: int = 0
 
         self._register_routes(tags or ["health"], dashboard=dashboard)
+        self.app.add_event_handler("shutdown", self._shutdown)
         for group in groups or []:
             self.include(group)
 
@@ -538,6 +539,21 @@ class HealthRegistry:
     def _cancel_poll_task(self) -> None:
         if self._poll_task is not None:
             self._poll_task.cancel()
+            self._poll_task = None
+
+    async def _shutdown(self) -> None:
+        """Cancel the poll task and wait for it to finish.
+
+        Registered as a FastAPI shutdown event handler so the background task
+        exits cleanly when uvicorn stops or reloads — preventing the process
+        from hanging on shutdown.
+        """
+        if self._poll_task is not None:
+            self._poll_task.cancel()
+            try:
+                await self._poll_task
+            except (asyncio.CancelledError, Exception):
+                pass
             self._poll_task = None
 
     async def _poll_loop(self) -> None:
