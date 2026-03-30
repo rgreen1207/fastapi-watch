@@ -251,6 +251,7 @@ class HealthRegistry:
         ] = []
         self._poll_task: asyncio.Task | None = None
         self._active_connections: int = 0
+        self._shutting_down: bool = False
 
         self._register_routes(tags or ["health"], dashboard=dashboard)
         self.app.router.on_shutdown.append(self._shutdown)
@@ -542,12 +543,13 @@ class HealthRegistry:
             self._poll_task = None
 
     async def _shutdown(self) -> None:
-        """Cancel the poll task and wait for it to finish.
+        """Signal SSE streams to stop and cancel the poll task.
 
         Registered as a FastAPI shutdown event handler so the background task
-        exits cleanly when uvicorn stops or reloads — preventing the process
-        from hanging on shutdown.
+        and any open streaming connections exit cleanly when uvicorn stops or
+        reloads — preventing the process from hanging on shutdown.
         """
+        self._shutting_down = True
         if self._poll_task is not None:
             self._poll_task.cancel()
             try:
@@ -585,7 +587,8 @@ class HealthRegistry:
     async def _wait_for_next_poll(self, request: Request) -> bool:
         """Sleep for poll_interval_ms, checking client disconnect every 500 ms.
 
-        Returns True if the client disconnected before the interval elapsed.
+        Returns True if the client disconnected or the app is shutting down
+        before the interval elapsed.
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._poll_interval_ms / 1000
@@ -594,7 +597,7 @@ class HealthRegistry:
             if remaining <= 0:
                 return False
             await asyncio.sleep(min(0.5, remaining))
-            if await request.is_disconnected():
+            if self._shutting_down or await request.is_disconnected():
                 return True
 
     async def _event_stream(
@@ -605,7 +608,7 @@ class HealthRegistry:
         """Async generator that yields SSE (Server-Sent Events) events while the client is connected."""
         await self._on_connect()
         try:
-            while True:
+            while not self._shutting_down:
                 results = await self._get_results()
                 yield f"data: {make_report(results)}\n\n"
                 if self._poll_interval_ms is None:
