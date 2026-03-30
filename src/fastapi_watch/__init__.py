@@ -1,5 +1,6 @@
 from .registry import HealthRegistry
 from .probe_router import ProbeRouter
+from .probes.base import BaseProbe, PassiveProbe
 from .probes.route import FastAPIRouteProbe
 from .probes.websocket import FastAPIWebSocketProbe
 from .probes.event_loop import EventLoopProbe
@@ -12,6 +13,8 @@ from .models import AlertRecord, ProbeStatus, ProbeResult, HealthReport
 from .storage import InMemoryProbeStorage, ProbeStorage
 
 __all__ = [
+    "BaseProbe",
+    "PassiveProbe",
     "HealthRegistry",
     "ProbeRouter",
     "FastAPIRouteProbe",
