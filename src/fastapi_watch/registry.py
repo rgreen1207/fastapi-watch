@@ -253,7 +253,7 @@ class HealthRegistry:
         self._active_connections: int = 0
 
         self._register_routes(tags or ["health"], dashboard=dashboard)
-        self.app.add_event_handler("shutdown", self._shutdown)
+        self.app.router.on_shutdown.append(self._shutdown)
         for group in groups or []:
             self.include(group)
 
