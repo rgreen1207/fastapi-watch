@@ -7,6 +7,9 @@ from .base import BaseProbe
 class MemcachedProbe(BaseProbe):
     """Health probe for Memcached using aiomcache.
 
+    Actively connects and issues a ``stats`` command on each poll. Works even
+    on an empty cache — no keys need to exist.
+
     Install with: ``pip install fastapi-watch[memcached]``
 
     Args:
@@ -14,6 +17,10 @@ class MemcachedProbe(BaseProbe):
         port: Memcached port (default ``11211``).
         name: Probe name shown in health reports.
         pool_size: Connection pool size passed to aiomcache (default 1).
+
+    Example::
+
+        registry.add(MemcachedProbe("cache.internal", port=11211, name="memcached"))
     """
 
     def __init__(
@@ -22,10 +29,12 @@ class MemcachedProbe(BaseProbe):
         port: int = 11211,
         name: str = "memcached",
         pool_size: int = 1,
+        poll_interval_ms: int | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self.name = name
+        self.poll_interval_ms = poll_interval_ms
         self._pool_size = pool_size
 
     async def check(self) -> ProbeResult:

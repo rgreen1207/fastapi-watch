@@ -1,75 +1,54 @@
-import time
-from urllib.parse import urlparse
-
-from ..models import ProbeResult, ProbeStatus
-from .base import BaseProbe
+from .base import PassiveProbe
 
 
-class HttpProbe(BaseProbe):
-    """Health probe that performs an HTTP GET against an upstream URL.
+class HttpProbe(PassiveProbe):
+    """Health probe that passively observes outgoing HTTP calls via the :meth:`watch` decorator.
 
-    Returns the HTTP status code, content type, and response body size.
+    Rather than making its own synthetic requests (which would burn API credits
+    or trip rate limits), ``HttpProbe`` instruments the functions in your code
+    that call external services. Every call is silently timed and any exception
+    is counted as an error.
 
-    Install with: ``pip install fastapi-watch[http]``
+    Works with any HTTP library and both ``async def`` and ``def`` functions.
 
     Args:
-        url: URL to check.
-        timeout: Request timeout in seconds (default 5.0).
-        name: Probe name. Defaults to the URL host.
-        expected_status: HTTP status code considered healthy (default 200).
+        name: Probe name shown in health reports (default ``"http"``).
+        max_error_rate: Error-rate threshold above which the probe is UNHEALTHY (0–1).
+        max_avg_rtt_ms: Average-RTT threshold in milliseconds. ``None`` disables it.
+        window_size: Number of recent calls used for percentile calculations.
+        ema_alpha: Smoothing factor for the exponential moving average (0–1).
+        poll_interval_ms: Per-probe poll interval override.
+
+    Example::
+
+        stripe_probe = HttpProbe(name="stripe", max_error_rate=0.05, max_avg_rtt_ms=500)
+
+        @stripe_probe.watch
+        async def charge_customer(amount: int, currency: str) -> dict:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://api.stripe.com/v1/charges",
+                    json={"amount": amount, "currency": currency},
+                ) as response:
+                    response.raise_for_status()
+                    return await response.json()
+
+        registry.add(stripe_probe)
     """
 
     def __init__(
         self,
-        url: str,
-        timeout: float = 5.0,
-        name: str | None = None,
-        expected_status: int = 200,
+        name: str = "http",
+        *,
+        max_error_rate: float = 0.1,
+        max_avg_rtt_ms: float | None = None,
+        window_size: int = 100,
+        ema_alpha: float = 0.1,
     ) -> None:
-        self.url = url
-        self.timeout = timeout
-        self.expected_status = expected_status
-        self.name = name if name is not None else (urlparse(url).netloc or url)
-
-    async def check(self) -> ProbeResult:
-        try:
-            import aiohttp
-        except ImportError as exc:
-            raise ImportError(
-                "Install fastapi-watch[http] to use HttpProbe."
-            ) from exc
-
-        start = time.perf_counter()
-        try:
-            timeout = aiohttp.ClientTimeout(total=self.timeout)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(self.url) as response:
-                    body = await response.read()
-                    latency = (time.perf_counter() - start) * 1000
-                    details = {
-                        "status_code": response.status,
-                        "content_type": response.headers.get("Content-Type"),
-                        "response_bytes": len(body),
-                    }
-                    if response.status == self.expected_status:
-                        return ProbeResult(
-                            name=self.name,
-                            status=ProbeStatus.HEALTHY,
-                            latency_ms=round(latency, 2),
-                            details=details,
-                        )
-                    return ProbeResult(
-                        name=self.name,
-                        status=ProbeStatus.UNHEALTHY,
-                        latency_ms=round(latency, 2),
-                        error=f"HTTP {response.status}",
-                        details=details,
-                    )
-        except Exception as exc:
-            latency = (time.perf_counter() - start) * 1000
-            return ProbeResult(
-                name=self.name,
-                status=ProbeStatus.UNHEALTHY,
-                latency_ms=round(latency, 2),
-                error=str(exc),
-            )
+        super().__init__(
+            name,
+            max_error_rate=max_error_rate,
+            max_avg_rtt_ms=max_avg_rtt_ms,
+            window_size=window_size,
+            ema_alpha=ema_alpha,
+        )

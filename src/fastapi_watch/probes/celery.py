@@ -38,8 +38,11 @@ def _pool_info(stats: dict) -> dict:
 class CeleryProbe(BaseProbe):
     """Health probe that inspects live Celery workers via the control broadcast API.
 
-    Reports per-worker active, reserved, and scheduled tasks, registered task
-    names, queue bindings, pool configuration, and lifetime task counts.
+    By default only a ``ping`` broadcast is issued on each poll — one round-trip
+    to confirm workers are alive. Set ``detailed=True`` to enable the full
+    inspection (active, reserved, scheduled, registered tasks, pool stats, and
+    queue bindings), which issues additional broadcasts and is best suited for
+    development or test environments.
 
     When no workers are found and *min_workers* is ``0`` (the default), the
     probe is **healthy** — this covers scale-to-zero deployments where workers
@@ -53,13 +56,18 @@ class CeleryProbe(BaseProbe):
             Workers that are alive respond well within 1 s; the timeout
             only matters when workers are unreachable (default ``1.0``).
         min_workers: Minimum number of workers that must be online for the
-            probe to be healthy.  ``0`` (default) means workers are optional.
+            probe to be healthy. ``0`` (default) means workers are optional.
+        detailed: When ``True``, collects per-worker active/reserved/scheduled
+            tasks, registered task names, queue bindings, and pool stats.
+            Disabled by default to minimise broadcast traffic in production.
 
     Example::
 
-        from celery_app import celery
-        registry.add(CeleryProbe(celery))
-        registry.add(CeleryProbe(celery, min_workers=2, timeout=2.0))
+        # Production — ping only
+        registry.add(CeleryProbe(celery, min_workers=2))
+
+        # Development / test — full worker inspection
+        registry.add(CeleryProbe(celery, min_workers=1, detailed=True))
     """
 
     def __init__(
@@ -68,11 +76,15 @@ class CeleryProbe(BaseProbe):
         name: str = "celery",
         timeout: float = 1.0,
         min_workers: int = 0,
+        detailed: bool = False,
+        poll_interval_ms: int | None = None,
     ) -> None:
         self.app = app
         self.name = name
         self.timeout = timeout
         self.min_workers = min_workers
+        self.detailed = detailed
+        self.poll_interval_ms = poll_interval_ms
 
     # ------------------------------------------------------------------
     # Synchronous inspect — called via run_in_executor
@@ -81,14 +93,16 @@ class CeleryProbe(BaseProbe):
     def _inspect(self) -> dict[str, Any]:
         i = self.app.control.inspect(timeout=self.timeout)
 
-        # Ping first: only one broadcast roundtrip if no workers are online.
         ping = i.ping() or {}
         workers = list(ping.keys())
 
         if not workers:
-            return {"workers_online": 0, "workers": {}}
+            return {"workers_online": 0, "workers": []}
 
-        # Workers are alive — fetch detailed state (each call is one broadcast).
+        if not self.detailed:
+            return {"workers_online": len(workers), "workers": workers}
+
+        # detailed=True — full inspection (additional broadcasts per call)
         active = i.active() or {}
         reserved = i.reserved() or {}
         scheduled = i.scheduled() or {}
@@ -128,7 +142,7 @@ class CeleryProbe(BaseProbe):
     async def check(self) -> ProbeResult:
         start = time.perf_counter()
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             data = await loop.run_in_executor(None, self._inspect)
             latency = (time.perf_counter() - start) * 1000
 

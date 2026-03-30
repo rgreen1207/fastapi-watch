@@ -1,3 +1,4 @@
+import asyncio
 import time
 from urllib.parse import urlparse
 
@@ -8,11 +9,10 @@ from .base import BaseProbe
 class RabbitMQProbe(BaseProbe):
     """Health probe for RabbitMQ using aio-pika.
 
-    When ``management_url`` is provided, calls the RabbitMQ Management HTTP API
-    to return rich details: server version, node info, per-queue message counts,
-    consumer counts, publish/deliver/ack rates, and cluster-wide totals.
-
-    Without ``management_url`` the probe only verifies TCP connectivity.
+    Actively verifies AMQP connectivity on each poll. When ``management_url``
+    is provided, also calls the RabbitMQ Management HTTP API to return rich
+    details: server version, node info, per-queue message counts, consumer
+    counts, and publish/deliver/ack rates.
 
     Install with: ``pip install fastapi-watch[rabbitmq]``
 
@@ -22,6 +22,18 @@ class RabbitMQProbe(BaseProbe):
         management_url: Base URL of the Management API
             (e.g. ``http://localhost:15672``). Credentials are taken from *url*.
             If omitted, no queue-level details are collected.
+
+    Example::
+
+        # Connectivity check only
+        registry.add(RabbitMQProbe(url="amqp://user:pass@rabbitmq/"))
+
+        # With Management API details (queue depths, rates, etc.)
+        registry.add(RabbitMQProbe(
+            url="amqp://user:pass@rabbitmq/",
+            management_url="http://rabbitmq:15672",
+            name="rabbitmq",
+        ))
     """
 
     def __init__(
@@ -29,10 +41,12 @@ class RabbitMQProbe(BaseProbe):
         url: str = "amqp://guest:guest@localhost/",
         name: str = "rabbitmq",
         management_url: str | None = None,
+        poll_interval_ms: int | None = None,
     ) -> None:
         self.url = url
         self.name = name
         self.management_url = management_url
+        self.poll_interval_ms = poll_interval_ms
 
         parsed = urlparse(url)
         self._mgmt_user = parsed.username or "guest"
@@ -91,10 +105,17 @@ class RabbitMQProbe(BaseProbe):
 
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5.0)) as session:
-                # --- Overview ------------------------------------------------
-                async with session.get(f"{base}/overview", auth=auth) as resp:
-                    resp.raise_for_status()
-                    overview = await resp.json()
+
+                async def _get_json(path: str) -> dict | list:
+                    async with session.get(f"{base}/{path}", auth=auth) as resp:
+                        resp.raise_for_status()
+                        return await resp.json()
+
+                # Fetch overview and queues in parallel.
+                overview, queues_data = await asyncio.gather(
+                    _get_json("overview"),
+                    _get_json("queues"),
+                )
 
                 totals = overview.get("queue_totals", {})
                 stats = overview.get("message_stats", {})
@@ -119,11 +140,6 @@ class RabbitMQProbe(BaseProbe):
                     "deliver_rate": stats.get("deliver_get_details", {}).get("rate", 0),
                     "ack_rate": stats.get("ack_details", {}).get("rate", 0),
                 }
-
-                # --- Per-queue details ----------------------------------------
-                async with session.get(f"{base}/queues", auth=auth) as resp:
-                    resp.raise_for_status()
-                    queues_data = await resp.json()
 
                 queues = {}
                 for q in queues_data:

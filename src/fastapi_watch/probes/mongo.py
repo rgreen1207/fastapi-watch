@@ -1,74 +1,52 @@
-import time
-
-from ..models import ProbeResult, ProbeStatus
-from .base import BaseProbe
+from .base import PassiveProbe
 
 
-class MongoProbe(BaseProbe):
-    """Health probe for MongoDB using motor.
+class MongoProbe(PassiveProbe):
+    """Health probe that passively observes outgoing MongoDB calls via the :meth:`watch` decorator.
 
-    Returns server version, uptime, connection pool stats, and memory usage.
+    Instruments the functions in your code that query MongoDB, recording
+    latency and errors from real traffic rather than issuing a synthetic
+    ``serverStatus`` command on a poll timer.
 
     Install with: ``pip install fastapi-watch[mongo]``
+
+    Args:
+        name: Probe name shown in health reports (default ``"mongodb"``).
+        max_error_rate: Error-rate threshold above which the probe is UNHEALTHY (0–1).
+        max_avg_rtt_ms: Average-RTT threshold in milliseconds. ``None`` disables it.
+        window_size: Number of recent calls used for percentile calculations.
+        ema_alpha: Smoothing factor for the exponential moving average (0–1).
+        poll_interval_ms: Per-probe poll interval override.
+
+    Example::
+
+        mongo_probe = MongoProbe(name="mongodb", max_error_rate=0.02)
+
+        @mongo_probe.watch
+        async def get_document(doc_id: str) -> dict | None:
+            return await db.documents.find_one({"_id": doc_id})
+
+        @mongo_probe.watch
+        async def insert_event(event: dict) -> str:
+            result = await db.events.insert_one(event)
+            return str(result.inserted_id)
+
+        registry.add(mongo_probe)
     """
 
     def __init__(
         self,
-        url: str = "mongodb://localhost:27017",
         name: str = "mongodb",
-        server_selection_timeout_ms: int = 2000,
+        *,
+        max_error_rate: float = 0.1,
+        max_avg_rtt_ms: float | None = None,
+        window_size: int = 100,
+        ema_alpha: float = 0.1,
     ) -> None:
-        self.url = url
-        self.name = name
-        self._timeout_ms = server_selection_timeout_ms
-
-    async def check(self) -> ProbeResult:
-        try:
-            import motor.motor_asyncio as motor
-        except ImportError as exc:
-            raise ImportError(
-                "Install fastapi-watch[mongo] to use MongoProbe."
-            ) from exc
-
-        start = time.perf_counter()
-        client = None
-        try:
-            client = motor.AsyncIOMotorClient(
-                self.url,
-                serverSelectionTimeoutMS=self._timeout_ms,
-            )
-            status = await client.admin.command("serverStatus")
-            latency = (time.perf_counter() - start) * 1000
-
-            connections = status.get("connections", {})
-            mem = status.get("mem", {})
-            return ProbeResult(
-                name=self.name,
-                status=ProbeStatus.HEALTHY,
-                latency_ms=round(latency, 2),
-                details={
-                    "version": status.get("version"),
-                    "uptime_seconds": status.get("uptime"),
-                    "connections": {
-                        "current": connections.get("current"),
-                        "available": connections.get("available"),
-                        "total_created": connections.get("totalCreated"),
-                    },
-                    "memory_mb": {
-                        "resident": mem.get("resident"),
-                        "virtual": mem.get("virtual"),
-                    },
-                    "storage_engine": status.get("storageEngine", {}).get("name"),
-                },
-            )
-        except Exception as exc:
-            latency = (time.perf_counter() - start) * 1000
-            return ProbeResult(
-                name=self.name,
-                status=ProbeStatus.UNHEALTHY,
-                latency_ms=round(latency, 2),
-                error=str(exc),
-            )
-        finally:
-            if client is not None:
-                client.close()
+        super().__init__(
+            name,
+            max_error_rate=max_error_rate,
+            max_avg_rtt_ms=max_avg_rtt_ms,
+            window_size=window_size,
+            ema_alpha=ema_alpha,
+        )

@@ -1,80 +1,58 @@
-import asyncio
-import time
-
-from ..models import ProbeResult, ProbeStatus
-from .base import BaseProbe
+from .base import PassiveProbe
 
 
-class PostgreSQLProbe(BaseProbe):
-    """Health probe for PostgreSQL using asyncpg (direct driver, no SQLAlchemy).
+class PostgreSQLProbe(PassiveProbe):
+    """Health probe that passively observes outgoing PostgreSQL calls via the :meth:`watch` decorator.
 
-    Returns server version, active connection count, max connections,
-    and the human-readable size of the current database.
+    Instruments the functions in your code that query PostgreSQL, recording
+    latency and errors from real traffic rather than opening a synthetic
+    connection and running queries on a poll timer.
 
     Install with: ``pip install fastapi-watch[postgres]``
 
     Args:
-        url: asyncpg DSN — ``postgresql://user:pass@host:port/db``.
-        name: Probe name shown in health reports.
-        timeout: Connection timeout in seconds (default 5.0).
+        name: Probe name shown in health reports (default ``"postgresql"``).
+        max_error_rate: Error-rate threshold above which the probe is UNHEALTHY (0–1).
+        max_avg_rtt_ms: Average-RTT threshold in milliseconds. ``None`` disables it.
+        window_size: Number of recent calls used for percentile calculations.
+        ema_alpha: Smoothing factor for the exponential moving average (0–1).
+        poll_interval_ms: Per-probe poll interval override.
+
+    Example::
+
+        pg_probe = PostgreSQLProbe(name="primary-db", max_error_rate=0.01)
+
+        @pg_probe.watch
+        async def get_user(user_id: int) -> dict | None:
+            async with pool.acquire() as conn:
+                return await conn.fetchrow(
+                    "SELECT id, email FROM users WHERE id = $1", user_id
+                )
+
+        @pg_probe.watch
+        async def create_order(user_id: int, total: float) -> int:
+            async with pool.acquire() as conn:
+                return await conn.fetchval(
+                    "INSERT INTO orders (user_id, total) VALUES ($1, $2) RETURNING id",
+                    user_id, total,
+                )
+
+        registry.add(pg_probe)
     """
 
     def __init__(
         self,
-        url: str,
         name: str = "postgresql",
-        timeout: float = 5.0,
+        *,
+        max_error_rate: float = 0.1,
+        max_avg_rtt_ms: float | None = None,
+        window_size: int = 100,
+        ema_alpha: float = 0.1,
     ) -> None:
-        self.url = url
-        self.name = name
-        self.timeout = timeout
-
-    async def check(self) -> ProbeResult:
-        try:
-            import asyncpg
-        except ImportError as exc:
-            raise ImportError(
-                "Install fastapi-watch[postgres] to use PostgreSQLProbe."
-            ) from exc
-
-        start = time.perf_counter()
-        conn = None
-        try:
-            conn = await asyncpg.connect(dsn=self.url, timeout=self.timeout)
-
-            version, active_connections, max_connections, db_size = await asyncio.gather(
-                conn.fetchval("SELECT version()"),
-                conn.fetchval(
-                    "SELECT count(*) FROM pg_stat_activity WHERE state = 'active'"
-                ),
-                conn.fetchval(
-                    "SELECT setting::int FROM pg_settings WHERE name = 'max_connections'"
-                ),
-                conn.fetchval(
-                    "SELECT pg_size_pretty(pg_database_size(current_database()))"
-                ),
-            )
-
-            latency = (time.perf_counter() - start) * 1000
-            return ProbeResult(
-                name=self.name,
-                status=ProbeStatus.HEALTHY,
-                latency_ms=round(latency, 2),
-                details={
-                    "version": version,
-                    "active_connections": active_connections,
-                    "max_connections": max_connections,
-                    "database_size": db_size,
-                },
-            )
-        except Exception as exc:
-            latency = (time.perf_counter() - start) * 1000
-            return ProbeResult(
-                name=self.name,
-                status=ProbeStatus.UNHEALTHY,
-                latency_ms=round(latency, 2),
-                error=str(exc),
-            )
-        finally:
-            if conn is not None:
-                await conn.close()
+        super().__init__(
+            name,
+            max_error_rate=max_error_rate,
+            max_avg_rtt_ms=max_avg_rtt_ms,
+            window_size=window_size,
+            ema_alpha=ema_alpha,
+        )

@@ -1,6 +1,8 @@
-from .base import BaseProbe
+from .base import BaseProbe, PassiveProbe
+from .route import FastAPIRouteProbe
+from .websocket import FastAPIWebSocketProbe
 from .celery import CeleryProbe
-from .memory import MemoryProbe
+from .noop import NoOpProbe
 from .redis import RedisProbe
 from .rabbitmq import RabbitMQProbe
 from .sqlalchemy import SqlAlchemyProbe
@@ -10,23 +12,29 @@ from .mongo import MongoProbe
 from .memcached import MemcachedProbe
 from .kafka import KafkaProbe
 from .http import HttpProbe
+from .event_loop import EventLoopProbe
+from .tcp import TCPProbe
+from .smtp import SMTPProbe
+from .threshold import ThresholdProbe
 
 __all__ = [
     "BaseProbe",
+    "PassiveProbe",
     "CeleryProbe",
-    "MemoryProbe",
-    # databases
-    "SqlAlchemyProbe",
-    "PostgreSQLProbe",
-    "MySQLProbe",
-    # caching
-    "RedisProbe",
-    "MemcachedProbe",
-    # messaging / queues
-    "RabbitMQProbe",
-    "KafkaProbe",
-    # document stores
-    "MongoProbe",
-    # http
+    "EventLoopProbe",
     "HttpProbe",
+    "KafkaProbe",
+    "MemcachedProbe",
+    "NoOpProbe",
+    "MongoProbe",
+    "MySQLProbe",
+    "PostgreSQLProbe",
+    "RabbitMQProbe",
+    "RedisProbe",
+    "FastAPIRouteProbe",
+    "SMTPProbe",
+    "SqlAlchemyProbe",
+    "TCPProbe",
+    "ThresholdProbe",
+    "FastAPIWebSocketProbe",
 ]
