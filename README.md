@@ -1,6 +1,4 @@
-<p align="center">
-  <b>fastapi-watch</b>
-</p>
+<h1 align="center">fastapi-watch</h1>
 <p align="center">
   <em>Structured health and readiness check system for <a href="https://fastapi.tiangolo.com/">FastAPI</a>.</em>
 </p>
@@ -1723,7 +1721,7 @@ registry.add(EventLoopProbe(
 **Details returned:**
 
 ```json
-{ "lag_ms": 2.4 }
+{ "lag_ms": 2.4, "warn_ms": 5.0, "fail_ms": 20.0 }
 ```
 
 **Constructor arguments:**
@@ -1761,7 +1759,9 @@ registry.add(DiskProbe(
   "total_gb": 500.1,
   "used_gb": 423.5,
   "free_gb": 76.6,
-  "percent_used": 84.7
+  "percent_used": 84.7,
+  "warn_percent": 80.0,
+  "fail_percent": 90.0
 }
 ```
 
@@ -1796,7 +1796,8 @@ The default probe name is `"tcp:{host}:{port}"`.
 {
   "host": "db.internal",
   "port": 5432,
-  "resolved_ip": "10.0.1.5"
+  "resolved_ips": ["10.0.1.5"],
+  "connect_ms": 1.23
 }
 ```
 
@@ -1842,7 +1843,7 @@ registry.add(SMTPProbe(
 {
   "host": "smtp.sendgrid.net",
   "port": 587,
-  "banner": "220 smtp.sendgrid.net ESMTP service ready",
+  "server_banner": "220 smtp.sendgrid.net ESMTP service ready",
   "tls": true,
   "extensions": ["STARTTLS", "AUTH LOGIN PLAIN", "SIZE 31457280"]
 }
@@ -2464,8 +2465,8 @@ registry.add(SqlAlchemyProbe(engine=engine, name="primary-db"))
 | `WebSocketProbe` | built-in | `name`, `max_error_rate`, `min_active_connections`, `window_size`, `ema_alpha` | `active_connections`, `total_connections`, `messages_received`, `messages_sent`, `error_count`, `error_rate`, `consecutive_errors`, `avg_duration_ms`, `min_duration_ms`, `max_duration_ms` |
 | `EventLoopProbe` | built-in | `name`, `warn_ms`, `fail_ms` | `lag_ms` |
 | `DiskProbe` | built-in | `path`, `warn_percent`, `fail_percent`, `name` | `path`, `total_gb`, `used_gb`, `free_gb`, `percent_used` |
-| `TCPProbe` | built-in | `host`, `port`, `timeout`, `name` | `host`, `port`, `resolved_ip` |
-| `SMTPProbe` | built-in | `host`, `port`, `timeout`, `use_tls`, `username`, `password`, `name` | `host`, `port`, `banner`, `tls`, `extensions` |
+| `TCPProbe` | built-in | `host`, `port`, `timeout`, `name` | `host`, `port`, `resolved_ips`, `connect_ms` |
+| `SMTPProbe` | built-in | `host`, `port`, `timeout`, `use_tls`, `username`, `password`, `name` | `host`, `port`, `server_banner`, `tls`, `extensions` |
 | `ThresholdProbe` | built-in | `probe`, `name`, `warn_if`, `fail_if` | (delegates to inner probe) |
 
 #### Databases
