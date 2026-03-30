@@ -48,7 +48,6 @@ class PostgreSQLProbe(PassiveProbe):
         max_avg_rtt_ms: float | None = None,
         window_size: int = 100,
         ema_alpha: float = 0.1,
-        poll_interval_ms: int | None = None,
     ) -> None:
         super().__init__(
             name,
@@ -56,5 +55,4 @@ class PostgreSQLProbe(PassiveProbe):
             max_avg_rtt_ms=max_avg_rtt_ms,
             window_size=window_size,
             ema_alpha=ema_alpha,
-            poll_interval_ms=poll_interval_ms,
         )
