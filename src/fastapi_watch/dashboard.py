@@ -1,6 +1,4 @@
 """Server-side rendered HTML health dashboard."""
-from __future__ import annotations
-
 import html as _html
 from typing import Any
 

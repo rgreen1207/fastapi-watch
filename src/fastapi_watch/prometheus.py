@@ -3,8 +3,6 @@
 No ``prometheus_client`` dependency required.  Implements the text exposition
 format 0.0.4 which Prometheus and most compatible scrapers understand.
 """
-from __future__ import annotations
-
 from .models import ProbeResult, ProbeStatus
 
 
