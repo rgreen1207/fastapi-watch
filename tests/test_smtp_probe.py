@@ -1,26 +1,26 @@
-"""Tests for HttpProbe passive observation via watch decorator."""
+"""Tests for SMTPProbe passive observation via watch decorator."""
 import pytest
 from fastapi_watch.models import ProbeStatus
-from fastapi_watch.probes.http import HttpProbe
+from fastapi_watch.probes.smtp import SMTPProbe
 
 
 @pytest.mark.asyncio
-async def test_no_calls_returns_healthy():
-    probe = HttpProbe(name="stripe")
+async def test_no_sends_returns_healthy():
+    probe = SMTPProbe(name="sendgrid")
     result = await probe.check()
     assert result.status == ProbeStatus.HEALTHY
-    assert result.details["message"] == "no calls observed yet"
+    assert result.details["message"] == "no sends observed yet"
 
 
 @pytest.mark.asyncio
-async def test_successful_call_recorded():
-    probe = HttpProbe(name="stripe")
+async def test_successful_send_recorded():
+    probe = SMTPProbe(name="sendgrid")
 
     @probe.watch
-    async def call():
-        return {"id": "ch_123"}
+    async def send():
+        return None
 
-    await call()
+    await send()
     result = await probe.check()
     assert result.status == ProbeStatus.HEALTHY
     assert result.details["call_count"] == 1
@@ -30,14 +30,14 @@ async def test_successful_call_recorded():
 
 @pytest.mark.asyncio
 async def test_exception_recorded_as_error():
-    probe = HttpProbe(name="stripe")
+    probe = SMTPProbe(name="sendgrid")
 
     @probe.watch
-    async def call():
-        raise ConnectionError("timeout")
+    async def send():
+        raise ConnectionError("auth failed")
 
     with pytest.raises(ConnectionError):
-        await call()
+        await send()
 
     result = await probe.check()
     assert result.details["call_count"] == 1
@@ -47,15 +47,15 @@ async def test_exception_recorded_as_error():
 
 @pytest.mark.asyncio
 async def test_error_rate_triggers_unhealthy():
-    probe = HttpProbe(name="stripe", max_error_rate=0.1)
+    probe = SMTPProbe(name="sendgrid", max_error_rate=0.1)
 
     @probe.watch
     async def fail():
-        raise RuntimeError("500")
+        raise RuntimeError("smtp error")
 
     @probe.watch
     async def succeed():
-        return "ok"
+        return None
 
     for _ in range(9):
         with pytest.raises(RuntimeError):
@@ -69,7 +69,7 @@ async def test_error_rate_triggers_unhealthy():
 
 @pytest.mark.asyncio
 async def test_consecutive_errors_reset_on_success():
-    probe = HttpProbe(name="stripe")
+    probe = SMTPProbe(name="sendgrid")
 
     @probe.watch
     async def fail():
@@ -77,7 +77,7 @@ async def test_consecutive_errors_reset_on_success():
 
     @probe.watch
     async def succeed():
-        return "ok"
+        return None
 
     for _ in range(3):
         with pytest.raises(RuntimeError):
@@ -90,67 +90,66 @@ async def test_consecutive_errors_reset_on_success():
 
 @pytest.mark.asyncio
 async def test_latency_recorded():
-    probe = HttpProbe(name="stripe")
+    probe = SMTPProbe(name="sendgrid")
 
     @probe.watch
-    async def call():
-        return "ok"
+    async def send():
+        return None
 
-    await call()
+    await send()
     result = await probe.check()
     assert result.details["last_rtt_ms"] is not None
     assert result.details["avg_rtt_ms"] is not None
 
 
 @pytest.mark.asyncio
-async def test_avg_rtt_triggers_unhealthy():
-    probe = HttpProbe(name="stripe", max_avg_rtt_ms=1.0)
-
-    import asyncio
-
-    @probe.watch
-    async def slow_call():
-        await asyncio.sleep(0.05)
-        return "ok"
-
-    await slow_call()
-    result = await probe.check()
-    assert result.status == ProbeStatus.UNHEALTHY
-    assert "avg RTT" in result.error
-
-
-@pytest.mark.asyncio
 async def test_sync_function_instrumented():
-    probe = HttpProbe(name="external")
+    probe = SMTPProbe(name="sendgrid")
 
     @probe.watch
-    def call():
-        return "ok"
+    def send():
+        return None
 
-    call()
+    send()
     result = await probe.check()
     assert result.details["call_count"] == 1
 
 
 @pytest.mark.asyncio
 async def test_exceptions_still_propagate():
-    probe = HttpProbe(name="stripe")
+    probe = SMTPProbe(name="sendgrid")
 
     @probe.watch
-    async def call():
-        raise ValueError("bad response")
+    async def send():
+        raise ValueError("bad credentials")
 
-    with pytest.raises(ValueError, match="bad response"):
-        await call()
+    with pytest.raises(ValueError, match="bad credentials"):
+        await send()
 
 
 @pytest.mark.asyncio
 async def test_return_value_preserved():
-    probe = HttpProbe(name="stripe")
+    probe = SMTPProbe(name="sendgrid")
 
     @probe.watch
-    async def call():
-        return {"id": "ch_123", "status": "succeeded"}
+    async def send():
+        return {"message_id": "abc123"}
 
-    result = await call()
-    assert result == {"id": "ch_123", "status": "succeeded"}
+    result = await send()
+    assert result == {"message_id": "abc123"}
+
+
+@pytest.mark.asyncio
+async def test_avg_rtt_triggers_unhealthy():
+    probe = SMTPProbe(name="sendgrid", max_avg_rtt_ms=1.0)
+
+    import asyncio
+
+    @probe.watch
+    async def slow_send():
+        await asyncio.sleep(0.05)
+
+    await slow_send()
+    result = await probe.check()
+    assert result.status == ProbeStatus.UNHEALTHY
+    assert "avg RTT" in result.error
