@@ -1,12 +1,12 @@
-"""Tests for MySQLProbe passive observation via watch decorator."""
+"""Tests for SqlAlchemyProbe passive observation via watch decorator."""
 import pytest
 from fastapi_watch.models import ProbeStatus
-from fastapi_watch.probes.mysql import MySQLProbe
+from fastapi_watch.probes.sqlalchemy import SqlAlchemyProbe
 
 
 @pytest.mark.asyncio
 async def test_no_calls_returns_healthy():
-    probe = MySQLProbe(name="primary-db")
+    probe = SqlAlchemyProbe(name="postgres")
     result = await probe.check()
     assert result.status == ProbeStatus.HEALTHY
     assert result.details["message"] == "no calls observed yet"
@@ -14,13 +14,13 @@ async def test_no_calls_returns_healthy():
 
 @pytest.mark.asyncio
 async def test_successful_call_recorded():
-    probe = MySQLProbe(name="primary-db")
+    probe = SqlAlchemyProbe(name="postgres")
 
     @probe.watch
-    async def get_product(pid: int):
-        return {"id": pid, "name": "widget"}
+    async def get_user(uid: int):
+        return {"id": uid}
 
-    await get_product(1)
+    await get_user(1)
     result = await probe.check()
     assert result.status == ProbeStatus.HEALTHY
     assert result.details["call_count"] == 1
@@ -29,11 +29,11 @@ async def test_successful_call_recorded():
 
 @pytest.mark.asyncio
 async def test_exception_recorded_as_error():
-    probe = MySQLProbe()
+    probe = SqlAlchemyProbe()
 
     @probe.watch
     async def query():
-        raise Exception("host unreachable")
+        raise Exception("connection pool exhausted")
 
     with pytest.raises(Exception):
         await query()
@@ -45,7 +45,7 @@ async def test_exception_recorded_as_error():
 
 @pytest.mark.asyncio
 async def test_error_rate_triggers_unhealthy():
-    probe = MySQLProbe(max_error_rate=0.1)
+    probe = SqlAlchemyProbe(max_error_rate=0.1)
 
     @probe.watch
     async def fail():
@@ -66,7 +66,7 @@ async def test_error_rate_triggers_unhealthy():
 
 @pytest.mark.asyncio
 async def test_consecutive_errors_reset_on_success():
-    probe = MySQLProbe()
+    probe = SqlAlchemyProbe()
 
     @probe.watch
     async def fail():
@@ -86,26 +86,26 @@ async def test_consecutive_errors_reset_on_success():
 
 @pytest.mark.asyncio
 async def test_return_value_preserved():
-    probe = MySQLProbe()
+    probe = SqlAlchemyProbe()
 
     @probe.watch
     async def query():
-        return [{"id": 1}, {"id": 2}]
+        return [1, 2, 3]
 
-    assert await query() == [{"id": 1}, {"id": 2}]
+    assert await query() == [1, 2, 3]
 
 
 @pytest.mark.asyncio
 async def test_exceptions_propagate():
-    probe = MySQLProbe()
+    probe = SqlAlchemyProbe()
 
     @probe.watch
     async def query():
-        raise RuntimeError("access denied")
+        raise RuntimeError("deadlock detected")
 
-    with pytest.raises(RuntimeError, match="access denied"):
+    with pytest.raises(RuntimeError, match="deadlock detected"):
         await query()
 
 
 def test_default_name():
-    assert MySQLProbe().name == "mysql"
+    assert SqlAlchemyProbe().name == "database"
