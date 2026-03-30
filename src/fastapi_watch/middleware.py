@@ -33,9 +33,10 @@ class _RouteStats:
         "_rtt_window",
         "_request_timestamps",
         "_ema_alpha",
+        "_min_error_status",
     )
 
-    def __init__(self, window_size: int, ema_alpha: float) -> None:
+    def __init__(self, window_size: int, ema_alpha: float, min_error_status: int = 500) -> None:
         self._lock = threading.Lock()
         self._request_count: int = 0
         self._error_count: int = 0
@@ -44,12 +45,13 @@ class _RouteStats:
         self._rtt_window: deque[float] = deque(maxlen=window_size)
         self._request_timestamps: deque[float] = deque(maxlen=window_size)
         self._ema_alpha = ema_alpha
+        self._min_error_status = min_error_status
 
     def record(self, status_code: int, rtt_ms: float) -> None:
         with self._lock:
             self._request_count += 1
             self._request_timestamps.append(time.monotonic())
-            is_error = status_code >= 400
+            is_error = status_code >= self._min_error_status
             if is_error:
                 self._error_count += 1
                 self._consecutive_errors += 1
@@ -102,6 +104,9 @@ class RequestMetricsMiddleware(BaseHTTPMiddleware):
             requests-per-minute calculations (default ``200``).
         ema_alpha: Smoothing factor for the exponential moving average RTT
             (default ``0.1``; higher = reacts faster to changes).
+        min_error_status: HTTP status codes at or above this value are counted
+            as errors (default ``500``).  4xx client errors such as 404 are not
+            counted as errors by default; set to ``400`` to include them.
 
     Example::
 
@@ -124,19 +129,21 @@ class RequestMetricsMiddleware(BaseHTTPMiddleware):
         per_route: bool = True,
         window_size: int = 200,
         ema_alpha: float = 0.1,
+        min_error_status: int = 500,
     ) -> None:
         super().__init__(app)
         self.per_route = per_route
         self._window_size = window_size
         self._ema_alpha = ema_alpha
-        self._aggregate = _RouteStats(window_size, ema_alpha)
+        self._min_error_status = min_error_status
+        self._aggregate = _RouteStats(window_size, ema_alpha, min_error_status)
         self._routes: dict[str, _RouteStats] = {}
         self._routes_lock = threading.Lock()
 
     def _get_or_create(self, path: str) -> _RouteStats:
         with self._routes_lock:
             if path not in self._routes:
-                self._routes[path] = _RouteStats(self._window_size, self._ema_alpha)
+                self._routes[path] = _RouteStats(self._window_size, self._ema_alpha, self._min_error_status)
             return self._routes[path]
 
     async def dispatch(self, request: Request, call_next) -> Response:

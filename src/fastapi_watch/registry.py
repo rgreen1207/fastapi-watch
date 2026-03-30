@@ -2,12 +2,18 @@ import asyncio
 import base64
 import logging
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import AsyncGenerator, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel
+
+
+class _MaintenanceRequest(BaseModel):
+    minutes: float | None = None
+    until: datetime | None = None
 
 from .alerts import BaseAlerter, WebhookAlerter
 from .dashboard import render_dashboard
@@ -100,14 +106,17 @@ class HealthRegistry:
 
     Mounted routes (all customisable via *prefix*):
 
-    - ``GET /health/live``          — liveness; always 200
-    - ``GET /health/ready``         — readiness; 200 if all critical probes pass, 503 otherwise
-    - ``GET /health/status``        — full probe detail; 200 / 207 (Multi-Status)
-    - ``GET /health/history``       — rolling probe result history
-    - ``GET /health/startup``       — startup check; 503 until :meth:`set_started` is called
-    - ``GET /health/dashboard``     — HTML dashboard with live SSE (Server-Sent Events) updates
-    - ``GET /health/ready/stream``  — SSE (Server-Sent Events) stream of readiness
-    - ``GET /health/status/stream`` — SSE (Server-Sent Events) stream of full probe detail
+    - ``GET    /health/live``          — liveness; always 200
+    - ``GET    /health/ready``         — readiness; 200 if all critical probes pass, 503 otherwise
+    - ``GET    /health/status``        — full probe detail; 200 / 207 (Multi-Status)
+    - ``GET    /health/history``       — rolling probe result history
+    - ``GET    /health/startup``       — startup check; 503 until :meth:`set_started` is called
+    - ``GET    /health/dashboard``     — HTML dashboard with live SSE (Server-Sent Events) updates
+    - ``GET    /health/ready/stream``  — SSE (Server-Sent Events) stream of readiness
+    - ``GET    /health/status/stream`` — SSE (Server-Sent Events) stream of full probe detail
+    - ``GET    /health/maintenance``   — current maintenance mode status
+    - ``POST   /health/maintenance``   — enable maintenance mode (optional body: ``minutes`` or ``until``)
+    - ``DELETE /health/maintenance``   — disable maintenance mode
 
     Args:
         app: FastAPI application.
@@ -220,6 +229,7 @@ class HealthRegistry:
         self._circuit_trips: dict[str, int] = {}  # lifetime trip count per probe
 
         # Maintenance mode
+        self._maintenance_active: bool = False
         self._maintenance_until: datetime | None = None
 
         # Alerters — webhook_url kept for backwards compat, wraps into WebhookAlerter
@@ -293,19 +303,28 @@ class HealthRegistry:
 
         Returns ``self`` for chaining.
         """
+        self._maintenance_active = True
         self._maintenance_until = until
         return self
 
     def clear_maintenance(self) -> "HealthRegistry":
         """Exit maintenance mode immediately. Returns ``self`` for chaining."""
+        self._maintenance_active = False
         self._maintenance_until = None
         return self
 
     def _in_maintenance(self) -> bool:
         """Return True if the registry is currently in maintenance mode."""
-        if self._maintenance_until is None:
+        if not self._maintenance_active:
             return False
-        return datetime.now(self._tzinfo) < self._maintenance_until
+        if self._maintenance_until is None:
+            return True  # indefinite
+        if datetime.now(self._tzinfo) < self._maintenance_until:
+            return True
+        # Window has elapsed — auto-clear
+        self._maintenance_active = False
+        self._maintenance_until = None
+        return False
 
     def on_state_change(
         self,
@@ -475,13 +494,16 @@ class HealthRegistry:
     async def _get_results(self) -> list[ProbeResult]:
         """Return current probe results.
 
-        Single-fetch probes always run fresh.  Polled probes are served from
-        the cache; uncached or expired probes run once to warm it.
+        Single-fetch probes always run fresh.  Polled probes run when their
+        interval has elapsed or their result is absent from cache.
         """
         cached = await self._storage.get_all_latest()
+        now = asyncio.get_running_loop().time()
         to_run = [
             (p, c) for p, c in self._probes
-            if self._effective_interval_s(p) is None or p.name not in cached
+            if self._effective_interval_s(p) is None
+            or p.name not in cached
+            or (p.name in self._probe_last_run and self._is_probe_due(p, now))
         ]
         if to_run:
             await self._execute_probes(to_run)
@@ -568,12 +590,7 @@ class HealthRegistry:
         await self._on_connect()
         try:
             while True:
-                _cached = await self._storage.get_all_latest()
-                results = (
-                    list(_cached.values())
-                    if _cached
-                    else await self._execute_probes(self._probes)
-                )
+                results = await self._get_results()
                 yield f"data: {make_report(results)}\n\n"
                 if self._poll_interval_ms is None:
                     return
@@ -805,6 +822,56 @@ class HealthRegistry:
                 content=render_prometheus(results, trips),
                 media_type="text/plain; version=0.0.4; charset=utf-8",
             )
+
+        @self.app.get(
+            f"{prefix}/maintenance",
+            tags=tags,
+            summary="Maintenance mode status",
+            description="Returns whether maintenance mode is currently active and when it expires.",
+            dependencies=auth_deps,
+        )
+        async def maintenance_status() -> Response:
+            active = registry._in_maintenance()
+            until = registry._maintenance_until
+            return JSONResponse({
+                "active": active,
+                "until": until.isoformat() if until is not None else None,
+            })
+
+        @self.app.post(
+            f"{prefix}/maintenance",
+            tags=tags,
+            summary="Enable maintenance mode",
+            description=(
+                "Enables maintenance mode. Optional body: ``{\"minutes\": N}`` or "
+                "``{\"until\": \"<ISO datetime>\"}``."
+                " Omit body (or send ``{}``) for indefinite maintenance."
+            ),
+            dependencies=auth_deps,
+        )
+        async def enable_maintenance(body: _MaintenanceRequest = Body(default=_MaintenanceRequest())) -> Response:
+            if body.until is not None:
+                until = body.until
+            elif body.minutes is not None:
+                until = datetime.now(registry._tzinfo) + timedelta(minutes=body.minutes)
+            else:
+                until = None
+            registry.set_maintenance(until=until)
+            return JSONResponse({
+                "active": True,
+                "until": registry._maintenance_until.isoformat() if registry._maintenance_until else None,
+            })
+
+        @self.app.delete(
+            f"{prefix}/maintenance",
+            tags=tags,
+            summary="Disable maintenance mode",
+            description="Clears maintenance mode immediately.",
+            dependencies=auth_deps,
+        )
+        async def disable_maintenance() -> Response:
+            registry.clear_maintenance()
+            return JSONResponse({"active": False, "until": None})
 
         if dashboard is not False:
             if callable(dashboard):

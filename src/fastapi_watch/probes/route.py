@@ -54,6 +54,9 @@ class FastAPIRouteProbe(BaseProbe):
         ema_alpha: Smoothing factor for the exponential moving average (0–1).
             Higher values make the average react faster to changes.
         timeout: Passed to the registry; not used internally.
+        min_error_status: HTTP status codes at or above this value are counted
+            as errors (default ``500``).  4xx client errors such as 404 are not
+            counted as errors by default; set to ``400`` to include them.
     """
 
     def __init__(
@@ -66,6 +69,7 @@ class FastAPIRouteProbe(BaseProbe):
         ema_alpha: float = 0.1,
         timeout: float | None = None,
         poll_interval_ms: int | None = None,
+        min_error_status: int = 500,
     ) -> None:
         self.name = name
         self.timeout = timeout
@@ -73,6 +77,7 @@ class FastAPIRouteProbe(BaseProbe):
         self.max_error_rate = max_error_rate
         self.max_avg_rtt_ms = max_avg_rtt_ms
         self.ema_alpha = ema_alpha
+        self.min_error_status = min_error_status
 
         self._label: str | None = None
         self._lock = threading.Lock()
@@ -98,7 +103,7 @@ class FastAPIRouteProbe(BaseProbe):
             self._last_rtt_ms = rtt_ms
             self._request_timestamps.append(datetime.now(timezone.utc).timestamp())
 
-            is_error = status_code >= 400
+            is_error = status_code >= self.min_error_status
             if is_error:
                 self._error_count += 1
                 self._consecutive_errors += 1
