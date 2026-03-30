@@ -4,19 +4,22 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fastapi-watch"
-version = "1.1.0"
+version = "1.2.0"
 description = "Structured health and readiness check system for FastAPI"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 keywords = ["fastapi", "health", "readiness", "probes", "kubernetes", "liveness"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Framework :: FastAPI",
 ]
 dependencies = [

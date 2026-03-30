@@ -1,82 +1,111 @@
-"""Tests for PostgreSQLProbe — mocked so no real Postgres needed."""
+"""Tests for PostgreSQLProbe passive observation via watch decorator."""
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
 from fastapi_watch.models import ProbeStatus
-
-try:
-    import asyncpg
-    HAS_ASYNCPG = True
-except ImportError:
-    HAS_ASYNCPG = False
-
-pytestmark = pytest.mark.skipif(not HAS_ASYNCPG, reason="asyncpg not installed")
-
-
-def _make_mock_conn(fetchval_results=None, fetchval_exc=None):
-    conn = AsyncMock()
-    if fetchval_exc:
-        conn.fetchval = AsyncMock(side_effect=fetchval_exc)
-    else:
-        # The probe runs 4 fetchval calls concurrently via asyncio.gather
-        results = fetchval_results or ["PostgreSQL 16.2", 5, 100, "42 MB"]
-        conn.fetchval = AsyncMock(side_effect=results)
-    conn.close = AsyncMock()
-    return conn
+from fastapi_watch.probes.postgresql import PostgreSQLProbe
 
 
 @pytest.mark.asyncio
-async def test_postgresql_probe_healthy():
-    from fastapi_watch.probes.postgresql import PostgreSQLProbe
-    mock_conn = _make_mock_conn()
-    with patch("asyncpg.connect", AsyncMock(return_value=mock_conn)):
-        probe = PostgreSQLProbe(url="postgresql://user:pass@localhost/db")
-        result = await probe.check()
+async def test_no_calls_returns_healthy():
+    probe = PostgreSQLProbe(name="primary-db")
+    result = await probe.check()
     assert result.status == ProbeStatus.HEALTHY
-    assert result.name == "postgresql"
-    mock_conn.close.assert_called_once()
+    assert result.details["message"] == "no calls observed yet"
 
 
 @pytest.mark.asyncio
-async def test_postgresql_probe_unhealthy_on_connect_error():
-    from fastapi_watch.probes.postgresql import PostgreSQLProbe
-    with patch("asyncpg.connect", AsyncMock(side_effect=Exception("connection refused"))):
-        probe = PostgreSQLProbe(url="postgresql://user:pass@localhost/db")
-        result = await probe.check()
-    assert result.status == ProbeStatus.UNHEALTHY
-    assert "connection refused" in result.error
+async def test_successful_call_recorded():
+    probe = PostgreSQLProbe(name="primary-db")
 
+    @probe.watch
+    async def get_user(uid: int):
+        return {"id": uid, "email": "test@example.com"}
 
-@pytest.mark.asyncio
-async def test_postgresql_probe_unhealthy_on_query_error():
-    from fastapi_watch.probes.postgresql import PostgreSQLProbe
-    mock_conn = _make_mock_conn(fetchval_exc=Exception("auth failed"))
-    with patch("asyncpg.connect", AsyncMock(return_value=mock_conn)):
-        probe = PostgreSQLProbe(url="postgresql://user:pass@localhost/db")
-        result = await probe.check()
-    assert result.status == ProbeStatus.UNHEALTHY
-    assert "auth failed" in result.error
-    mock_conn.close.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_postgresql_probe_custom_name():
-    from fastapi_watch.probes.postgresql import PostgreSQLProbe
-    mock_conn = _make_mock_conn()
-    with patch("asyncpg.connect", AsyncMock(return_value=mock_conn)):
-        probe = PostgreSQLProbe(url="postgresql://localhost/db", name="primary-db")
-        result = await probe.check()
-    assert result.name == "primary-db"
-
-
-@pytest.mark.asyncio
-async def test_postgresql_probe_returns_details():
-    from fastapi_watch.probes.postgresql import PostgreSQLProbe
-    mock_conn = _make_mock_conn(fetchval_results=["PostgreSQL 16.2", 5, 100, "42 MB"])
-    with patch("asyncpg.connect", AsyncMock(return_value=mock_conn)):
-        probe = PostgreSQLProbe(url="postgresql://localhost/db")
-        result = await probe.check()
+    await get_user(1)
+    result = await probe.check()
     assert result.status == ProbeStatus.HEALTHY
-    assert result.details["version"] == "PostgreSQL 16.2"
-    assert result.details["active_connections"] == 5
-    assert result.details["max_connections"] == 100
-    assert result.details["database_size"] == "42 MB"
+    assert result.details["call_count"] == 1
+    assert result.details["error_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_exception_recorded_as_error():
+    probe = PostgreSQLProbe()
+
+    @probe.watch
+    async def query():
+        raise Exception("connection refused")
+
+    with pytest.raises(Exception):
+        await query()
+
+    result = await probe.check()
+    assert result.details["error_count"] == 1
+    assert result.details["consecutive_errors"] == 1
+
+
+@pytest.mark.asyncio
+async def test_error_rate_triggers_unhealthy():
+    probe = PostgreSQLProbe(max_error_rate=0.1)
+
+    @probe.watch
+    async def fail():
+        raise RuntimeError()
+
+    @probe.watch
+    async def succeed():
+        return "ok"
+
+    for _ in range(9):
+        with pytest.raises(RuntimeError):
+            await fail()
+    await succeed()
+
+    result = await probe.check()
+    assert result.status == ProbeStatus.UNHEALTHY
+
+
+@pytest.mark.asyncio
+async def test_consecutive_errors_reset_on_success():
+    probe = PostgreSQLProbe()
+
+    @probe.watch
+    async def fail():
+        raise RuntimeError()
+
+    @probe.watch
+    async def succeed():
+        return "ok"
+
+    for _ in range(3):
+        with pytest.raises(RuntimeError):
+            await fail()
+    assert probe._consecutive_errors == 3
+    await succeed()
+    assert probe._consecutive_errors == 0
+
+
+@pytest.mark.asyncio
+async def test_return_value_preserved():
+    probe = PostgreSQLProbe()
+
+    @probe.watch
+    async def query():
+        return {"id": 1}
+
+    assert await query() == {"id": 1}
+
+
+@pytest.mark.asyncio
+async def test_exceptions_propagate():
+    probe = PostgreSQLProbe()
+
+    @probe.watch
+    async def query():
+        raise ValueError("auth failed")
+
+    with pytest.raises(ValueError, match="auth failed"):
+        await query()
+
+
+def test_default_name():
+    assert PostgreSQLProbe().name == "postgresql"

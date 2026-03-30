@@ -1,77 +1,156 @@
-"""Tests for HttpProbe using aiohttp mock."""
+"""Tests for HttpProbe passive observation via watch decorator."""
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi_watch.models import ProbeStatus
-
-try:
-    import aiohttp
-    HAS_AIOHTTP = True
-except ImportError:
-    HAS_AIOHTTP = False
-
-pytestmark = pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
-
-
-def _make_mock_session(status: int):
-    mock_response = AsyncMock()
-    mock_response.status = status
-    mock_response.__aenter__ = AsyncMock(return_value=mock_response)
-    mock_response.__aexit__ = AsyncMock(return_value=False)
-
-    mock_session = AsyncMock()
-    mock_session.get = MagicMock(return_value=mock_response)
-    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session.__aexit__ = AsyncMock(return_value=False)
-    return mock_session
+from fastapi_watch.probes.http import HttpProbe
 
 
 @pytest.mark.asyncio
-async def test_http_probe_healthy_response():
-    from fastapi_watch.probes.http import HttpProbe
-    with patch("aiohttp.ClientSession", return_value=_make_mock_session(200)):
-        probe = HttpProbe(url="http://example.com/health", name="upstream")
-        result = await probe.check()
+async def test_no_calls_returns_healthy():
+    probe = HttpProbe(name="stripe")
+    result = await probe.check()
     assert result.status == ProbeStatus.HEALTHY
-    assert result.name == "upstream"
+    assert result.details["message"] == "no calls observed yet"
 
 
 @pytest.mark.asyncio
-async def test_http_probe_unhealthy_on_bad_status():
-    from fastapi_watch.probes.http import HttpProbe
-    with patch("aiohttp.ClientSession", return_value=_make_mock_session(503)):
-        probe = HttpProbe(url="http://example.com/health", name="upstream")
-        result = await probe.check()
-    assert result.status == ProbeStatus.UNHEALTHY
-    assert "503" in result.error
+async def test_successful_call_recorded():
+    probe = HttpProbe(name="stripe")
 
+    @probe.watch
+    async def call():
+        return {"id": "ch_123"}
 
-@pytest.mark.asyncio
-async def test_http_probe_unhealthy_on_exception():
-    from fastapi_watch.probes.http import HttpProbe
-
-    mock_session = AsyncMock()
-    mock_session.get = MagicMock(side_effect=Exception("connection refused"))
-    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session.__aexit__ = AsyncMock(return_value=False)
-
-    with patch("aiohttp.ClientSession", return_value=mock_session):
-        probe = HttpProbe(url="http://example.com/health", name="upstream")
-        result = await probe.check()
-    assert result.status == ProbeStatus.UNHEALTHY
-    assert "connection refused" in result.error
-
-
-@pytest.mark.asyncio
-async def test_http_probe_name_defaults_to_host():
-    from fastapi_watch.probes.http import HttpProbe
-    probe = HttpProbe(url="http://api.example.com/health")
-    assert probe.name == "api.example.com"
-
-
-@pytest.mark.asyncio
-async def test_http_probe_custom_expected_status():
-    from fastapi_watch.probes.http import HttpProbe
-    with patch("aiohttp.ClientSession", return_value=_make_mock_session(204)):
-        probe = HttpProbe(url="http://example.com/health", expected_status=204)
-        result = await probe.check()
+    await call()
+    result = await probe.check()
     assert result.status == ProbeStatus.HEALTHY
+    assert result.details["call_count"] == 1
+    assert result.details["error_count"] == 0
+    assert result.details["error_rate"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_exception_recorded_as_error():
+    probe = HttpProbe(name="stripe")
+
+    @probe.watch
+    async def call():
+        raise ConnectionError("timeout")
+
+    with pytest.raises(ConnectionError):
+        await call()
+
+    result = await probe.check()
+    assert result.details["call_count"] == 1
+    assert result.details["error_count"] == 1
+    assert result.details["consecutive_errors"] == 1
+
+
+@pytest.mark.asyncio
+async def test_error_rate_triggers_unhealthy():
+    probe = HttpProbe(name="stripe", max_error_rate=0.1)
+
+    @probe.watch
+    async def fail():
+        raise RuntimeError("500")
+
+    @probe.watch
+    async def succeed():
+        return "ok"
+
+    for _ in range(9):
+        with pytest.raises(RuntimeError):
+            await fail()
+    await succeed()
+
+    result = await probe.check()
+    assert result.status == ProbeStatus.UNHEALTHY
+    assert "error rate" in result.error
+
+
+@pytest.mark.asyncio
+async def test_consecutive_errors_reset_on_success():
+    probe = HttpProbe(name="stripe")
+
+    @probe.watch
+    async def fail():
+        raise RuntimeError()
+
+    @probe.watch
+    async def succeed():
+        return "ok"
+
+    for _ in range(3):
+        with pytest.raises(RuntimeError):
+            await fail()
+
+    assert probe._consecutive_errors == 3
+    await succeed()
+    assert probe._consecutive_errors == 0
+
+
+@pytest.mark.asyncio
+async def test_latency_recorded():
+    probe = HttpProbe(name="stripe")
+
+    @probe.watch
+    async def call():
+        return "ok"
+
+    await call()
+    result = await probe.check()
+    assert result.details["last_rtt_ms"] is not None
+    assert result.details["avg_rtt_ms"] is not None
+
+
+@pytest.mark.asyncio
+async def test_avg_rtt_triggers_unhealthy():
+    probe = HttpProbe(name="stripe", max_avg_rtt_ms=1.0)
+
+    import asyncio
+
+    @probe.watch
+    async def slow_call():
+        await asyncio.sleep(0.05)
+        return "ok"
+
+    await slow_call()
+    result = await probe.check()
+    assert result.status == ProbeStatus.UNHEALTHY
+    assert "avg RTT" in result.error
+
+
+@pytest.mark.asyncio
+async def test_sync_function_instrumented():
+    probe = HttpProbe(name="external")
+
+    @probe.watch
+    def call():
+        return "ok"
+
+    call()
+    result = await probe.check()
+    assert result.details["call_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_exceptions_still_propagate():
+    probe = HttpProbe(name="stripe")
+
+    @probe.watch
+    async def call():
+        raise ValueError("bad response")
+
+    with pytest.raises(ValueError, match="bad response"):
+        await call()
+
+
+@pytest.mark.asyncio
+async def test_return_value_preserved():
+    probe = HttpProbe(name="stripe")
+
+    @probe.watch
+    async def call():
+        return {"id": "ch_123", "status": "succeeded"}
+
+    result = await call()
+    assert result == {"id": "ch_123", "status": "succeeded"}

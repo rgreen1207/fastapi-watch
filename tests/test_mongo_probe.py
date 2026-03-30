@@ -1,12 +1,12 @@
-"""Tests for MySQLProbe passive observation via watch decorator."""
+"""Tests for MongoProbe passive observation via watch decorator."""
 import pytest
 from fastapi_watch.models import ProbeStatus
-from fastapi_watch.probes.mysql import MySQLProbe
+from fastapi_watch.probes.mongo import MongoProbe
 
 
 @pytest.mark.asyncio
 async def test_no_calls_returns_healthy():
-    probe = MySQLProbe(name="primary-db")
+    probe = MongoProbe(name="mongodb")
     result = await probe.check()
     assert result.status == ProbeStatus.HEALTHY
     assert result.details["message"] == "no calls observed yet"
@@ -14,13 +14,13 @@ async def test_no_calls_returns_healthy():
 
 @pytest.mark.asyncio
 async def test_successful_call_recorded():
-    probe = MySQLProbe(name="primary-db")
+    probe = MongoProbe(name="mongodb")
 
     @probe.watch
-    async def get_product(pid: int):
-        return {"id": pid, "name": "widget"}
+    async def get_doc(doc_id: str):
+        return {"_id": doc_id, "value": 42}
 
-    await get_product(1)
+    await get_doc("abc")
     result = await probe.check()
     assert result.status == ProbeStatus.HEALTHY
     assert result.details["call_count"] == 1
@@ -29,11 +29,11 @@ async def test_successful_call_recorded():
 
 @pytest.mark.asyncio
 async def test_exception_recorded_as_error():
-    probe = MySQLProbe()
+    probe = MongoProbe()
 
     @probe.watch
     async def query():
-        raise Exception("host unreachable")
+        raise Exception("server selection timeout")
 
     with pytest.raises(Exception):
         await query()
@@ -45,7 +45,7 @@ async def test_exception_recorded_as_error():
 
 @pytest.mark.asyncio
 async def test_error_rate_triggers_unhealthy():
-    probe = MySQLProbe(max_error_rate=0.1)
+    probe = MongoProbe(max_error_rate=0.1)
 
     @probe.watch
     async def fail():
@@ -66,7 +66,7 @@ async def test_error_rate_triggers_unhealthy():
 
 @pytest.mark.asyncio
 async def test_consecutive_errors_reset_on_success():
-    probe = MySQLProbe()
+    probe = MongoProbe()
 
     @probe.watch
     async def fail():
@@ -86,26 +86,26 @@ async def test_consecutive_errors_reset_on_success():
 
 @pytest.mark.asyncio
 async def test_return_value_preserved():
-    probe = MySQLProbe()
+    probe = MongoProbe()
 
     @probe.watch
     async def query():
-        return [{"id": 1}, {"id": 2}]
+        return {"_id": "abc", "status": "ok"}
 
-    assert await query() == [{"id": 1}, {"id": 2}]
+    assert await query() == {"_id": "abc", "status": "ok"}
 
 
 @pytest.mark.asyncio
 async def test_exceptions_propagate():
-    probe = MySQLProbe()
+    probe = MongoProbe()
 
     @probe.watch
     async def query():
-        raise RuntimeError("access denied")
+        raise RuntimeError("write conflict")
 
-    with pytest.raises(RuntimeError, match="access denied"):
+    with pytest.raises(RuntimeError, match="write conflict"):
         await query()
 
 
 def test_default_name():
-    assert MySQLProbe().name == "mysql"
+    assert MongoProbe().name == "mongodb"

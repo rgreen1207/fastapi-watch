@@ -1,3 +1,4 @@
+import asyncio
 import time
 
 from ..models import ProbeResult, ProbeStatus
@@ -7,8 +8,8 @@ from .base import BaseProbe
 class KafkaProbe(BaseProbe):
     """Health probe for Apache Kafka using aiokafka.
 
-    Returns the number of brokers in the cluster and a list of topic names.
-    No topics are created or consumed.
+    Actively connects an admin client on each poll, lists topics, and
+    describes the cluster. No topics are created or consumed.
 
     Install with: ``pip install fastapi-watch[kafka]``
 
@@ -18,6 +19,17 @@ class KafkaProbe(BaseProbe):
         name: Probe name shown in health reports.
         request_timeout_ms: Timeout for the admin client metadata request
             in milliseconds (default 5000).
+
+    Example::
+
+        registry.add(KafkaProbe("broker1:9092,broker2:9092", name="kafka"))
+
+        # Multiple brokers as a list
+        registry.add(KafkaProbe(
+            bootstrap_servers=["b1:9092", "b2:9092"],
+            name="kafka",
+            request_timeout_ms=3000,
+        ))
     """
 
     def __init__(
@@ -25,12 +37,14 @@ class KafkaProbe(BaseProbe):
         bootstrap_servers: str | list[str] = "localhost:9092",
         name: str = "kafka",
         request_timeout_ms: int = 5000,
+        poll_interval_ms: int | None = None,
     ) -> None:
         if isinstance(bootstrap_servers, list):
             self.bootstrap_servers = ",".join(bootstrap_servers)
         else:
             self.bootstrap_servers = bootstrap_servers
         self.name = name
+        self.poll_interval_ms = poll_interval_ms
         self._timeout_ms = request_timeout_ms
 
     async def check(self) -> ProbeResult:
@@ -52,16 +66,14 @@ class KafkaProbe(BaseProbe):
 
             details: dict = {}
             try:
-                topics = await client.list_topics()
-                cluster = await client.describe_cluster()
+                topics, cluster = await asyncio.gather(
+                    client.list_topics(),
+                    client.describe_cluster(),
+                )
                 details["broker_count"] = len(cluster.brokers)
                 details["controller_id"] = cluster.controller_id
-                details["topics"] = sorted(
-                    t for t in topics if not t.startswith("__")
-                )
-                details["internal_topics"] = sorted(
-                    t for t in topics if t.startswith("__")
-                )
+                details["topics"] = sorted(t for t in topics if not t.startswith("__"))
+                details["internal_topics"] = sorted(t for t in topics if t.startswith("__"))
             except Exception:
                 pass  # details are best-effort
 
@@ -83,6 +95,6 @@ class KafkaProbe(BaseProbe):
         finally:
             if client is not None:
                 try:
-                    await client.close()
+                    await asyncio.wait_for(client.close(), timeout=5.0)
                 except Exception:
                     pass
