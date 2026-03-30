@@ -1847,37 +1847,37 @@ The default probe name is `"tcp:{host}:{port}"`.
 
 ### SMTP
 
-`SMTPProbe` connects to an SMTP server, sends `EHLO`, and optionally negotiates STARTTLS and authenticates. The connection is opened and closed on every check — no persistent session is held. Runs in a thread-pool executor. No extra install required — uses only the standard library.
+`SMTPProbe` passively observes outgoing email calls in your code via the `@probe.watch` decorator. Rather than repeatedly authenticating against a third-party mail service on a timer (which risks rate limits and security alerts), it instruments the functions that actually send mail and records latency and errors from real sends only.
 
 ```python
 from fastapi_watch.probes import SMTPProbe
 
-# Connectivity only — EHLO handshake
-registry.add(SMTPProbe(host="smtp.internal", port=25))
+smtp_probe = SMTPProbe(name="sendgrid", max_error_rate=0.05)
 
-# With STARTTLS
-registry.add(SMTPProbe(host="smtp.gmail.com", port=587, use_tls=True))
+@smtp_probe.watch
+async def send_welcome_email(to: str) -> None:
+    async with aiosmtplib.SMTP("smtp.sendgrid.net", port=587) as smtp:
+        await smtp.login("apikey", os.environ["SENDGRID_API_KEY"])
+        await smtp.sendmail(FROM, to, message.as_string())
 
-# With STARTTLS and authentication
-registry.add(SMTPProbe(
-    host="smtp.sendgrid.net",
-    port=587,
-    use_tls=True,
-    username="apikey",
-    password="SG.xxxxx",
-    name="sendgrid",
-))
+registry.add(smtp_probe)
 ```
+
+Every call to `send_welcome_email` is silently timed. Exceptions are counted as errors and re-raised normally. Works with any SMTP library and both `async def` and `def` functions.
 
 **Details returned:**
 
 ```json
 {
-  "host": "smtp.sendgrid.net",
-  "port": 587,
-  "server_banner": "220 smtp.sendgrid.net ESMTP service ready",
-  "tls": true,
-  "extensions": ["STARTTLS", "AUTH LOGIN PLAIN", "SIZE 31457280"]
+  "call_count": 54,
+  "error_count": 1,
+  "error_rate": 0.0185,
+  "consecutive_errors": 0,
+  "last_rtt_ms": 312.4,
+  "avg_rtt_ms": 287.1,
+  "p95_rtt_ms": 498.2,
+  "min_rtt_ms": 201.3,
+  "max_rtt_ms": 612.0
 }
 ```
 
@@ -1885,13 +1885,11 @@ registry.add(SMTPProbe(
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `host` | required | SMTP server hostname |
-| `port` | `25` | SMTP port |
-| `timeout` | `5.0` | Connection + handshake timeout in seconds |
-| `use_tls` | `False` | Upgrade to TLS with STARTTLS after EHLO |
-| `username` | `None` | SMTP auth username. `None` skips authentication |
-| `password` | `None` | SMTP auth password |
 | `name` | `"smtp"` | Probe label |
+| `max_error_rate` | `0.1` | Error-rate threshold above which the probe is UNHEALTHY (0–1) |
+| `max_avg_rtt_ms` | `None` | Average-RTT threshold in milliseconds. `None` disables it |
+| `window_size` | `100` | Number of recent calls used for percentile calculations |
+| `ema_alpha` | `0.1` | Smoothing factor for the exponential moving average (0–1) |
 | `poll_interval_ms` | `None` | Uses registry default |
 
 ---
@@ -2376,22 +2374,35 @@ Works with both `async def` and `def` functions, and any HTTP library.
 pip install "fastapi-watch[celery]"
 ```
 
-`CeleryProbe` uses Celery's [control broadcast API](https://docs.celeryq.dev/en/stable/userguide/monitoring.html#inspection) to inspect every live worker — no extra infrastructure required beyond the broker your app already uses.
+`CeleryProbe` uses Celery's [control broadcast API](https://docs.celeryq.dev/en/stable/userguide/monitoring.html#inspection) to check worker liveness — no extra infrastructure required beyond the broker your app already uses.
 
-Pass your existing Celery application instance directly:
+By default only a single `ping` broadcast is issued per poll, confirming workers are alive without generating additional broker traffic. Set `detailed=True` for full per-worker inspection, which is useful in development and test environments.
 
 ```python
 from celery_app import celery
 from fastapi_watch.probes import CeleryProbe
 
-registry.add(CeleryProbe(celery))
+# Production — ping only (1 broadcast per poll)
+registry.add(CeleryProbe(celery, min_workers=2))
+
+# Development / test — full worker inspection
+registry.add(CeleryProbe(celery, min_workers=1, detailed=True))
 ```
 
-**Details returned (workers online):**
+**Details returned — ping only (default):**
 
 ```json
 {
   "workers_online": 2,
+  "workers": ["celery@host1", "celery@host2"]
+}
+```
+
+**Details returned — `detailed=True`:**
+
+```json
+{
+  "workers_online": 1,
   "workers": {
     "celery@host1": {
       "status": "online",
@@ -2434,21 +2445,6 @@ registry.add(CeleryProbe(celery))
 | `0` (default) | **Healthy** — silently explains workers may be scaled down | N/A |
 | `≥ 1` | **Unhealthy** — error lists how many are expected | **Unhealthy** — error lists count found vs. expected |
 
-Use `min_workers=0` (the default) for deployments that scale Celery workers to zero when there is no work to do. The probe will report healthy and note the reason, rather than raising a false alarm.
-
-Use `min_workers=1` (or higher) when at least that many workers must always be running — for example, a background processor that needs to be ready at all times regardless of queue depth.
-
-```python
-# Workers come and go — zero online is acceptable
-registry.add(CeleryProbe(celery))
-
-# At least one worker must always be online
-registry.add(CeleryProbe(celery, min_workers=1))
-
-# Fleet of workers — alert if fewer than 2 are responding
-registry.add(CeleryProbe(celery, min_workers=2))
-```
-
 **Constructor arguments:**
 
 | Argument | Default | Description |
@@ -2457,6 +2453,7 @@ registry.add(CeleryProbe(celery, min_workers=2))
 | `name` | `"celery"` | Probe label |
 | `timeout` | `1.0` | Seconds to wait for each inspector broadcast reply |
 | `min_workers` | `0` | Minimum number of workers that must be online. `0` means scale-to-zero is acceptable |
+| `detailed` | `False` | Collect full per-worker stats (active/reserved/scheduled tasks, pool, queues). Enable in dev/test only |
 
 ---
 
@@ -2507,7 +2504,7 @@ registry.add(SqlAlchemyProbe(engine=engine, name="primary-db"))
 | `FastAPIWebSocketProbe` | built-in | `name`, `max_error_rate`, `min_active_connections`, `window_size`, `ema_alpha` | `active_connections`, `total_connections`, `messages_received`, `messages_sent`, `error_count`, `error_rate`, `consecutive_errors`, `avg_duration_ms`, `min_duration_ms`, `max_duration_ms` |
 | `EventLoopProbe` | built-in | `name`, `warn_ms`, `fail_ms` | `lag_ms` |
 | `TCPProbe` | built-in | `host`, `port`, `timeout`, `name` | `host`, `port`, `resolved_ips`, `connect_ms` |
-| `SMTPProbe` | built-in | `host`, `port`, `timeout`, `use_tls`, `username`, `password`, `name` | `host`, `port`, `server_banner`, `tls`, `extensions` |
+| `SMTPProbe` | built-in | `name`, `max_error_rate`, `max_avg_rtt_ms`, `window_size`, `ema_alpha` | `call_count`, `error_count`, `error_rate`, `consecutive_errors`, `last_rtt_ms`, `avg_rtt_ms`, `p95_rtt_ms`, `min_rtt_ms`, `max_rtt_ms` |
 | `ThresholdProbe` | built-in | `probe`, `name`, `warn_if`, `fail_if` | (delegates to inner probe) |
 
 #### Databases
@@ -2531,7 +2528,7 @@ registry.add(SqlAlchemyProbe(engine=engine, name="primary-db"))
 |-------|-------|---------------------|----------------|
 | `RabbitMQProbe` | `rabbitmq` | `url`, `name`, `management_url` | `connected`; + `server`, `totals`, `queues` when `management_url` is set |
 | `KafkaProbe` | `kafka` | `bootstrap_servers`, `name`, `request_timeout_ms` | `broker_count`, `controller_id`, `topics`, `internal_topics` |
-| `CeleryProbe` | `celery` | `app`, `name`, `timeout`, `min_workers` | `workers_online`, per-worker `active`, `reserved`, `scheduled`, `registered_tasks`, `pool`, `total_tasks_executed`, `queues` |
+| `CeleryProbe` | `celery` | `app`, `name`, `timeout`, `min_workers`, `detailed` | `workers_online`, `workers` (list when ping-only, dict when `detailed=True`) |
 
 #### Document stores
 

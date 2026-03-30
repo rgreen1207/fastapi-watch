@@ -1,76 +1,155 @@
+"""Tests for SMTPProbe passive observation via watch decorator."""
 import pytest
-from unittest.mock import patch, MagicMock
-from fastapi_watch.probes.smtp import SMTPProbe
 from fastapi_watch.models import ProbeStatus
-
-
-def _make_smtp_mock(banner=b"220 mail.example.com ESMTP", extensions=None):
-    smtp = MagicMock()
-    smtp.__enter__ = MagicMock(return_value=smtp)
-    smtp.__exit__ = MagicMock(return_value=False)
-    smtp.getwelcome = MagicMock(return_value=banner)
-    smtp.ehlo = MagicMock(return_value=(250, b"ok"))
-    smtp.esmtp_features = {k: "" for k in (extensions or ["size", "starttls", "auth"])}
-    return smtp
+from fastapi_watch.probes.smtp import SMTPProbe
 
 
 @pytest.mark.asyncio
-async def test_smtp_healthy_on_successful_connect():
-    with patch("smtplib.SMTP", return_value=_make_smtp_mock()):
-        probe = SMTPProbe("mail.example.com", port=25)
-        result = await probe.check()
-
+async def test_no_sends_returns_healthy():
+    probe = SMTPProbe(name="sendgrid")
+    result = await probe.check()
     assert result.status == ProbeStatus.HEALTHY
-    assert result.details["host"] == "mail.example.com"
-    assert result.details["port"] == 25
-    assert "server_banner" in result.details
-    assert "extensions" in result.details
+    assert result.details["message"] == "no sends observed yet"
 
 
 @pytest.mark.asyncio
-async def test_smtp_extensions_sorted():
-    with patch("smtplib.SMTP", return_value=_make_smtp_mock(extensions=["size", "auth", "8bitmime"])):
-        probe = SMTPProbe("smtp.test", port=587)
-        result = await probe.check()
+async def test_successful_send_recorded():
+    probe = SMTPProbe(name="sendgrid")
 
-    assert result.details["extensions"] == sorted(["size", "auth", "8bitmime"])
+    @probe.watch
+    async def send():
+        return None
+
+    await send()
+    result = await probe.check()
+    assert result.status == ProbeStatus.HEALTHY
+    assert result.details["call_count"] == 1
+    assert result.details["error_count"] == 0
+    assert result.details["error_rate"] == 0.0
 
 
 @pytest.mark.asyncio
-async def test_smtp_unhealthy_on_connection_error():
-    import smtplib
-    with patch("smtplib.SMTP", side_effect=smtplib.SMTPConnectError(421, b"Connection refused")):
-        probe = SMTPProbe("broken.smtp", port=25)
-        result = await probe.check()
+async def test_exception_recorded_as_error():
+    probe = SMTPProbe(name="sendgrid")
 
+    @probe.watch
+    async def send():
+        raise ConnectionError("auth failed")
+
+    with pytest.raises(ConnectionError):
+        await send()
+
+    result = await probe.check()
+    assert result.details["call_count"] == 1
+    assert result.details["error_count"] == 1
+    assert result.details["consecutive_errors"] == 1
+
+
+@pytest.mark.asyncio
+async def test_error_rate_triggers_unhealthy():
+    probe = SMTPProbe(name="sendgrid", max_error_rate=0.1)
+
+    @probe.watch
+    async def fail():
+        raise RuntimeError("smtp error")
+
+    @probe.watch
+    async def succeed():
+        return None
+
+    for _ in range(9):
+        with pytest.raises(RuntimeError):
+            await fail()
+    await succeed()
+
+    result = await probe.check()
     assert result.status == ProbeStatus.UNHEALTHY
-    assert "SMTPConnectError" in result.error
+    assert "error rate" in result.error
 
 
 @pytest.mark.asyncio
-async def test_smtp_custom_name():
-    with patch("smtplib.SMTP", return_value=_make_smtp_mock()):
-        probe = SMTPProbe("smtp.example.com", name="sendgrid")
-        result = await probe.check()
+async def test_consecutive_errors_reset_on_success():
+    probe = SMTPProbe(name="sendgrid")
 
-    assert result.name == "sendgrid"
+    @probe.watch
+    async def fail():
+        raise RuntimeError()
+
+    @probe.watch
+    async def succeed():
+        return None
+
+    for _ in range(3):
+        with pytest.raises(RuntimeError):
+            await fail()
+
+    assert probe._consecutive_errors == 3
+    await succeed()
+    assert probe._consecutive_errors == 0
 
 
 @pytest.mark.asyncio
-async def test_smtp_tls_flag_in_details():
-    mock = _make_smtp_mock()
-    mock.starttls = MagicMock()
-    with patch("smtplib.SMTP", return_value=mock):
-        probe = SMTPProbe("smtp.example.com", port=587, use_tls=True)
-        result = await probe.check()
+async def test_latency_recorded():
+    probe = SMTPProbe(name="sendgrid")
 
-    assert result.details["tls"] is True
-    mock.starttls.assert_called_once()
+    @probe.watch
+    async def send():
+        return None
+
+    await send()
+    result = await probe.check()
+    assert result.details["last_rtt_ms"] is not None
+    assert result.details["avg_rtt_ms"] is not None
 
 
 @pytest.mark.asyncio
-async def test_smtp_no_extra_deps():
-    """SMTPProbe must not require any package beyond the stdlib."""
-    import fastapi_watch.probes.smtp as smtp_module
-    import smtplib
-    assert smtplib  # stdlib present
+async def test_sync_function_instrumented():
+    probe = SMTPProbe(name="sendgrid")
+
+    @probe.watch
+    def send():
+        return None
+
+    send()
+    result = await probe.check()
+    assert result.details["call_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_exceptions_still_propagate():
+    probe = SMTPProbe(name="sendgrid")
+
+    @probe.watch
+    async def send():
+        raise ValueError("bad credentials")
+
+    with pytest.raises(ValueError, match="bad credentials"):
+        await send()
+
+
+@pytest.mark.asyncio
+async def test_return_value_preserved():
+    probe = SMTPProbe(name="sendgrid")
+
+    @probe.watch
+    async def send():
+        return {"message_id": "abc123"}
+
+    result = await send()
+    assert result == {"message_id": "abc123"}
+
+
+@pytest.mark.asyncio
+async def test_avg_rtt_triggers_unhealthy():
+    probe = SMTPProbe(name="sendgrid", max_avg_rtt_ms=1.0)
+
+    import asyncio
+
+    @probe.watch
+    async def slow_send():
+        await asyncio.sleep(0.05)
+
+    await slow_send()
+    result = await probe.check()
+    assert result.status == ProbeStatus.UNHEALTHY
+    assert "avg RTT" in result.error
