@@ -1,7 +1,7 @@
 import pytest
 from fastapi import FastAPI
 from fastapi_watch import HealthRegistry, ProbeRouter
-from fastapi_watch.probes import MemoryProbe
+from fastapi_watch.probes import NoOpProbe
 from fastapi_watch.models import ProbeStatus
 
 
@@ -11,7 +11,7 @@ from fastapi_watch.models import ProbeStatus
 
 def test_add_single_probe():
     router = ProbeRouter()
-    probe = MemoryProbe(name="db")
+    probe = NoOpProbe(name="db")
     router.add(probe)
     assert len(router._probes) == 1
     assert router._probes[0] == (probe, True)
@@ -19,20 +19,20 @@ def test_add_single_probe():
 
 def test_add_non_critical():
     router = ProbeRouter()
-    probe = MemoryProbe(name="cache")
+    probe = NoOpProbe(name="cache")
     router.add(probe, critical=False)
     assert router._probes[0] == (probe, False)
 
 
 def test_add_returns_self_for_chaining():
     router = ProbeRouter()
-    result = router.add(MemoryProbe(name="a"))
+    result = router.add(NoOpProbe(name="a"))
     assert result is router
 
 
 def test_add_deduplicates_by_identity():
     router = ProbeRouter()
-    probe = MemoryProbe(name="a")
+    probe = NoOpProbe(name="a")
     router.add(probe)
     router.add(probe)
     assert len(router._probes) == 1
@@ -40,8 +40,8 @@ def test_add_deduplicates_by_identity():
 
 def test_add_allows_different_instances_same_name():
     router = ProbeRouter()
-    router.add(MemoryProbe(name="x"))
-    router.add(MemoryProbe(name="x"))
+    router.add(NoOpProbe(name="x"))
+    router.add(NoOpProbe(name="x"))
     assert len(router._probes) == 2
 
 
@@ -51,14 +51,14 @@ def test_add_allows_different_instances_same_name():
 
 def test_add_probes_adds_all():
     router = ProbeRouter()
-    probes = [MemoryProbe(name="a"), MemoryProbe(name="b"), MemoryProbe(name="c")]
+    probes = [NoOpProbe(name="a"), NoOpProbe(name="b"), NoOpProbe(name="c")]
     router.add_probes(probes)
     assert len(router._probes) == 3
 
 
 def test_add_probes_critical_flag_applied_to_all():
     router = ProbeRouter()
-    probes = [MemoryProbe(name="a"), MemoryProbe(name="b")]
+    probes = [NoOpProbe(name="a"), NoOpProbe(name="b")]
     router.add_probes(probes, critical=False)
     for _, critical in router._probes:
         assert critical is False
@@ -66,13 +66,13 @@ def test_add_probes_critical_flag_applied_to_all():
 
 def test_add_probes_returns_self():
     router = ProbeRouter()
-    result = router.add_probes([MemoryProbe(name="a")])
+    result = router.add_probes([NoOpProbe(name="a")])
     assert result is router
 
 
 def test_add_probes_deduplicates():
     router = ProbeRouter()
-    probe = MemoryProbe(name="a")
+    probe = NoOpProbe(name="a")
     router.add_probes([probe, probe])
     assert len(router._probes) == 1
 
@@ -83,8 +83,8 @@ def test_add_probes_deduplicates():
 
 def test_include_router_merges_probes():
     sub = ProbeRouter()
-    sub.add(MemoryProbe(name="a"))
-    sub.add(MemoryProbe(name="b"))
+    sub.add(NoOpProbe(name="a"))
+    sub.add(NoOpProbe(name="b"))
 
     parent = ProbeRouter()
     parent.include_router(sub)
@@ -93,8 +93,8 @@ def test_include_router_merges_probes():
 
 def test_include_router_preserves_criticality():
     sub = ProbeRouter()
-    probe_crit = MemoryProbe(name="critical-svc")
-    probe_opt = MemoryProbe(name="optional-svc")
+    probe_crit = NoOpProbe(name="critical-svc")
+    probe_opt = NoOpProbe(name="optional-svc")
     sub.add(probe_crit, critical=True)
     sub.add(probe_opt, critical=False)
 
@@ -114,7 +114,7 @@ def test_include_router_returns_self():
 
 
 def test_include_router_deduplicates_by_identity():
-    probe = MemoryProbe(name="shared")
+    probe = NoOpProbe(name="shared")
     sub = ProbeRouter()
     sub.add(probe)
 
@@ -126,7 +126,7 @@ def test_include_router_deduplicates_by_identity():
 
 def test_include_router_empty_sub_is_noop():
     parent = ProbeRouter()
-    parent.add(MemoryProbe(name="a"))
+    parent.add(NoOpProbe(name="a"))
     parent.include_router(ProbeRouter())
     assert len(parent._probes) == 1
 
@@ -137,10 +137,10 @@ def test_include_router_empty_sub_is_noop():
 
 def test_nested_routers_compose_correctly():
     leaf_a = ProbeRouter()
-    leaf_a.add(MemoryProbe(name="db"))
+    leaf_a.add(NoOpProbe(name="db"))
 
     leaf_b = ProbeRouter()
-    leaf_b.add(MemoryProbe(name="cache"), critical=False)
+    leaf_b.add(NoOpProbe(name="cache"), critical=False)
 
     mid = ProbeRouter()
     mid.include_router(leaf_a)
@@ -157,10 +157,10 @@ def test_nested_routers_compose_correctly():
 
 def test_chaining_add_and_include_router():
     sub = ProbeRouter()
-    sub.add(MemoryProbe(name="sub-probe"))
+    sub.add(NoOpProbe(name="sub-probe"))
 
     router = ProbeRouter()
-    router.add(MemoryProbe(name="a")).add(MemoryProbe(name="b")).include_router(sub)
+    router.add(NoOpProbe(name="a")).add(NoOpProbe(name="b")).include_router(sub)
     assert len(router._probes) == 3
 
 
@@ -171,7 +171,7 @@ def test_chaining_add_and_include_router():
 @pytest.mark.asyncio
 async def test_registry_routers_param_registers_probes():
     router = ProbeRouter()
-    router.add(MemoryProbe(name="from-router"))
+    router.add(NoOpProbe(name="from-router"))
 
     app = FastAPI()
     registry = HealthRegistry(app, routers=[router])
@@ -182,10 +182,10 @@ async def test_registry_routers_param_registers_probes():
 @pytest.mark.asyncio
 async def test_registry_routers_param_multiple_routers():
     router_a = ProbeRouter()
-    router_a.add(MemoryProbe(name="a"))
+    router_a.add(NoOpProbe(name="a"))
 
     router_b = ProbeRouter()
-    router_b.add(MemoryProbe(name="b"))
+    router_b.add(NoOpProbe(name="b"))
 
     app = FastAPI()
     registry = HealthRegistry(app, routers=[router_a, router_b])
@@ -197,7 +197,7 @@ async def test_registry_routers_param_multiple_routers():
 @pytest.mark.asyncio
 async def test_registry_routers_param_preserves_criticality():
     router = ProbeRouter()
-    router.add(MemoryProbe(name="optional"), critical=False)
+    router.add(NoOpProbe(name="optional"), critical=False)
 
     app = FastAPI()
     registry = HealthRegistry(app, routers=[router])
@@ -208,7 +208,7 @@ async def test_registry_routers_param_preserves_criticality():
 @pytest.mark.asyncio
 async def test_include_router_on_registry_adds_probes():
     router = ProbeRouter()
-    router.add(MemoryProbe(name="via-include"))
+    router.add(NoOpProbe(name="via-include"))
 
     app = FastAPI()
     registry = HealthRegistry(app)
@@ -229,7 +229,7 @@ def test_include_router_on_registry_returns_self():
 @pytest.mark.asyncio
 async def test_include_router_on_registry_preserves_criticality():
     router = ProbeRouter()
-    router.add(MemoryProbe(name="opt"), critical=False)
+    router.add(NoOpProbe(name="opt"), critical=False)
 
     app = FastAPI()
     registry = HealthRegistry(app)
@@ -240,7 +240,7 @@ async def test_include_router_on_registry_preserves_criticality():
 
 @pytest.mark.asyncio
 async def test_include_router_on_registry_deduplicates():
-    probe = MemoryProbe(name="shared")
+    probe = NoOpProbe(name="shared")
     router = ProbeRouter()
     router.add(probe)
 

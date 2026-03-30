@@ -2,7 +2,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from fastapi_watch import HealthRegistry
-from fastapi_watch.probes.memory import MemoryProbe
+from fastapi_watch.probes.noop import NoOpProbe
 from fastapi_watch.models import ProbeResult, ProbeStatus
 from fastapi_watch.prometheus import render_prometheus
 
@@ -88,7 +88,7 @@ def test_render_prometheus_trailing_newline():
 def test_metrics_endpoint_returns_prometheus_format():
     app = FastAPI()
     registry = HealthRegistry(app, poll_interval_ms=None)
-    registry.add(MemoryProbe(name="mem"))
+    registry.add(NoOpProbe(name="mem"))
     client = TestClient(app)
 
     resp = client.get("/health/metrics")

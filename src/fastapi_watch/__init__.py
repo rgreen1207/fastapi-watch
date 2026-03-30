@@ -3,7 +3,6 @@ from .probe_router import ProbeRouter
 from .probes.route import RouteProbe
 from .probes.websocket import WebSocketProbe
 from .probes.event_loop import EventLoopProbe
-from .probes.disk import DiskProbe
 from .probes.tcp import TCPProbe
 from .probes.smtp import SMTPProbe
 from .probes.threshold import ThresholdProbe
@@ -18,7 +17,6 @@ __all__ = [
     "RouteProbe",
     "WebSocketProbe",
     "EventLoopProbe",
-    "DiskProbe",
     "TCPProbe",
     "SMTPProbe",
     "ThresholdProbe",

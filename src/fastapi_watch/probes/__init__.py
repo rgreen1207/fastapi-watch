@@ -2,7 +2,7 @@ from .base import BaseProbe
 from .route import RouteProbe
 from .websocket import WebSocketProbe
 from .celery import CeleryProbe
-from .memory import MemoryProbe
+from .noop import NoOpProbe
 from .redis import RedisProbe
 from .rabbitmq import RabbitMQProbe
 from .sqlalchemy import SqlAlchemyProbe
@@ -13,7 +13,6 @@ from .memcached import MemcachedProbe
 from .kafka import KafkaProbe
 from .http import HttpProbe
 from .event_loop import EventLoopProbe
-from .disk import DiskProbe
 from .tcp import TCPProbe
 from .smtp import SMTPProbe
 from .threshold import ThresholdProbe
@@ -21,12 +20,11 @@ from .threshold import ThresholdProbe
 __all__ = [
     "BaseProbe",
     "CeleryProbe",
-    "DiskProbe",
     "EventLoopProbe",
     "HttpProbe",
     "KafkaProbe",
     "MemcachedProbe",
-    "MemoryProbe",
+    "NoOpProbe",
     "MongoProbe",
     "MySQLProbe",
     "PostgreSQLProbe",
