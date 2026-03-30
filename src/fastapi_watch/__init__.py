@@ -1,6 +1,6 @@
 from .alerts import BaseAlerter, WebhookAlerter, SlackAlerter, TeamsAlerter, PagerDutyAlerter
 from .registry import HealthRegistry
-from .probe_router import ProbeGroup
+from .probe_group import ProbeGroup
 from .probes.base import BaseProbe, PassiveProbe
 from .probes.route import FastAPIRouteProbe
 from .probes.websocket import FastAPIWebSocketProbe

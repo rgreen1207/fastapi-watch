@@ -13,7 +13,7 @@ from .alerts import BaseAlerter, WebhookAlerter
 from .dashboard import render_dashboard
 from .models import AlertRecord, HealthReport, ProbeResult, ProbeStatus
 from .prometheus import render_prometheus
-from .probe_router import ProbeGroup
+from .probe_group import ProbeGroup
 from .probes.base import BaseProbe
 from .storage import InMemoryProbeStorage, ProbeStorage
 
