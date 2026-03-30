@@ -1,4 +1,4 @@
-from .base import BaseProbe
+from .base import BaseProbe, PassiveProbe
 from .route import FastAPIRouteProbe
 from .websocket import FastAPIWebSocketProbe
 from .celery import CeleryProbe
@@ -19,6 +19,7 @@ from .threshold import ThresholdProbe
 
 __all__ = [
     "BaseProbe",
+    "PassiveProbe",
     "CeleryProbe",
     "EventLoopProbe",
     "HttpProbe",

@@ -24,11 +24,42 @@ def _calc_p95(window: deque) -> float | None:
 
 
 class BaseProbe(ABC):
-    """Abstract base class for fastapi-watch health probes.
+    """Base class for custom **active** health probes.
 
-    Subclass this and implement :meth:`check` to create a custom probe.
-    Set the :attr:`name` class or instance attribute to identify this probe
-    in health reports.
+    Active probes make their own check on every poll cycle (e.g. a TCP ping,
+    a queue depth query, a process liveness check). Subclass this, implement
+    :meth:`check`, and register the probe with the registry.
+
+    Example::
+
+        from fastapi_watch import BaseProbe
+        from fastapi_watch.models import ProbeResult, ProbeStatus
+
+        class QueueDepthProbe(BaseProbe):
+            name = "job-queue"
+            poll_interval_ms = 10_000  # check every 10 s
+
+            def __init__(self, queue, warn_depth: int = 500, fail_depth: int = 1000):
+                self.queue = queue
+                self.warn_depth = warn_depth
+                self.fail_depth = fail_depth
+
+            async def check(self) -> ProbeResult:
+                depth = await self.queue.depth()
+                if depth >= self.fail_depth:
+                    status = ProbeStatus.UNHEALTHY
+                elif depth >= self.warn_depth:
+                    status = ProbeStatus.DEGRADED
+                else:
+                    status = ProbeStatus.HEALTHY
+                return ProbeResult(
+                    name=self.name,
+                    status=status,
+                    latency_ms=0.0,
+                    details={"depth": depth, "warn": self.warn_depth, "fail": self.fail_depth},
+                )
+
+        registry.add(QueueDepthProbe(queue, warn_depth=200, fail_depth=800))
     """
 
     name: str = "unnamed"
@@ -43,14 +74,36 @@ class BaseProbe(ABC):
 
 
 class PassiveProbe(BaseProbe):
-    """Base class for probes that observe real calls via a :meth:`watch` decorator.
+    """Base class for custom **passive** health probes.
 
-    Rather than making synthetic requests on a poll timer, passive probes
-    instrument functions in your code. Every watched call is silently timed;
-    exceptions are counted as errors and re-raised unchanged.
+    Passive probes never make their own external calls. Instead they instrument
+    functions in your code via the inherited :meth:`watch` decorator. Every
+    watched call is silently timed; exceptions are counted as errors and
+    re-raised unchanged. :meth:`check` reports the accumulated stats.
 
-    Subclasses inherit :meth:`watch`, :meth:`check`, and all stat tracking.
-    Override only the docstring and set a meaningful default ``name``.
+    Subclass this, set a default ``name``, and optionally override the
+    docstring. No ``check`` implementation is needed — it is provided.
+
+    Example::
+
+        from fastapi_watch import PassiveProbe
+
+        class PaymentGatewayProbe(PassiveProbe):
+            \\"\\"\\"Observes calls to the payment gateway.\\"\\"\\"
+
+        payment_probe = PaymentGatewayProbe(name="stripe", max_error_rate=0.02)
+
+        @payment_probe.watch
+        async def create_charge(amount: int, token: str) -> dict:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://api.stripe.com/v1/charges",
+                    json={"amount": amount, "source": token},
+                ) as resp:
+                    resp.raise_for_status()
+                    return await resp.json()
+
+        registry.add(payment_probe)
 
     Stats reported by :meth:`check`:
 
