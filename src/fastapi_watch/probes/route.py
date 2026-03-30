@@ -74,6 +74,7 @@ class RouteProbe(BaseProbe):
         self.max_avg_rtt_ms = max_avg_rtt_ms
         self.ema_alpha = ema_alpha
 
+        self._label: str | None = None
         self._lock = threading.Lock()
         self._request_count: int = 0
         self._error_count: int = 0
@@ -138,8 +139,22 @@ class RouteProbe(BaseProbe):
     # Decorator
     # ------------------------------------------------------------------
 
-    def watch(self, func: Callable) -> Callable:
+    def watch(self, func_or_label: Callable | str | None = None) -> Callable:
         """Decorator that instruments a route handler.
+
+        Can be used with or without an optional string label:
+
+        .. code-block:: python
+
+            @route_probe.watch
+            async def list_users(): ...
+
+            @route_probe.watch("GET /users")
+            async def list_users(): ...
+
+        The label is included as ``"description"`` in the reported details,
+        which is useful when multiple probes cover different methods on the
+        same path (e.g. ``GET /users`` vs ``POST /users``).
 
         Works with both ``async def`` and ``def`` handlers.  Preserves the
         function signature so FastAPI dependency injection continues to work.
@@ -148,6 +163,14 @@ class RouteProbe(BaseProbe):
         re-raised so FastAPI's normal exception handling is unaffected.
         Any other exception is recorded as a 500 and re-raised.
         """
+        if isinstance(func_or_label, str):
+            self._label: str | None = func_or_label
+            return self._wrap
+        if func_or_label is None:
+            return self._wrap
+        return self._wrap(func_or_label)
+
+    def _wrap(self, func: Callable) -> Callable:
         if asyncio.iscoroutinefunction(func):
             @functools.wraps(func)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -213,6 +236,7 @@ class RouteProbe(BaseProbe):
         status = ProbeStatus.UNHEALTHY if reasons else ProbeStatus.HEALTHY
 
         details: dict[str, Any] = {
+            **({"description": self._label} if self._label is not None else {}),
             "request_count": self._request_count,
             "error_count": self._error_count,
             "error_rate": round(error_rate, 4),
