@@ -1,9 +1,7 @@
 import asyncio
 import base64
-import json
 import logging
 import secrets
-import urllib.request
 from datetime import datetime
 from typing import AsyncGenerator, Awaitable, Callable
 from zoneinfo import ZoneInfo
@@ -11,10 +9,11 @@ from zoneinfo import ZoneInfo
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
+from .alerts import BaseAlerter, WebhookAlerter
 from .dashboard import render_dashboard
 from .models import AlertRecord, HealthReport, ProbeResult, ProbeStatus
 from .prometheus import render_prometheus
-from .probe_router import ProbeRouter
+from .probe_group import ProbeGroup
 from .probes.base import BaseProbe
 from .storage import InMemoryProbeStorage, ProbeStorage
 
@@ -123,7 +122,7 @@ class HealthRegistry:
         grace_period_ms: Ignore probe failures for this many ms after startup
             (affects ``/health/ready`` only).
         history_size: Number of past results kept per probe (default 120).
-        routers: :class:`~fastapi_watch.ProbeRouter` instances to merge at startup.
+        groups: :class:`~fastapi_watch.ProbeGroup` instances to merge at startup.
         dashboard: ``True`` (default) — built-in HTML dashboard.  ``False`` — omit the
             route.  Callable ``(report: HealthReport) -> str`` — custom renderer.
         circuit_breaker: Enable the circuit breaker (default ``True``).  When a probe
@@ -176,12 +175,13 @@ class HealthRegistry:
         grace_period_ms: int = 0,
         history_size: int = 120,
         timezone: str = "UTC",
-        routers: list[ProbeRouter] | None = None,
+        groups: list[ProbeGroup] | None = None,
         dashboard: bool | Callable[..., str] = True,
         circuit_breaker: bool = True,
         circuit_breaker_threshold: int = 5,
         circuit_breaker_cooldown_ms: int = 600_000,
         webhook_url: str | None = None,
+        alerters: list[BaseAlerter] | None = None,
         auth: dict | Callable | None = None,
         startup_probes: list[BaseProbe] | None = None,
         result_ttl_seconds: float = 7200.0,
@@ -222,8 +222,10 @@ class HealthRegistry:
         # Maintenance mode
         self._maintenance_until: datetime | None = None
 
-        # Webhook
-        self._webhook_url: str | None = webhook_url
+        # Alerters — webhook_url kept for backwards compat, wraps into WebhookAlerter
+        self._alerters: list[BaseAlerter] = list(alerters or [])
+        if webhook_url:
+            self._alerters.append(WebhookAlerter(url=webhook_url))
 
         # Auth
         self._auth = auth
@@ -241,16 +243,16 @@ class HealthRegistry:
         self._active_connections: int = 0
 
         self._register_routes(tags or ["health"], dashboard=dashboard)
-        for router in routers or []:
-            self.include_router(router)
+        for group in groups or []:
+            self.include(group)
 
     # ------------------------------------------------------------------
     # Public API — probe registration
     # ------------------------------------------------------------------
 
-    def include_router(self, router: ProbeRouter) -> "HealthRegistry":
-        """Include all probes from a :class:`~fastapi_watch.ProbeRouter`. Returns ``self``."""
-        for probe, critical in router._probes:
+    def include(self, group: ProbeGroup) -> "HealthRegistry":
+        """Include all probes from a :class:`~fastapi_watch.ProbeGroup`. Returns ``self``."""
+        for probe, critical in group._probes:
             self.add(probe, critical=critical)
         return self
 
@@ -591,48 +593,38 @@ class HealthRegistry:
             old = self._probe_states.get(result.name)
             self._probe_states[result.name] = result.status
             if old is not None and old != result.status:
-                await self._storage.append_alert(AlertRecord(
+                alert_record = AlertRecord(
                     probe=result.name,
                     old_status=old,
                     new_status=result.status,
                     timestamp=datetime.now(self._tzinfo),
-                ))
+                )
+                await self._storage.append_alert(alert_record)
                 for cb in self._state_change_callbacks:
                     ret = cb(result.name, old, result.status)
                     if asyncio.iscoroutine(ret):
                         await ret
-                if self._webhook_url is not None and not in_maintenance:
+                if self._alerters and not in_maintenance:
                     asyncio.create_task(
-                        self._post_webhook(result.name, old, result.status)
+                        self._dispatch_alert(alert_record)
                     )
 
-    async def _post_webhook(
-        self, probe_name: str, old: ProbeStatus, new: ProbeStatus
-    ) -> None:
-        """Fire-and-forget HTTP POST to the configured webhook URL."""
-        payload = json.dumps({
-            "probe": probe_name,
-            "old_status": old.value,
-            "new_status": new.value,
-            "timestamp": datetime.now(self._tzinfo).isoformat(),
-        }).encode()
+    async def _dispatch_alert(self, alert: AlertRecord) -> None:
+        """Call each registered alerter for a probe state change.
 
-        def _post() -> None:
+        Failures in individual alerters are caught and logged so one broken
+        integration cannot silence the others.
+        """
+        for alerter in self._alerters:
             try:
-                req = urllib.request.Request(
-                    self._webhook_url,
-                    data=payload,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                urllib.request.urlopen(req, timeout=5)
+                await alerter.notify(alert)
             except Exception:
                 if self._logger:
                     self._logger.warning(
-                        "Webhook POST to %s failed", self._webhook_url
+                        "Alerter %s failed for probe %s",
+                        type(alerter).__name__,
+                        alert.probe,
                     )
-
-        await asyncio.get_running_loop().run_in_executor(None, _post)
 
     # ------------------------------------------------------------------
     # Route registration
