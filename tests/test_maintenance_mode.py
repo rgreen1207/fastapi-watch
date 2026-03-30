@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from fastapi_watch import HealthRegistry
-from fastapi_watch.probes.memory import MemoryProbe
+from fastapi_watch.probes.noop import NoOpProbe
 from fastapi_watch.models import ProbeResult, ProbeStatus
 
 
@@ -82,7 +82,7 @@ def test_set_maintenance_indefinite_until_none():
 # ---------------------------------------------------------------------------
 
 def test_ready_returns_200_maintenance_during_maintenance():
-    class UnhealthyProbe(MemoryProbe):
+    class UnhealthyProbe(NoOpProbe):
         async def check(self):
             return ProbeResult(name=self.name, status=ProbeStatus.UNHEALTHY, error="down")
 
@@ -98,7 +98,7 @@ def test_ready_returns_200_maintenance_during_maintenance():
 
 
 def test_ready_resumes_normal_after_maintenance_cleared():
-    class UnhealthyProbe(MemoryProbe):
+    class UnhealthyProbe(NoOpProbe):
         async def check(self):
             return ProbeResult(name=self.name, status=ProbeStatus.UNHEALTHY, error="down")
 

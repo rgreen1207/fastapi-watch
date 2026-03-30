@@ -2,10 +2,10 @@ from ..models import ProbeResult, ProbeStatus
 from .base import BaseProbe
 
 
-class MemoryProbe(BaseProbe):
+class NoOpProbe(BaseProbe):
     """Always-passing probe. Useful for testing or as a no-op placeholder."""
 
-    def __init__(self, name: str = "memory", poll_interval_ms: int | None = None) -> None:
+    def __init__(self, name: str = "noop", poll_interval_ms: int | None = None) -> None:
         self.name = name
         self.poll_interval_ms = poll_interval_ms
 

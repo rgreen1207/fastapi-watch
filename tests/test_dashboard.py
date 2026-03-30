@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 from fastapi_watch import HealthRegistry
 from fastapi_watch._dashboard import render_dashboard
 from fastapi_watch.models import HealthReport, ProbeResult, ProbeStatus
-from fastapi_watch.probes import MemoryProbe
+from fastapi_watch.probes import NoOpProbe
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +236,7 @@ def test_render_error_message_escaped():
 def test_dashboard_endpoint_returns_200():
     app = FastAPI()
     registry = HealthRegistry(app, poll_interval_ms=None)
-    registry.add(MemoryProbe(name="mem"))
+    registry.add(NoOpProbe(name="mem"))
     client = TestClient(app)
     resp = client.get("/health/dashboard")
     assert resp.status_code == 200
@@ -245,7 +245,7 @@ def test_dashboard_endpoint_returns_200():
 def test_dashboard_endpoint_content_type_html():
     app = FastAPI()
     registry = HealthRegistry(app, poll_interval_ms=None)
-    registry.add(MemoryProbe(name="mem"))
+    registry.add(NoOpProbe(name="mem"))
     client = TestClient(app)
     resp = client.get("/health/dashboard")
     assert "text/html" in resp.headers["content-type"]
@@ -254,7 +254,7 @@ def test_dashboard_endpoint_content_type_html():
 def test_dashboard_endpoint_contains_probe_name():
     app = FastAPI()
     registry = HealthRegistry(app, poll_interval_ms=None)
-    registry.add(MemoryProbe(name="my-service"))
+    registry.add(NoOpProbe(name="my-service"))
     client = TestClient(app)
     resp = client.get("/health/dashboard")
     assert "my-service" in resp.text
@@ -263,7 +263,7 @@ def test_dashboard_endpoint_contains_probe_name():
 def test_dashboard_endpoint_respects_custom_prefix():
     app = FastAPI()
     registry = HealthRegistry(app, prefix="/ops/health", poll_interval_ms=None)
-    registry.add(MemoryProbe(name="mem"))
+    registry.add(NoOpProbe(name="mem"))
     client = TestClient(app)
     assert client.get("/ops/health/dashboard").status_code == 200
     assert client.get("/health/dashboard").status_code == 404
@@ -301,8 +301,8 @@ def test_dashboard_default_is_enabled():
 def test_dashboard_shows_probe_count_summary():
     app = FastAPI()
     registry = HealthRegistry(app, poll_interval_ms=None)
-    registry.add(MemoryProbe(name="a"))
-    registry.add(MemoryProbe(name="b"))
+    registry.add(NoOpProbe(name="a"))
+    registry.add(NoOpProbe(name="b"))
     client = TestClient(app)
     resp = client.get("/health/dashboard")
     # Should show "2 / 2 probes healthy" or similar

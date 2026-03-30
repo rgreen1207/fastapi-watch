@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from fastapi_watch import HealthRegistry
 from fastapi_watch.models import ProbeResult, ProbeStatus, HealthReport
-from fastapi_watch.probes.memory import MemoryProbe
+from fastapi_watch.probes.noop import NoOpProbe
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +93,7 @@ def test_report_healthy_when_unhealthy_is_non_critical():
 # /health/ready HTTP behavior with DEGRADED
 # ---------------------------------------------------------------------------
 
-class DegradedProbe(MemoryProbe):
+class DegradedProbe(NoOpProbe):
     async def check(self):
         return ProbeResult(name=self.name, status=ProbeStatus.DEGRADED)
 
@@ -110,7 +110,7 @@ def test_ready_returns_200_when_degraded():
 
 
 def test_ready_returns_503_when_unhealthy():
-    class UnhealthyProbe(MemoryProbe):
+    class UnhealthyProbe(NoOpProbe):
         async def check(self):
             return ProbeResult(name=self.name, status=ProbeStatus.UNHEALTHY, error="down")
 
@@ -137,7 +137,7 @@ def test_status_returns_207_when_degraded():
 
 @pytest.mark.asyncio
 async def test_circuit_resets_on_degraded():
-    class DegProbe(MemoryProbe):
+    class DegProbe(NoOpProbe):
         async def check(self):
             return ProbeResult(name=self.name, status=ProbeStatus.DEGRADED)
 

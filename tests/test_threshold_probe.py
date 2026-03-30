@@ -1,11 +1,11 @@
 import pytest
 from fastapi_watch.probes.threshold import ThresholdProbe
-from fastapi_watch.probes.memory import MemoryProbe
+from fastapi_watch.probes.noop import NoOpProbe
 from fastapi_watch.models import ProbeResult, ProbeStatus
 
 
-def _make_probe_with_details(details: dict, status: ProbeStatus = ProbeStatus.HEALTHY) -> MemoryProbe:
-    class DetailsProbe(MemoryProbe):
+def _make_probe_with_details(details: dict, status: ProbeStatus = ProbeStatus.HEALTHY) -> NoOpProbe:
+    class DetailsProbe(NoOpProbe):
         async def check(self):
             return ProbeResult(name=self.name, status=status, details=details)
     return DetailsProbe(name="inner")

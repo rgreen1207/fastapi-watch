@@ -2,16 +2,16 @@
 import pytest
 from fastapi import FastAPI
 from fastapi_watch import HealthRegistry
-from fastapi_watch.probes.memory import MemoryProbe
+from fastapi_watch.probes.noop import NoOpProbe
 from fastapi_watch.models import ProbeResult, ProbeStatus
 
 
-class AlwaysFail(MemoryProbe):
+class AlwaysFail(NoOpProbe):
     async def check(self):
         return ProbeResult(name=self.name, status=ProbeStatus.UNHEALTHY, error="fail")
 
 
-class AlwaysPass(MemoryProbe):
+class AlwaysPass(NoOpProbe):
     async def check(self):
         return ProbeResult(name=self.name, status=ProbeStatus.HEALTHY)
 
@@ -79,7 +79,7 @@ async def test_cb_open_true_when_circuit_open():
 async def test_cb_resets_after_success():
     fail_count = 0
 
-    class SometimesFail(MemoryProbe):
+    class SometimesFail(NoOpProbe):
         async def check(self):
             nonlocal fail_count
             if fail_count < 2:

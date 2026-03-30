@@ -93,7 +93,7 @@ Install only the extras you actually use. Nothing is pulled in by default beyond
 > **zsh users:** wrap the package name in quotes to prevent the shell from interpreting `[` and `]` as glob patterns.
 
 ```bash
-# Core package — includes the always-passing MemoryProbe, no other deps
+# Core package — includes the always-passing NoOpProbe, no other deps
 pip install fastapi-watch
 
 # Add individual service probes as needed
@@ -506,7 +506,7 @@ registry = HealthRegistry(app, poll_interval_ms=60_000)  # global: every 60 s
 
 registry.add(PostgreSQLProbe(url="postgresql://...", poll_interval_ms=30_000))  # every 30 s
 registry.add(RedisProbe(url="redis://...", poll_interval_ms=10_000))            # every 10 s
-registry.add(MemoryProbe())                                                      # uses global: 60 s
+registry.add(NoOpProbe())                                                        # uses global: 60 s
 ```
 
 The minimum enforced interval is 1000 ms — lower values are clamped. Pass `poll_interval_ms=None` on the probe to explicitly use the registry default. Probes without a custom interval are always in sync with the registry-level setting.
@@ -536,7 +536,7 @@ Every probe result and the overall health report can be in one of three states:
 
 **DEGRADED is a first-class signal.** It lets probes communicate "something is wrong but the service is still responding" without triggering an emergency. Load balancers keep routing traffic (200), the dashboard shows an amber card, and Prometheus scrapes surface a `probe_degraded` gauge.
 
-Built-in probes that emit DEGRADED: `EventLoopProbe`, `DiskProbe`, `ThresholdProbe`. Custom probes can return it at any time:
+Built-in probes that emit DEGRADED: `EventLoopProbe`, `ThresholdProbe`. Custom probes can return it at any time:
 
 ```python
 from fastapi_watch.models import ProbeResult, ProbeStatus
@@ -1810,48 +1810,6 @@ registry.add(EventLoopProbe(
 
 ---
 
-### Disk space
-
-`DiskProbe` checks available disk space at a given path using `shutil.disk_usage`. It runs in a thread-pool executor so it never blocks the event loop.
-
-No extra install required.
-
-```python
-from fastapi_watch.probes import DiskProbe
-
-registry.add(DiskProbe(
-    path="/",            # default
-    warn_percent=80.0,   # DEGRADED if used >= 80% (default)
-    fail_percent=90.0,   # UNHEALTHY if used >= 90% (default)
-))
-```
-
-**Details returned:**
-
-```json
-{
-  "path": "/",
-  "total_gb": 500.1,
-  "used_gb": 423.5,
-  "free_gb": 76.6,
-  "percent_used": 84.7,
-  "warn_percent": 80.0,
-  "fail_percent": 90.0
-}
-```
-
-**Constructor arguments:**
-
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `path` | `"/"` | Filesystem path to check |
-| `warn_percent` | `80.0` | Usage % threshold for DEGRADED |
-| `fail_percent` | `90.0` | Usage % threshold for UNHEALTHY |
-| `name` | `"disk"` | Probe label |
-| `poll_interval_ms` | `None` | Uses registry default |
-
----
-
 ### TCP / DNS reachability
 
 `TCPProbe` resolves a hostname and opens a TCP connection to verify that a host and port are reachable. Both DNS resolution and the TCP connect run in an executor so they never block the event loop. No extra install required — uses only the standard library.
@@ -2539,7 +2497,6 @@ registry.add(SqlAlchemyProbe(engine=engine, name="primary-db"))
 | `RouteProbe` | built-in | `name`, `max_error_rate`, `max_avg_rtt_ms`, `window_size`, `ema_alpha` | `request_count`, `error_count`, `error_rate`, `consecutive_errors`, `last_status_code`, `last_rtt_ms`, `avg_rtt_ms`, `p95_rtt_ms`, `min_rtt_ms`, `max_rtt_ms`, `requests_per_minute` |
 | `WebSocketProbe` | built-in | `name`, `max_error_rate`, `min_active_connections`, `window_size`, `ema_alpha` | `active_connections`, `total_connections`, `messages_received`, `messages_sent`, `error_count`, `error_rate`, `consecutive_errors`, `avg_duration_ms`, `min_duration_ms`, `max_duration_ms` |
 | `EventLoopProbe` | built-in | `name`, `warn_ms`, `fail_ms` | `lag_ms` |
-| `DiskProbe` | built-in | `path`, `warn_percent`, `fail_percent`, `name` | `path`, `total_gb`, `used_gb`, `free_gb`, `percent_used` |
 | `TCPProbe` | built-in | `host`, `port`, `timeout`, `name` | `host`, `port`, `resolved_ips`, `connect_ms` |
 | `SMTPProbe` | built-in | `host`, `port`, `timeout`, `use_tls`, `username`, `password`, `name` | `host`, `port`, `server_banner`, `tls`, `extensions` |
 | `ThresholdProbe` | built-in | `probe`, `name`, `warn_if`, `fail_if` | (delegates to inner probe) |
@@ -2583,7 +2540,7 @@ registry.add(SqlAlchemyProbe(engine=engine, name="primary-db"))
 
 | Probe | Extra | Key constructor args | Details fields |
 |-------|-------|---------------------|----------------|
-| `MemoryProbe` | built-in | `name` | — |
+| `NoOpProbe` | built-in | `name` | — |
 
 ---
 
