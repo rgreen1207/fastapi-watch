@@ -2322,19 +2322,55 @@ registry.add(MongoProbe(url="mongodb://localhost:27017"))
 pip install "fastapi-watch[http]"
 ```
 
-`HttpProbe` performs an HTTP GET and checks the response status code.
+`HttpProbe` performs an HTTP request against an upstream URL and checks the response status code. All standard HTTP methods are supported, so you can probe read and write endpoints alike.
 
 ```python
 from fastapi_watch.probes import HttpProbe
 
+# GET (default) — simple health check
 registry.add(HttpProbe(url="https://api.upstream.com/health"))
+
+# POST — probe a write endpoint, expect 201
+registry.add(HttpProbe(
+    url="https://api.example.com/items",
+    method="POST",
+    json={"name": "probe-test"},
+    expected_status=201,
+    name="items-write",
+))
+
+# PUT — probe a replace endpoint
+registry.add(HttpProbe(
+    url="https://api.example.com/items/probe-test",
+    method="PUT",
+    json={"name": "probe-test", "active": True},
+    name="items-replace",
+))
+
+# PATCH — probe a partial-update endpoint
+registry.add(HttpProbe(
+    url="https://api.example.com/items/probe-test",
+    method="PATCH",
+    json={"active": False},
+    name="items-update",
+))
+
+# DELETE — probe a delete endpoint, expect 204
+registry.add(HttpProbe(
+    url="https://api.example.com/items/probe-test",
+    method="DELETE",
+    headers={"Authorization": "Bearer <token>"},
+    expected_status=204,
+    name="items-delete",
+))
 ```
 
 **Details returned:**
 
 ```json
 {
-  "status_code": 200,
+  "method": "POST",
+  "status_code": 201,
   "content_type": "application/json",
   "response_bytes": 43
 }
@@ -2346,18 +2382,13 @@ registry.add(HttpProbe(url="https://api.upstream.com/health"))
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `url` | required | URL to GET |
+| `url` | required | URL to request |
+| `method` | `"GET"` | HTTP method: `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS` |
+| `json` | `None` | JSON body sent with the request (ignored for `GET`, `HEAD`, `OPTIONS`) |
+| `headers` | `None` | Dict of HTTP headers to include |
 | `timeout` | `5.0` | Request timeout in seconds |
 | `name` | URL host | Probe label |
 | `expected_status` | `200` | HTTP status code considered healthy |
-
-```python
-# Expect a 204 instead of 200
-registry.add(HttpProbe(url="https://api.example.com/ping", expected_status=204))
-
-# Shorter timeout, explicit name
-registry.add(HttpProbe(url="https://api.payments.com/health", timeout=2.0, name="payments-api"))
-```
 
 ---
 
@@ -2534,7 +2565,7 @@ registry.add(SqlAlchemyProbe(engine=engine, name="primary-db"))
 
 | Probe | Extra | Key constructor args | Details fields |
 |-------|-------|---------------------|----------------|
-| `HttpProbe` | `http` | `url`, `timeout`, `name`, `expected_status` | `status_code`, `content_type`, `response_bytes` |
+| `HttpProbe` | `http` | `url`, `method`, `json`, `headers`, `timeout`, `name`, `expected_status` | `method`, `status_code`, `content_type`, `response_bytes` |
 
 #### Testing / placeholder
 
