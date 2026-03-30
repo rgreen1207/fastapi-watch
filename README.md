@@ -56,6 +56,8 @@ Open `/health/dashboard` for a live HTML page that shows all probe results, upda
 - [State-change callbacks](#state-change-callbacks)
 - [Startup grace period](#startup-grace-period)
 - [Probe result history](#probe-result-history)
+- [Alert history](#alert-history)
+- [Custom storage backend](#custom-storage-backend)
 - [Response format](#response-format)
 - [Writing a custom probe](#writing-a-custom-probe)
 - [Built-in probes](#built-in-probes)
@@ -135,7 +137,7 @@ registry = HealthRegistry(
     poll_interval_ms=60_000,            # re-run probes every 60 s while streaming
     logger=logging.getLogger(__name__), # optional — omit to silence all logging
     grace_period_ms=10_000,             # hold /ready for 10 s while the app warms up
-    history_size=20,                    # keep the last 20 results per probe
+    history_size=20,                    # keep the last 20 results per probe (default: 120)
 )
 
 registry.add(PostgreSQLProbe(url="postgresql://user:pass@localhost/mydb"))
@@ -148,7 +150,8 @@ That's it. The following routes are now live:
 GET /health/live          → always 200
 GET /health/ready         → 200 (healthy/degraded) / 503 (unhealthy)
 GET /health/status        → 200 / 207
-GET /health/history       → rolling probe history
+GET /health/history       → rolling probe history (TTL: 2 hours)
+GET /health/alerts        → probe state-change alert log (TTL: 72 hours)
 GET /health/metrics       → Prometheus text format
 GET /health/startup       → 200 after set_started(); 503 before
 GET /health/dashboard     → HTML dashboard with live SSE updates
@@ -206,7 +209,8 @@ async def list_users():
 | `GET /health/live` | **Liveness** — is the process alive? | `200 OK` | `200 OK` | `200 OK` |
 | `GET /health/ready` | **Readiness** — are all critical probes passing or degraded? | `200 OK` | `200 OK` | `503 Service Unavailable` |
 | `GET /health/status` | **Status** — full detail on every probe | `200 OK` | `207 Multi-Status` | `207 Multi-Status` |
-| `GET /health/history` | **History** — last N results per probe | `200 OK` | `200 OK` | `200 OK` |
+| `GET /health/history` | **History** — last N results per probe (within TTL window) | `200 OK` | `200 OK` | `200 OK` |
+| `GET /health/alerts` | **Alerts** — probe state-change log (within alert TTL window) | `200 OK` | `200 OK` | `200 OK` |
 | `GET /health/metrics` | **Prometheus metrics** — text format 0.0.4 | `200 OK` | `200 OK` | `200 OK` |
 | `GET /health/startup` | **Startup** — has `set_started()` been called and do startup probes pass? | `200 OK` | — | `503 Service Unavailable` |
 | `GET /health/dashboard` | **Dashboard** — live HTML page | `200 OK` | `200 OK` (amber banner) | `200 OK` (red header) |
@@ -221,6 +225,7 @@ registry = HealthRegistry(app, prefix="/ops/health")
 # → /ops/health/ready
 # → /ops/health/status
 # → /ops/health/history
+# → /ops/health/alerts
 # → /ops/health/metrics
 # → /ops/health/startup
 # → /ops/health/dashboard
@@ -1010,9 +1015,12 @@ Every probe result is stored in a rolling per-probe history. Use `GET /health/hi
 ```python
 registry = HealthRegistry(
     app,
-    history_size=20,  # keep the last 20 results per probe (default: 10)
+    history_size=20,          # max results kept per probe (default: 120)
+    result_ttl_seconds=3600,  # drop results older than 1 hour (default: 7200 = 2 hours)
 )
 ```
+
+Results older than `result_ttl_seconds` are excluded from `/health/history` responses. When the per-probe `history_size` cap is reached, the oldest entry is dropped regardless of TTL.
 
 **`GET /health/history` — response format:**
 
@@ -1059,7 +1067,74 @@ registry = HealthRegistry(
 }
 ```
 
-Results are ordered oldest-first. History is in-memory and resets on process restart.
+Results are ordered oldest-first. History is in-memory by default and resets on process restart. See [Custom storage backend](#custom-storage-backend) to persist across restarts.
+
+---
+
+## Alert history
+
+Every probe state change is recorded as an alert. Use `GET /health/alerts` to retrieve them — useful for auditing when and how often services flapped.
+
+```python
+registry = HealthRegistry(
+    app,
+    alert_ttl_seconds=86400,  # keep alerts for 24 hours (default: 259200 = 72 hours)
+    max_alerts=500,           # hard cap on stored alerts (default: 120)
+)
+```
+
+Alerts are retained for up to `alert_ttl_seconds`. When `max_alerts` is reached the oldest alert is dropped immediately regardless of TTL. Alerts are recorded for every state transition including maintenance-suppressed ones.
+
+**`GET /health/alerts` — response format:**
+
+```json
+{
+  "alerts": [
+    {
+      "probe": "redis",
+      "old_status": "healthy",
+      "new_status": "unhealthy",
+      "timestamp": "2026-03-29T14:22:01.843+00:00"
+    },
+    {
+      "probe": "redis",
+      "old_status": "unhealthy",
+      "new_status": "healthy",
+      "timestamp": "2026-03-29T14:25:17.112+00:00"
+    }
+  ]
+}
+```
+
+Alerts are ordered oldest-first.
+
+---
+
+## Custom storage backend
+
+By default probe results and alerts are held in memory (`InMemoryProbeStorage`). Pass a custom `storage` to persist across restarts or share state across multiple instances.
+
+```python
+from fastapi_watch import HealthRegistry, ProbeStorage
+
+class MyRedisStorage:
+    """Minimal example — see ProbeStorage docstring for a full Redis sketch."""
+
+    async def get_latest(self, name): ...
+    async def get_all_latest(self): ...
+    async def set_latest(self, result): ...
+    def clear_latest(self): ...
+    async def append_history(self, result): ...
+    async def get_history(self): ...
+    async def append_alert(self, alert): ...
+    async def get_alerts(self): ...
+
+registry = HealthRegistry(app, storage=MyRedisStorage())
+```
+
+Any class that implements all eight methods satisfies the `ProbeStorage` protocol — no inheritance required. The `ProbeStorage` docstring in `storage.py` contains a complete annotated Redis implementation sketch.
+
+When `storage` is supplied, `result_ttl_seconds`, `alert_ttl_seconds`, `max_alerts`, and `history_size` are **not** passed to the custom backend — configure those limits inside your own implementation.
 
 ---
 
@@ -2524,7 +2599,11 @@ registry.add(SqlAlchemyProbe(engine=engine, name="primary-db"))
 | `poll_interval_ms` | `int \| None` | `60000` | How often (ms) to re-run probes while an SSE client is connected. `0` or `None` disables polling — each request or stream event runs probes on demand. Values below `1000` are clamped to `1000`. |
 | `logger` | `logging.Logger \| None` | `None` | Logger for warnings (e.g. clamped interval) and probe exception messages. Pass `None` to emit no logs. |
 | `grace_period_ms` | `int` | `0` | How long (ms) after startup to return `503 {"status": "starting"}` from `/ready`. `0` disables the grace period. |
-| `history_size` | `int` | `10` | Number of past probe results to retain per probe. Retrieved via `GET /health/history`. Minimum `1`. |
+| `history_size` | `int` | `120` | Maximum number of past probe results retained per probe. Oldest entry dropped when full. Retrieved via `GET /health/history`. Minimum `1`. |
+| `result_ttl_seconds` | `float` | `7200.0` | How long (seconds) probe results are retained. Results older than this are excluded from `/health/history`. Set to `0` to disable time-based expiry. |
+| `alert_ttl_seconds` | `float` | `259200.0` | How long (seconds) alert records (state-change events) are retained. Set to `0` to keep until evicted by `max_alerts`. |
+| `max_alerts` | `int` | `120` | Hard cap on stored alert records. When full, the oldest alert is dropped before the new one is appended. |
+| `storage` | `ProbeStorage \| None` | `None` | Custom storage backend. `None` uses `InMemoryProbeStorage`. When supplied, `history_size`, `result_ttl_seconds`, `alert_ttl_seconds`, and `max_alerts` are ignored — configure limits inside the backend. |
 | `timezone` | `str` | `"UTC"` | IANA timezone name for all `checked_at` timestamps. Reflected in the `timezone` field of every response. |
 | `routers` | `list[ProbeRouter] \| None` | `None` | One or more `ProbeRouter` instances to include at startup. Equivalent to calling `include_router()` for each. |
 | `dashboard` | `bool \| Callable` | `True` | `True` — built-in HTML dashboard at `GET /health/dashboard`. `False` — omit the route. Callable `(report: HealthReport) -> str` — custom renderer. |

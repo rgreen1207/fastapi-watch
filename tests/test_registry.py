@@ -211,10 +211,11 @@ def test_set_poll_interval_updates_value():
 def test_set_poll_interval_to_zero_clears_cache():
     app = FastAPI()
     registry = HealthRegistry(app)
-    registry._probe_cache["x"] = ProbeResult(name="x", status=ProbeStatus.HEALTHY)
+    registry._storage._cache["x"] = ProbeResult(name="x", status=ProbeStatus.HEALTHY)
+    registry._storage._cache_times["x"] = 0.0
     registry.set_poll_interval(0)
     assert registry._poll_interval_ms is None
-    assert len(registry._probe_cache) == 0
+    assert len(registry._storage._cache) == 0
 
 
 def test_set_poll_interval_below_minimum_is_clamped():
@@ -330,8 +331,9 @@ async def test_poll_loop_populates_cache():
 
     # Simulate startup then run the poll loop once manually.
     await registry.run_all()
-    assert len(registry._probe_cache) > 0
-    assert "mem" in registry._probe_cache
+    cached = await registry._storage.get_all_latest()
+    assert len(cached) > 0
+    assert "mem" in cached
 
 
 @pytest.mark.asyncio
@@ -341,12 +343,12 @@ async def test_get_results_uses_cache_in_poll_mode():
 
     cached_result = ProbeResult(name="cached", status=ProbeStatus.HEALTHY)
     registry._probes.append((MemoryProbe(name="cached"), True))
-    registry._probe_cache["cached"] = cached_result
+    await registry._storage.set_latest(cached_result)
 
     results = await registry._get_results()
     assert any(r.name == "cached" for r in results)
     # Polled probe with warm cache should not have been re-run
-    assert registry._probe_cache["cached"] is cached_result
+    assert await registry._storage.get_latest("cached") is cached_result
 
 
 @pytest.mark.asyncio
@@ -887,8 +889,9 @@ async def test_history_populated_after_run_all():
     registry = HealthRegistry(app, history_size=5)
     registry.add(MemoryProbe(name="mem"))
     await registry.run_all()
-    assert "mem" in registry._probe_history
-    assert len(registry._probe_history["mem"]) == 1
+    history = await registry._storage.get_history()
+    assert "mem" in history
+    assert len(history["mem"]) == 1
 
 
 @pytest.mark.asyncio
@@ -898,7 +901,8 @@ async def test_history_respects_history_size():
     registry.add(MemoryProbe(name="mem"))
     for _ in range(10):
         await registry.run_all()
-    assert len(registry._probe_history["mem"]) == 3
+    history = await registry._storage.get_history()
+    assert len(history["mem"]) == 3
 
 
 @pytest.mark.asyncio
@@ -907,7 +911,8 @@ async def test_history_entries_are_probe_results():
     registry = HealthRegistry(app, history_size=5)
     registry.add(MemoryProbe(name="mem"))
     await registry.run_all()
-    entry = registry._probe_history["mem"][0]
+    history = await registry._storage.get_history()
+    entry = history["mem"][0]
     assert isinstance(entry, ProbeResult)
     assert entry.name == "mem"
     assert entry.status == ProbeStatus.HEALTHY
@@ -937,10 +942,10 @@ def test_history_endpoint_returns_results_after_run():
     assert data["probes"]["mem"][0]["status"] == "healthy"
 
 
-def test_history_default_size_is_10():
+def test_history_default_size_is_120():
     app = FastAPI()
     registry = HealthRegistry(app)
-    assert registry._history_size == 10
+    assert registry._history_size == 120
 
 
 # ---------------------------------------------------------------------------

@@ -39,6 +39,13 @@ class ProbeResult(BaseModel):
         return self.status != ProbeStatus.UNHEALTHY
 
 
+class AlertRecord(BaseModel):
+    probe: str
+    old_status: ProbeStatus
+    new_status: ProbeStatus
+    timestamp: datetime
+
+
 class HealthReport(BaseModel):
     status: ProbeStatus
     checked_at: datetime | None = None

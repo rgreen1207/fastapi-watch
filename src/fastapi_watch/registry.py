@@ -4,7 +4,6 @@ import json
 import logging
 import secrets
 import urllib.request
-from collections import deque
 from datetime import datetime
 from typing import AsyncGenerator, Awaitable, Callable
 from zoneinfo import ZoneInfo
@@ -13,10 +12,11 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from .dashboard import render_dashboard
-from .models import HealthReport, ProbeResult, ProbeStatus
+from .models import AlertRecord, HealthReport, ProbeResult, ProbeStatus
 from .prometheus import render_prometheus
 from .probe_router import ProbeRouter
 from .probes.base import BaseProbe
+from .storage import InMemoryProbeStorage, ProbeStorage
 
 _MIN_POLL_INTERVAL_MS = 1000
 
@@ -122,7 +122,7 @@ class HealthRegistry:
         timezone: IANA timezone name for all timestamps (default ``"UTC"``).
         grace_period_ms: Ignore probe failures for this many ms after startup
             (affects ``/health/ready`` only).
-        history_size: Number of past results kept per probe (default 10).
+        history_size: Number of past results kept per probe (default 120).
         routers: :class:`~fastapi_watch.ProbeRouter` instances to merge at startup.
         dashboard: ``True`` (default) — built-in HTML dashboard.  ``False`` — omit the
             route.  Callable ``(report: HealthReport) -> str`` — custom renderer.
@@ -136,6 +136,15 @@ class HealthRegistry:
             (default 5).
         circuit_breaker_cooldown_ms: How long (ms) the circuit stays open before the
             probe is retried (default ``600_000`` = 10 minutes).
+        result_ttl_seconds: How long (seconds) probe results are retained in storage
+            (default ``7200`` = 2 hours).  Set to ``0`` to disable time-based expiry.
+        alert_ttl_seconds: How long (seconds) alert records (state-change events) are
+            retained (default ``259200`` = 72 hours).  Set to ``0`` to keep forever.
+        max_alerts: Maximum number of alert records to retain (default ``120``).
+            When the cap is reached the oldest alert is dropped (regardless of TTL).
+        storage: Custom storage backend implementing :class:`~fastapi_watch.ProbeStorage`.
+            Defaults to :class:`~fastapi_watch.InMemoryProbeStorage`.  Pass a Redis-backed
+            or other implementation here for persistence across restarts.
         webhook_url: HTTP(S) URL that receives a JSON ``POST`` whenever a probe
             changes state.  The call is fire-and-forget and never blocks health checks.
             Payload: ``{"probe", "old_status", "new_status", "timestamp"}``.
@@ -165,7 +174,7 @@ class HealthRegistry:
         poll_interval_ms: int | None = 60_000,
         logger: logging.Logger | None = None,
         grace_period_ms: int = 0,
-        history_size: int = 10,
+        history_size: int = 120,
         timezone: str = "UTC",
         routers: list[ProbeRouter] | None = None,
         dashboard: bool | Callable[..., str] = True,
@@ -175,6 +184,10 @@ class HealthRegistry:
         webhook_url: str | None = None,
         auth: dict | Callable | None = None,
         startup_probes: list[BaseProbe] | None = None,
+        result_ttl_seconds: float = 7200.0,
+        alert_ttl_seconds: float = 259200.0,
+        max_alerts: int = 120,
+        storage: ProbeStorage | None = None,
     ) -> None:
         self.app = app
         self.prefix = prefix
@@ -184,12 +197,16 @@ class HealthRegistry:
         self._tzinfo: ZoneInfo = ZoneInfo(timezone)
         self._start_time: datetime = datetime.now(self._tzinfo)
         self._history_size: int = max(1, history_size)
-        self._probe_history: dict[str, deque[ProbeResult]] = {}
+        self._storage: ProbeStorage = storage or InMemoryProbeStorage(
+            max_results=self._history_size,
+            result_ttl_seconds=result_ttl_seconds,
+            alert_ttl_seconds=alert_ttl_seconds,
+            max_alerts=max(1, max_alerts),
+        )
         self._probes: list[tuple[BaseProbe, bool]] = []
         self._poll_interval_ms: int | None = self._set_interval(poll_interval_ms)
 
-        # Per-probe result cache and scheduling
-        self._probe_cache: dict[str, ProbeResult] = {}
+        # Per-probe scheduling
         self._probe_last_run: dict[str, float] = {}
         self._last_checked_at: datetime | None = None
         self._cache_lock = asyncio.Lock()
@@ -308,7 +325,7 @@ class HealthRegistry:
         """
         self._poll_interval_ms = self._set_interval(ms)
         if self._poll_interval_ms is None:
-            self._probe_cache.clear()
+            self._storage.clear_latest()
             if not self._has_custom_intervals():
                 self._cancel_poll_task()
         elif self._active_connections > 0:
@@ -335,11 +352,11 @@ class HealthRegistry:
         run_time = asyncio.get_running_loop().time()
         async with self._cache_lock:
             for r in results:
-                self._probe_cache[r.name] = r
+                await self._storage.set_latest(r)
                 self._probe_last_run[r.name] = run_time
             self._last_checked_at = now_dt
         for r in results:
-            self._probe_history.setdefault(r.name, deque(maxlen=self._history_size)).append(r)
+            await self._storage.append_history(r)
         await self._fire_state_changes(results)
         return results
 
@@ -352,7 +369,7 @@ class HealthRegistry:
             open_until = self._circuit_open_until.get(probe.name, 0.0)
             if loop.time() < open_until:
                 cb_info = self._cb_info(probe.name, True)
-                cached = self._probe_cache.get(probe.name)
+                cached = await self._storage.get_latest(probe.name)
                 if cached is not None:
                     details = {**(cached.details or {}), "circuit_breaker": cb_info}
                     return cached.model_copy(update={"critical": critical, "details": details})
@@ -457,15 +474,16 @@ class HealthRegistry:
         """Return current probe results.
 
         Single-fetch probes always run fresh.  Polled probes are served from
-        the cache; uncached probes run once to warm it.
+        the cache; uncached or expired probes run once to warm it.
         """
+        cached = await self._storage.get_all_latest()
         to_run = [
             (p, c) for p, c in self._probes
-            if self._effective_interval_s(p) is None or p.name not in self._probe_cache
+            if self._effective_interval_s(p) is None or p.name not in cached
         ]
         if to_run:
             await self._execute_probes(to_run)
-        return list(self._probe_cache.values())
+        return list((await self._storage.get_all_latest()).values())
 
     # ------------------------------------------------------------------
     # Polling loop
@@ -548,9 +566,10 @@ class HealthRegistry:
         await self._on_connect()
         try:
             while True:
+                _cached = await self._storage.get_all_latest()
                 results = (
-                    list(self._probe_cache.values())
-                    if self._probe_cache
+                    list(_cached.values())
+                    if _cached
                     else await self._execute_probes(self._probes)
                 )
                 yield f"data: {make_report(results)}\n\n"
@@ -566,18 +585,18 @@ class HealthRegistry:
     # ------------------------------------------------------------------
 
     async def _fire_state_changes(self, results: list[ProbeResult]) -> None:
-        """Fire callbacks and webhook for any probe whose status changed."""
-        if not self._state_change_callbacks and self._webhook_url is None:
-            # Fast path — store states only
-            for r in results:
-                self._probe_states[r.name] = r.status
-            return
-
+        """Record alerts and fire callbacks/webhook for any probe whose status changed."""
         in_maintenance = self._in_maintenance()
         for result in results:
             old = self._probe_states.get(result.name)
             self._probe_states[result.name] = result.status
             if old is not None and old != result.status:
+                await self._storage.append_alert(AlertRecord(
+                    probe=result.name,
+                    old_status=old,
+                    new_status=result.status,
+                    timestamp=datetime.now(self._tzinfo),
+                ))
                 for cb in self._state_change_callbacks:
                     ret = cb(result.name, old, result.status)
                     if asyncio.iscoroutine(ret):
@@ -701,15 +720,27 @@ class HealthRegistry:
             f"{prefix}/history",
             tags=tags,
             summary="Probe result history",
-            description="Returns the last N results for each probe (oldest-first).",
+            description="Returns the last N results for each probe (oldest-first), within the result TTL window.",
             dependencies=auth_deps,
         )
         async def probe_history() -> Response:
+            history = await registry._storage.get_history()
             payload = {
                 name: [r.model_dump(mode="json") for r in entries]
-                for name, entries in registry._probe_history.items()
+                for name, entries in history.items()
             }
             return JSONResponse({"probes": payload})
+
+        @self.app.get(
+            f"{prefix}/alerts",
+            tags=tags,
+            summary="Alert history",
+            description="Returns probe state-change alerts retained within the alert TTL window (default 72 hours).",
+            dependencies=auth_deps,
+        )
+        async def alert_history() -> Response:
+            alerts = await registry._storage.get_alerts()
+            return JSONResponse({"alerts": [a.model_dump(mode="json") for a in alerts]})
 
         @self.app.get(
             f"{prefix}/startup",
