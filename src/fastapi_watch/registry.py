@@ -2,6 +2,7 @@ import asyncio
 import base64
 import logging
 import secrets
+import signal as _signal
 from datetime import datetime, timedelta
 from typing import AsyncGenerator, Awaitable, Callable
 from zoneinfo import ZoneInfo
@@ -252,6 +253,8 @@ class HealthRegistry:
         self._poll_task: asyncio.Task | None = None
         self._active_connections: int = 0
         self._shutting_down: bool = False
+        self._sse_tasks: set[asyncio.Task] = set()
+        self._signal_handler_installed: bool = False
 
         self._register_routes(tags or ["health"], dashboard=dashboard)
         self.app.router.on_shutdown.append(self._shutdown)
@@ -286,10 +289,22 @@ class HealthRegistry:
     def set_started(self) -> "HealthRegistry":
         """Mark the application as fully initialised.
 
+        Call this from your lifespan startup after dependencies are ready.
         Until this is called ``GET /health/startup`` returns 503.
+
+        This is also the correct place to install the early-shutdown signal hook.
+        Lifespan startup runs after uvicorn's ``install_signal_handlers()``, so
+        reading the existing SIGTERM handler here is race-free.  Calling it from
+        ``_on_connect()`` instead risks a race where the browser reconnects before
+        uvicorn re-registers its handler in the new worker, leaving our hook with
+        no chain and uvicorn's subsequent ``add_signal_handler`` overwriting it.
+
         Returns ``self`` for chaining.
         """
         self._started = True
+        if not self._signal_handler_installed:
+            self._signal_handler_installed = True
+            self._install_early_shutdown_hook()
         return self
 
     def set_maintenance(self, until: datetime | None = None) -> "HealthRegistry":
@@ -527,6 +542,13 @@ class HealthRegistry:
         return normalized
 
     async def _on_connect(self) -> None:
+        # Fallback for apps that never call set_started().
+        # Note: this path has a race condition on reload (the browser may reconnect
+        # before uvicorn re-registers its SIGTERM handler in the new worker).
+        # Prefer calling set_started() from your lifespan startup instead.
+        if not self._signal_handler_installed:
+            self._signal_handler_installed = True
+            self._install_early_shutdown_hook()
         self._active_connections += 1
         if self._active_connections == 1 and self._poll_task is None:
             if self._poll_interval_ms is not None or self._has_custom_intervals():
@@ -542,14 +564,59 @@ class HealthRegistry:
             self._poll_task.cancel()
             self._poll_task = None
 
+    def _install_early_shutdown_hook(self) -> None:
+        """Chain a SIGTERM/SIGINT handler that stops SSE streams before uvicorn drains connections.
+
+        uvicorn's shutdown order is:
+          1. connection.shutdown() on all connections
+          2. wait for connections to drain  ← SSE hangs here
+          3. lifespan teardown
+
+        By intercepting the signal before step 2, we set _shutting_down and cancel
+        active SSE tasks so they close themselves within one poll tick (≤ 500 ms),
+        allowing uvicorn to proceed without hanging.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # Not in an event loop; skip
+
+        for sig in (_signal.SIGTERM, _signal.SIGINT):
+            # Retrieve uvicorn's existing asyncio-level handler so we can chain it.
+            # loop._signal_handlers is CPython-private but stable across 3.10–3.13.
+            existing = getattr(loop, "_signal_handlers", {}).get(sig)
+
+            def _make_handler(existing_handle):
+                def _chained():
+                    # Stop SSE streams immediately (within ≤500 ms they will self-close).
+                    self._shutting_down = True
+                    for task in list(self._sse_tasks):
+                        task.cancel()
+                    self._cancel_poll_task()
+                    # Delegate to uvicorn's original handler so it still shuts down.
+                    if existing_handle is not None:
+                        try:
+                            existing_handle._run()
+                        except Exception:
+                            pass
+                return _chained
+
+            try:
+                loop.add_signal_handler(sig, _make_handler(existing))
+            except (OSError, RuntimeError, NotImplementedError):
+                pass  # Windows, or signal not supported in this context
+
     async def _shutdown(self) -> None:
         """Signal SSE streams to stop and cancel the poll task.
 
-        Registered as a FastAPI shutdown event handler so the background task
-        and any open streaming connections exit cleanly when uvicorn stops or
-        reloads — preventing the process from hanging on shutdown.
+        Called from the lifespan teardown as a safety net.  On uvicorn the signal
+        handler installed by _install_early_shutdown_hook fires first (before
+        connection draining), so this is usually a no-op by the time it runs.
+        It also handles non-signal shutdowns (e.g. programmatic server stop).
         """
         self._shutting_down = True
+        for task in list(self._sse_tasks):
+            task.cancel()
         if self._poll_task is not None:
             self._poll_task.cancel()
             try:
@@ -606,6 +673,9 @@ class HealthRegistry:
         make_report: Callable[[list[ProbeResult]], str],
     ) -> AsyncGenerator[str, None]:
         """Async generator that yields SSE (Server-Sent Events) events while the client is connected."""
+        task = asyncio.current_task()
+        if task is not None:
+            self._sse_tasks.add(task)
         await self._on_connect()
         try:
             while not self._shutting_down:
@@ -615,7 +685,10 @@ class HealthRegistry:
                     return
                 if await self._wait_for_next_poll(request):
                     return
+        except asyncio.CancelledError:
+            pass
         finally:
+            self._sse_tasks.discard(task)
             await self._on_disconnect()
 
     # ------------------------------------------------------------------
