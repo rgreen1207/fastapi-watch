@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from .dashboard import render_dashboard
 from .models import AlertRecord, HealthReport, ProbeResult, ProbeStatus
 from .prometheus import render_prometheus
-from .probe_router import ProbeRouter
+from .probe_router import ProbeGroup
 from .probes.base import BaseProbe
 from .storage import InMemoryProbeStorage, ProbeStorage
 
@@ -123,7 +123,7 @@ class HealthRegistry:
         grace_period_ms: Ignore probe failures for this many ms after startup
             (affects ``/health/ready`` only).
         history_size: Number of past results kept per probe (default 120).
-        routers: :class:`~fastapi_watch.ProbeRouter` instances to merge at startup.
+        groups: :class:`~fastapi_watch.ProbeGroup` instances to merge at startup.
         dashboard: ``True`` (default) — built-in HTML dashboard.  ``False`` — omit the
             route.  Callable ``(report: HealthReport) -> str`` — custom renderer.
         circuit_breaker: Enable the circuit breaker (default ``True``).  When a probe
@@ -176,7 +176,7 @@ class HealthRegistry:
         grace_period_ms: int = 0,
         history_size: int = 120,
         timezone: str = "UTC",
-        routers: list[ProbeRouter] | None = None,
+        groups: list[ProbeGroup] | None = None,
         dashboard: bool | Callable[..., str] = True,
         circuit_breaker: bool = True,
         circuit_breaker_threshold: int = 5,
@@ -241,16 +241,16 @@ class HealthRegistry:
         self._active_connections: int = 0
 
         self._register_routes(tags or ["health"], dashboard=dashboard)
-        for router in routers or []:
-            self.include_router(router)
+        for group in groups or []:
+            self.include(group)
 
     # ------------------------------------------------------------------
     # Public API — probe registration
     # ------------------------------------------------------------------
 
-    def include_router(self, router: ProbeRouter) -> "HealthRegistry":
-        """Include all probes from a :class:`~fastapi_watch.ProbeRouter`. Returns ``self``."""
-        for probe, critical in router._probes:
+    def include(self, group: ProbeGroup) -> "HealthRegistry":
+        """Include all probes from a :class:`~fastapi_watch.ProbeGroup`. Returns ``self``."""
+        for probe, critical in group._probes:
             self.add(probe, critical=critical)
         return self
 
