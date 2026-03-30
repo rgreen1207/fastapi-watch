@@ -2,7 +2,7 @@
   <b>fastapi-watch</b>
 </p>
 <p align="center">
-  <em>Structured health and readiness check system for [FastAPI](https://fastapi.tiangolo.com/).</em>
+  <em>Structured health and readiness check system for <a href="https://fastapi.tiangolo.com/">FastAPI</a>.</em>
 </p>
 <p align="center">
   <a href="https://github.com/rgreen1207/fastapi-watch/actions/workflows/publish.yml">
