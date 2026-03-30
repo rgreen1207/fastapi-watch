@@ -65,32 +65,22 @@ def _make_auth_checker(auth) -> Callable | None:
     if auth_type == "basic":
         expected_user = auth["username"].encode()
         expected_pass = auth["password"].encode()
+        _challenge = {"WWW-Authenticate": f"Basic {_realm}"}
 
         async def _basic(request: Request) -> None:
             header = request.headers.get("Authorization", "")
             if not header.startswith("Basic "):
-                raise HTTPException(
-                    status_code=401,
-                    headers={"WWW-Authenticate": f"Basic {_realm}"},
-                    detail="Unauthorized",
-                )
+                raise HTTPException(status_code=401, headers=_challenge, detail="Unauthorized")
             try:
                 decoded = base64.b64decode(header[6:]).decode()
                 user, _, pwd = decoded.partition(":")
             except Exception:
-                raise HTTPException(
-                    status_code=401,
-                    headers={"WWW-Authenticate": f"Basic {_realm}"},
-                )
+                raise HTTPException(status_code=401, headers=_challenge)
             if not (
                 secrets.compare_digest(user.encode(), expected_user)
                 and secrets.compare_digest(pwd.encode(), expected_pass)
             ):
-                raise HTTPException(
-                    status_code=401,
-                    headers={"WWW-Authenticate": f"Basic {_realm}"},
-                    detail="Unauthorized",
-                )
+                raise HTTPException(status_code=401, headers=_challenge, detail="Unauthorized")
         return _basic
 
     if auth_type == "apikey":
@@ -361,11 +351,7 @@ class HealthRegistry:
         if self._circuit_breaker_enabled:
             open_until = self._circuit_open_until.get(probe.name, 0.0)
             if loop.time() < open_until:
-                cb_info = {
-                    "open": True,
-                    "consecutive_failures": self._circuit_err_count.get(probe.name, 0),
-                    "trips_total": self._circuit_trips.get(probe.name, 0),
-                }
+                cb_info = self._cb_info(probe.name, True)
                 cached = self._probe_cache.get(probe.name)
                 if cached is not None:
                     details = {**(cached.details or {}), "circuit_breaker": cb_info}
@@ -433,12 +419,8 @@ class HealthRegistry:
                         )
 
             # Inject circuit breaker stats into result details
-            cb_info = {
-                "open": probe.name in self._circuit_open_until
-                        and loop.time() < self._circuit_open_until.get(probe.name, 0.0),
-                "consecutive_failures": self._circuit_err_count.get(probe.name, 0),
-                "trips_total": self._circuit_trips.get(probe.name, 0),
-            }
+            is_open = loop.time() < self._circuit_open_until.get(probe.name, 0.0)
+            cb_info = self._cb_info(probe.name, is_open)
             result = result.model_copy(
                 update={"details": {**(result.details or {}), "circuit_breaker": cb_info}}
             )
@@ -529,8 +511,14 @@ class HealthRegistry:
     def _in_grace_period(self) -> bool:
         if not self._grace_period_ms:
             return False
-        elapsed_ms = (datetime.now(self._tzinfo) - self._start_time).total_seconds() * 1000
-        return elapsed_ms < self._grace_period_ms
+        return (datetime.now(self._tzinfo) - self._start_time).total_seconds() * 1000 < self._grace_period_ms
+
+    def _cb_info(self, probe_name: str, open: bool) -> dict:
+        return {
+            "open": open,
+            "consecutive_failures": self._circuit_err_count.get(probe_name, 0),
+            "trips_total": self._circuit_trips.get(probe_name, 0),
+        }
 
     # ------------------------------------------------------------------
     # SSE (Server-Sent Events) streaming

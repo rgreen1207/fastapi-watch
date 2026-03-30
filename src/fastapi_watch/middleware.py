@@ -16,7 +16,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from .models import ProbeResult, ProbeStatus
-from .probes.base import BaseProbe
+from .probes.base import BaseProbe, _calc_p95, _update_ema
 
 
 # ---------------------------------------------------------------------------
@@ -57,12 +57,7 @@ class _RouteStats:
                 self._consecutive_errors += 1
             else:
                 self._consecutive_errors = 0
-            alpha = self._ema_alpha
-            self._avg_rtt_ms = (
-                rtt_ms
-                if self._avg_rtt_ms is None
-                else alpha * rtt_ms + (1 - alpha) * self._avg_rtt_ms
-            )
+            self._avg_rtt_ms = _update_ema(self._avg_rtt_ms, rtt_ms, self._ema_alpha)
             self._rtt_window.append(rtt_ms)
 
     def snapshot(self) -> dict[str, Any]:
@@ -71,11 +66,7 @@ class _RouteStats:
             ec = self._error_count
             error_rate = ec / rc if rc > 0 else 0.0
             avg = round(self._avg_rtt_ms or 0.0, 2)
-            p95: float | None = None
-            if self._rtt_window:
-                s = sorted(self._rtt_window)
-                idx = max(0, int(len(s) * 0.95) - 1)
-                p95 = round(s[idx], 2)
+            p95 = _calc_p95(self._rtt_window)
             rpm: float | None = None
             ts = list(self._request_timestamps)
             if len(ts) >= 2:
