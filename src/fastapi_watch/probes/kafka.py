@@ -8,8 +8,8 @@ from .base import BaseProbe
 class KafkaProbe(BaseProbe):
     """Health probe for Apache Kafka using aiokafka.
 
-    Returns the number of brokers in the cluster and a list of topic names.
-    No topics are created or consumed.
+    Actively connects an admin client on each poll, lists topics, and
+    describes the cluster. No topics are created or consumed.
 
     Install with: ``pip install fastapi-watch[kafka]``
 
@@ -19,6 +19,17 @@ class KafkaProbe(BaseProbe):
         name: Probe name shown in health reports.
         request_timeout_ms: Timeout for the admin client metadata request
             in milliseconds (default 5000).
+
+    Example::
+
+        registry.add(KafkaProbe("broker1:9092,broker2:9092", name="kafka"))
+
+        # Multiple brokers as a list
+        registry.add(KafkaProbe(
+            bootstrap_servers=["b1:9092", "b2:9092"],
+            name="kafka",
+            request_timeout_ms=3000,
+        ))
     """
 
     def __init__(

@@ -35,13 +35,27 @@ class ThresholdProbe(BaseProbe):
 
     Example::
 
-        from fastapi_watch.probes import PostgreSQLProbe, ThresholdProbe
+        from fastapi_watch.probes import EventLoopProbe, ThresholdProbe
 
-        pg = PostgreSQLProbe(url="postgresql://...")
+        # Promote DEGRADED → UNHEALTHY based on a detail value
         registry.add(ThresholdProbe(
-            pg,
-            warn_if=lambda d: d.get("active_connections", 0) / d.get("max_connections", 1) > 0.80,
-            fail_if=lambda d: d.get("active_connections", 0) / d.get("max_connections", 1) > 0.95,
+            EventLoopProbe(),
+            warn_if=lambda d: d.get("lag_ms", 0) > 3.0,
+            fail_if=lambda d: d.get("lag_ms", 0) > 15.0,
+        ))
+
+        # Wrap any passive probe to add custom error-rate bands
+        from fastapi_watch.probes import RedisProbe
+        redis = RedisProbe(name="session-cache")
+
+        @redis.watch
+        async def get_session(sid: str):
+            return await cache.get(sid)
+
+        registry.add(ThresholdProbe(
+            redis,
+            warn_if=lambda d: d.get("error_rate", 0) > 0.01,
+            fail_if=lambda d: d.get("consecutive_errors", 0) >= 5,
         ))
     """
 

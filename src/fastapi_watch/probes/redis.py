@@ -1,84 +1,54 @@
-import time
-
-from ..models import ProbeResult, ProbeStatus
-from .base import BaseProbe
+from .base import PassiveProbe
 
 
-class RedisProbe(BaseProbe):
-    """Health probe for Redis using redis[asyncio].
+class RedisProbe(PassiveProbe):
+    """Health probe that passively observes outgoing Redis calls via the :meth:`watch` decorator.
 
-    Returns server version, uptime, memory usage, connected clients,
-    total key count, and a per-prefix cluster breakdown with key counts
-    and sampled TTLs.
+    Instruments the functions in your code that interact with Redis, recording
+    latency and errors from real traffic rather than making synthetic commands
+    on a poll timer.
 
     Install with: ``pip install fastapi-watch[redis]``
+
+    Args:
+        name: Probe name shown in health reports (default ``"redis"``).
+        max_error_rate: Error-rate threshold above which the probe is UNHEALTHY (0–1).
+        max_avg_rtt_ms: Average-RTT threshold in milliseconds. ``None`` disables it.
+        window_size: Number of recent calls used for percentile calculations.
+        ema_alpha: Smoothing factor for the exponential moving average (0–1).
+        poll_interval_ms: Per-probe poll interval override.
+
+    Example::
+
+        redis_probe = RedisProbe(name="session-cache", max_error_rate=0.05)
+
+        @redis_probe.watch
+        async def get_session(session_id: str) -> dict | None:
+            return await redis.hgetall(f"session:{session_id}")
+
+        @redis_probe.watch
+        async def set_session(session_id: str, data: dict) -> None:
+            await redis.hset(f"session:{session_id}", mapping=data)
+            await redis.expire(f"session:{session_id}", 3600)
+
+        registry.add(redis_probe)
     """
 
-    def __init__(self, url: str = "redis://localhost", name: str = "redis", poll_interval_ms: int | None = None) -> None:
-        self.url = url
-        self.name = name
-        self.poll_interval_ms = poll_interval_ms
-
-    async def check(self) -> ProbeResult:
-        try:
-            from redis.asyncio import from_url
-        except ImportError as exc:
-            raise ImportError(
-                "Install fastapi-watch[redis] to use RedisProbe."
-            ) from exc
-
-        start = time.perf_counter()
-        redis = None
-        try:
-            redis = from_url(self.url, decode_responses=True)
-            await redis.ping()
-            latency = (time.perf_counter() - start) * 1000
-
-            details: dict = {}
-            try:
-                info = await redis.info()
-                details["version"] = info.get("redis_version")
-                details["uptime_seconds"] = info.get("uptime_in_seconds")
-                details["used_memory_human"] = info.get("used_memory_human")
-                details["connected_clients"] = info.get("connected_clients")
-                details["role"] = info.get("role")
-
-                db_size = await redis.dbsize()
-                details["total_keys"] = db_size
-
-                # Per-prefix cluster breakdown — capped to avoid scanning
-                # the entire keyspace on large instances.
-                _MAX_SCAN = 1000
-                clusters: dict[str, int] = {}
-                scanned = 0
-                async for key in redis.scan_iter(match="*", count=200):
-                    prefix = key.split(":")[0] if ":" in key else key
-                    clusters[prefix] = clusters.get(prefix, 0) + 1
-                    scanned += 1
-                    if scanned >= _MAX_SCAN:
-                        break
-
-                if clusters:
-                    details["clusters"] = clusters
-                    if scanned >= _MAX_SCAN:
-                        details["clusters_truncated"] = True
-            except Exception:
-                pass  # details are best-effort; connectivity is what matters
-
-            return ProbeResult(
-                name=self.name,
-                status=ProbeStatus.HEALTHY,
-                latency_ms=round(latency, 2),
-                details=details,
-            )
-        except Exception as exc:
-            latency = (time.perf_counter() - start) * 1000
-            return ProbeResult(
-                name=self.name,
-                status=ProbeStatus.UNHEALTHY,
-                latency_ms=round(latency, 2),
-                error=str(exc),
-            )
-        finally:
-            if redis is not None:
-                await redis.aclose()
+    def __init__(
+        self,
+        name: str = "redis",
+        *,
+        max_error_rate: float = 0.1,
+        max_avg_rtt_ms: float | None = None,
+        window_size: int = 100,
+        ema_alpha: float = 0.1,
+        poll_interval_ms: int | None = None,
+    ) -> None:
+        super().__init__(
+            name,
+            max_error_rate=max_error_rate,
+            max_avg_rtt_ms=max_avg_rtt_ms,
+            window_size=window_size,
+            ema_alpha=ema_alpha,
+            poll_interval_ms=poll_interval_ms,
+        )

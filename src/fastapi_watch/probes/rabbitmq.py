@@ -9,11 +9,10 @@ from .base import BaseProbe
 class RabbitMQProbe(BaseProbe):
     """Health probe for RabbitMQ using aio-pika.
 
-    When ``management_url`` is provided, calls the RabbitMQ Management HTTP API
-    to return rich details: server version, node info, per-queue message counts,
-    consumer counts, publish/deliver/ack rates, and cluster-wide totals.
-
-    Without ``management_url`` the probe only verifies TCP connectivity.
+    Actively verifies AMQP connectivity on each poll. When ``management_url``
+    is provided, also calls the RabbitMQ Management HTTP API to return rich
+    details: server version, node info, per-queue message counts, consumer
+    counts, and publish/deliver/ack rates.
 
     Install with: ``pip install fastapi-watch[rabbitmq]``
 
@@ -23,6 +22,18 @@ class RabbitMQProbe(BaseProbe):
         management_url: Base URL of the Management API
             (e.g. ``http://localhost:15672``). Credentials are taken from *url*.
             If omitted, no queue-level details are collected.
+
+    Example::
+
+        # Connectivity check only
+        registry.add(RabbitMQProbe(url="amqp://user:pass@rabbitmq/"))
+
+        # With Management API details (queue depths, rates, etc.)
+        registry.add(RabbitMQProbe(
+            url="amqp://user:pass@rabbitmq/",
+            management_url="http://rabbitmq:15672",
+            name="rabbitmq",
+        ))
     """
 
     def __init__(
