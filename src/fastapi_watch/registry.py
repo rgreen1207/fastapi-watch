@@ -565,7 +565,7 @@ class HealthRegistry:
             self._poll_task = None
 
     def _install_early_shutdown_hook(self) -> None:
-        """Chain a SIGTERM/SIGINT handler that stops SSE streams before uvicorn drains connections.
+        """Chain SIGTERM/SIGINT handlers to stop SSE streams before uvicorn drains connections.
 
         uvicorn's shutdown order is:
           1. connection.shutdown() on all connections
@@ -575,36 +575,28 @@ class HealthRegistry:
         By intercepting the signal before step 2, we set _shutting_down and cancel
         active SSE tasks so they close themselves within one poll tick (≤ 500 ms),
         allowing uvicorn to proceed without hanging.
+
+        uvicorn registers its own handlers via signal.signal() (not
+        loop.add_signal_handler()), so we chain at the Python signal level.
         """
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return  # Not in an event loop; skip
-
         for sig in (_signal.SIGTERM, _signal.SIGINT):
-            # Retrieve uvicorn's existing asyncio-level handler so we can chain it.
-            # loop._signal_handlers is CPython-private but stable across 3.10–3.13.
-            existing = getattr(loop, "_signal_handlers", {}).get(sig)
+            existing_handler = _signal.getsignal(sig)
 
-            def _make_handler(existing_handle):
-                def _chained():
-                    # Stop SSE streams immediately (within ≤500 ms they will self-close).
+            def _make_handler(existing):
+                def _chained(signum, frame):
                     self._shutting_down = True
                     for task in list(self._sse_tasks):
                         task.cancel()
                     self._cancel_poll_task()
-                    # Delegate to uvicorn's original handler so it still shuts down.
-                    if existing_handle is not None:
-                        try:
-                            existing_handle._run()
-                        except Exception:
-                            pass
+                    # Delegate to uvicorn's handler so it still shuts down.
+                    if callable(existing):
+                        existing(signum, frame)
                 return _chained
 
             try:
-                loop.add_signal_handler(sig, _make_handler(existing))
-            except (OSError, RuntimeError, NotImplementedError):
-                pass  # Windows, or signal not supported in this context
+                _signal.signal(sig, _make_handler(existing_handler))
+            except (OSError, ValueError):
+                pass  # Not in main thread or signal not supported
 
     async def _shutdown(self) -> None:
         """Signal SSE streams to stop and cancel the poll task.
