@@ -1,11 +1,27 @@
 """Storage backends for probe results and alert history.
 
-:class:`ProbeStorage` is the protocol every backend must satisfy.
-:class:`InMemoryProbeStorage` is the default in-process implementation with
-TTL-based expiry and per-collection size caps.
+:class:`HealthRegistry` writes to storage after every probe poll and reads
+from it to serve the health endpoints.  Three collections are managed:
 
-Pass a custom backend to ``HealthRegistry(app, storage=my_storage)`` to store
-probe results and alerts in an external system (e.g. Redis, PostgreSQL).
+* **Latest** — the most recent :class:`~fastapi_watch.models.ProbeResult` per
+  probe.  Served by ``GET /health/status`` and the live dashboard.
+* **History** — a rolling window of past results per probe (capped at
+  ``max_results`` entries).  Served by ``GET /health/history``.
+* **Alerts** — a log of probe state-change events
+  (:class:`~fastapi_watch.models.AlertRecord`), written whenever a probe
+  transitions between HEALTHY / DEGRADED / UNHEALTHY.  Served by
+  ``GET /health/alerts`` and consumed by alerters in ``alerts.py``.
+
+Both the latest and history collections share the same ``result_ttl_seconds``
+expiry.  Alerts have their own ``alert_ttl_seconds`` expiry.  Setting either
+TTL to ``0`` disables time-based expiry for that collection.
+
+:class:`ProbeStorage` is the protocol every backend must satisfy.
+:class:`InMemoryProbeStorage` is the default in-process implementation.
+
+Pass a custom backend to ``HealthRegistry(app, storage=my_storage)`` to
+persist results and alerts in an external system (e.g. Redis, PostgreSQL)
+so they survive process restarts or are shared across multiple instances.
 """
 import time
 from collections import deque
@@ -94,16 +110,26 @@ class ProbeStorage(Protocol):
 
 
 class InMemoryProbeStorage:
-    """Default in-process storage backend.
+    """Default in-process storage backend.  All data is held in Python dicts
+    and deques — no external dependencies, no I/O.
 
-    Probe results expire after *result_ttl_seconds* (default 2 hours) and at most
-    *max_results* history entries are kept per probe (oldest entries are dropped
-    when the cap is reached).
+    **Latest results** (one per probe): expire after *result_ttl_seconds*
+    (default 2 hours).  A stale latest result is dropped on the next read so
+    ``GET /health/status`` never returns data older than the TTL.
 
-    Alerts expire after *alert_ttl_seconds* (default 72 hours) and are also capped
-    at *max_alerts* entries (default 120); oldest alerts are dropped first when full.
+    **History** (rolling window per probe): capped at *max_results* entries
+    (default 120 per probe); oldest entries are evicted when the cap is
+    reached.  The same *result_ttl_seconds* TTL applies on read.
+
+    **Alerts** (state-change log): capped at *max_alerts* entries (default
+    120 total); oldest alerts are evicted when full.  Alerts older than
+    *alert_ttl_seconds* (default 72 hours) are dropped on read.
 
     Set either TTL to ``0`` to disable time-based expiry for that collection.
+
+    For multi-process deployments or persistence across restarts, replace this
+    with a custom backend that implements :class:`ProbeStorage` and pass it to
+    ``HealthRegistry(app, storage=my_storage)``.
     """
 
     def __init__(
