@@ -24,10 +24,12 @@ class PostgreSQLProbe(BaseProbe):
         url: str,
         name: str = "postgresql",
         timeout: float = 5.0,
+        poll_interval_ms: int | None = None,
     ) -> None:
         self.url = url
         self.name = name
         self.timeout = timeout
+        self.poll_interval_ms = poll_interval_ms
 
     async def check(self) -> ProbeResult:
         try:

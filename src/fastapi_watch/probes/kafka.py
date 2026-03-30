@@ -1,3 +1,4 @@
+import asyncio
 import time
 
 from ..models import ProbeResult, ProbeStatus
@@ -25,12 +26,14 @@ class KafkaProbe(BaseProbe):
         bootstrap_servers: str | list[str] = "localhost:9092",
         name: str = "kafka",
         request_timeout_ms: int = 5000,
+        poll_interval_ms: int | None = None,
     ) -> None:
         if isinstance(bootstrap_servers, list):
             self.bootstrap_servers = ",".join(bootstrap_servers)
         else:
             self.bootstrap_servers = bootstrap_servers
         self.name = name
+        self.poll_interval_ms = poll_interval_ms
         self._timeout_ms = request_timeout_ms
 
     async def check(self) -> ProbeResult:
@@ -52,16 +55,14 @@ class KafkaProbe(BaseProbe):
 
             details: dict = {}
             try:
-                topics = await client.list_topics()
-                cluster = await client.describe_cluster()
+                topics, cluster = await asyncio.gather(
+                    client.list_topics(),
+                    client.describe_cluster(),
+                )
                 details["broker_count"] = len(cluster.brokers)
                 details["controller_id"] = cluster.controller_id
-                details["topics"] = sorted(
-                    t for t in topics if not t.startswith("__")
-                )
-                details["internal_topics"] = sorted(
-                    t for t in topics if t.startswith("__")
-                )
+                details["topics"] = sorted(t for t in topics if not t.startswith("__"))
+                details["internal_topics"] = sorted(t for t in topics if t.startswith("__"))
             except Exception:
                 pass  # details are best-effort
 
@@ -83,6 +84,6 @@ class KafkaProbe(BaseProbe):
         finally:
             if client is not None:
                 try:
-                    await client.close()
+                    await asyncio.wait_for(client.close(), timeout=5.0)
                 except Exception:
                     pass

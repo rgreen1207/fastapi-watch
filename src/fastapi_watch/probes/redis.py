@@ -14,9 +14,10 @@ class RedisProbe(BaseProbe):
     Install with: ``pip install fastapi-watch[redis]``
     """
 
-    def __init__(self, url: str = "redis://localhost", name: str = "redis") -> None:
+    def __init__(self, url: str = "redis://localhost", name: str = "redis", poll_interval_ms: int | None = None) -> None:
         self.url = url
         self.name = name
+        self.poll_interval_ms = poll_interval_ms
 
     async def check(self) -> ProbeResult:
         try:
@@ -45,21 +46,22 @@ class RedisProbe(BaseProbe):
                 db_size = await redis.dbsize()
                 details["total_keys"] = db_size
 
-                # Per-prefix cluster breakdown
-                clusters: dict[str, list[str]] = {}
-                async for key in redis.scan_iter(match="*", count=500):
+                # Per-prefix cluster breakdown — capped to avoid scanning
+                # the entire keyspace on large instances.
+                _MAX_SCAN = 1000
+                clusters: dict[str, int] = {}
+                scanned = 0
+                async for key in redis.scan_iter(match="*", count=200):
                     prefix = key.split(":")[0] if ":" in key else key
-                    clusters.setdefault(prefix, []).append(key)
+                    clusters[prefix] = clusters.get(prefix, 0) + 1
+                    scanned += 1
+                    if scanned >= _MAX_SCAN:
+                        break
 
-                cluster_details = {}
-                for prefix, keys in clusters.items():
-                    sample_ttl = await redis.ttl(keys[0])
-                    cluster_details[prefix] = {
-                        "keys": len(keys),
-                        "ttl_seconds": None if sample_ttl < 0 else sample_ttl,
-                    }
-                if cluster_details:
-                    details["clusters"] = cluster_details
+                if clusters:
+                    details["clusters"] = clusters
+                    if scanned >= _MAX_SCAN:
+                        details["clusters_truncated"] = True
             except Exception:
                 pass  # details are best-effort; connectivity is what matters
 

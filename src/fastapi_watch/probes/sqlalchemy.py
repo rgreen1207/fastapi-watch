@@ -24,9 +24,11 @@ class SqlAlchemyProbe(BaseProbe):
         self,
         engine: "AsyncEngine",
         name: str = "database",
+        poll_interval_ms: int | None = None,
     ) -> None:
         self.engine = engine
         self.name = name
+        self.poll_interval_ms = poll_interval_ms
 
     async def check(self) -> ProbeResult:
         try:

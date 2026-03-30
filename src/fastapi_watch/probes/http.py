@@ -25,11 +25,13 @@ class HttpProbe(BaseProbe):
         timeout: float = 5.0,
         name: str | None = None,
         expected_status: int = 200,
+        poll_interval_ms: int | None = None,
     ) -> None:
         self.url = url
         self.timeout = timeout
         self.expected_status = expected_status
         self.name = name if name is not None else (urlparse(url).netloc or url)
+        self.poll_interval_ms = poll_interval_ms
 
     async def check(self) -> ProbeResult:
         try:
@@ -44,12 +46,17 @@ class HttpProbe(BaseProbe):
             timeout = aiohttp.ClientTimeout(total=self.timeout)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(self.url) as response:
-                    body = await response.read()
                     latency = (time.perf_counter() - start) * 1000
+                    # Prefer Content-Length to avoid reading the full body.
+                    cl = response.headers.get("Content-Length")
+                    if cl is not None:
+                        response_bytes = int(cl)
+                    else:
+                        response_bytes = len(await response.read())
                     details = {
                         "status_code": response.status,
                         "content_type": response.headers.get("Content-Type"),
-                        "response_bytes": len(body),
+                        "response_bytes": response_bytes,
                     }
                     if response.status == self.expected_status:
                         return ProbeResult(

@@ -68,11 +68,13 @@ class CeleryProbe(BaseProbe):
         name: str = "celery",
         timeout: float = 1.0,
         min_workers: int = 0,
+        poll_interval_ms: int | None = None,
     ) -> None:
         self.app = app
         self.name = name
         self.timeout = timeout
         self.min_workers = min_workers
+        self.poll_interval_ms = poll_interval_ms
 
     # ------------------------------------------------------------------
     # Synchronous inspect — called via run_in_executor
@@ -128,7 +130,7 @@ class CeleryProbe(BaseProbe):
     async def check(self) -> ProbeResult:
         start = time.perf_counter()
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             data = await loop.run_in_executor(None, self._inspect)
             latency = (time.perf_counter() - start) * 1000
 

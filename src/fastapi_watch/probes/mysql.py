@@ -45,8 +45,10 @@ class MySQLProbe(BaseProbe):
         db: str = "",
         name: str = "mysql",
         connect_timeout: int = 5,
+        poll_interval_ms: int | None = None,
     ) -> None:
         self.name = name
+        self.poll_interval_ms = poll_interval_ms
         self._timeout = connect_timeout
 
         if url is not None:

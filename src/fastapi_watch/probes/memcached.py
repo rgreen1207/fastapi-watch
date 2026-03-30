@@ -22,10 +22,12 @@ class MemcachedProbe(BaseProbe):
         port: int = 11211,
         name: str = "memcached",
         pool_size: int = 1,
+        poll_interval_ms: int | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self.name = name
+        self.poll_interval_ms = poll_interval_ms
         self._pool_size = pool_size
 
     async def check(self) -> ProbeResult:
