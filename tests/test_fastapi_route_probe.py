@@ -2,7 +2,7 @@ import asyncio
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
-from fastapi_watch import HealthRegistry, RouteProbe
+from fastapi_watch import HealthRegistry, FastAPIRouteProbe
 from fastapi_watch.models import ProbeStatus
 
 
@@ -24,7 +24,7 @@ async def _call(wrapper, *args, **kwargs):
 
 @pytest.mark.asyncio
 async def test_check_before_any_requests_is_healthy():
-    probe = RouteProbe(name="api")
+    probe = FastAPIRouteProbe(name="api")
     result = await probe.check()
     assert result.status == ProbeStatus.HEALTHY
     assert result.name == "api"
@@ -33,7 +33,7 @@ async def test_check_before_any_requests_is_healthy():
 
 @pytest.mark.asyncio
 async def test_latency_ms_zero_before_any_requests():
-    probe = RouteProbe(name="api")
+    probe = FastAPIRouteProbe(name="api")
     result = await probe.check()
     assert result.latency_ms == 0.0
 
@@ -44,7 +44,7 @@ async def test_latency_ms_zero_before_any_requests():
 
 @pytest.mark.asyncio
 async def test_rtt_recorded_for_async_handler():
-    probe = RouteProbe(name="api")
+    probe = FastAPIRouteProbe(name="api")
 
     @probe.watch
     async def handler():
@@ -58,7 +58,7 @@ async def test_rtt_recorded_for_async_handler():
 
 @pytest.mark.asyncio
 async def test_avg_rtt_ms_updated_after_requests():
-    probe = RouteProbe(name="api")
+    probe = FastAPIRouteProbe(name="api")
 
     @probe.watch
     async def handler():
@@ -73,7 +73,7 @@ async def test_avg_rtt_ms_updated_after_requests():
 
 @pytest.mark.asyncio
 async def test_request_count_increments():
-    probe = RouteProbe(name="api")
+    probe = FastAPIRouteProbe(name="api")
 
     @probe.watch
     async def handler():
@@ -92,7 +92,7 @@ async def test_request_count_increments():
 
 @pytest.mark.asyncio
 async def test_rtt_recorded_for_sync_handler():
-    probe = RouteProbe(name="api")
+    probe = FastAPIRouteProbe(name="api")
 
     @probe.watch
     def handler():
@@ -105,7 +105,7 @@ async def test_rtt_recorded_for_sync_handler():
 
 
 def test_sync_handler_still_returns_value():
-    probe = RouteProbe(name="api")
+    probe = FastAPIRouteProbe(name="api")
 
     @probe.watch
     def handler():
@@ -120,7 +120,7 @@ def test_sync_handler_still_returns_value():
 
 @pytest.mark.asyncio
 async def test_last_status_code_200_on_success():
-    probe = RouteProbe(name="api")
+    probe = FastAPIRouteProbe(name="api")
 
     @probe.watch
     async def handler():
@@ -133,7 +133,7 @@ async def test_last_status_code_200_on_success():
 
 @pytest.mark.asyncio
 async def test_http_exception_status_code_captured():
-    probe = RouteProbe(name="api")
+    probe = FastAPIRouteProbe(name="api")
 
     @probe.watch
     async def handler():
@@ -147,7 +147,7 @@ async def test_http_exception_status_code_captured():
 
 @pytest.mark.asyncio
 async def test_http_exception_is_reraised():
-    probe = RouteProbe(name="api")
+    probe = FastAPIRouteProbe(name="api")
 
     @probe.watch
     async def handler():
@@ -160,7 +160,7 @@ async def test_http_exception_is_reraised():
 
 @pytest.mark.asyncio
 async def test_unhandled_exception_recorded_as_500():
-    probe = RouteProbe(name="api")
+    probe = FastAPIRouteProbe(name="api")
 
     @probe.watch
     async def handler():
@@ -174,7 +174,7 @@ async def test_unhandled_exception_recorded_as_500():
 
 @pytest.mark.asyncio
 async def test_unhandled_exception_is_reraised():
-    probe = RouteProbe(name="api")
+    probe = FastAPIRouteProbe(name="api")
 
     @probe.watch
     async def handler():
@@ -190,7 +190,7 @@ async def test_unhandled_exception_is_reraised():
 
 @pytest.mark.asyncio
 async def test_error_rate_calculated_correctly():
-    probe = RouteProbe(name="api")
+    probe = FastAPIRouteProbe(name="api")
 
     @probe.watch
     async def handler(fail: bool):
@@ -209,7 +209,7 @@ async def test_error_rate_calculated_correctly():
 
 @pytest.mark.asyncio
 async def test_healthy_when_error_rate_within_threshold():
-    probe = RouteProbe(name="api", max_error_rate=0.1)
+    probe = FastAPIRouteProbe(name="api", max_error_rate=0.1)
 
     @probe.watch
     async def handler():
@@ -224,7 +224,7 @@ async def test_healthy_when_error_rate_within_threshold():
 
 @pytest.mark.asyncio
 async def test_unhealthy_when_error_rate_exceeds_threshold():
-    probe = RouteProbe(name="api", max_error_rate=0.1)
+    probe = FastAPIRouteProbe(name="api", max_error_rate=0.1)
 
     @probe.watch
     async def handler(fail: bool):
@@ -248,7 +248,7 @@ async def test_unhealthy_when_error_rate_exceeds_threshold():
 
 @pytest.mark.asyncio
 async def test_consecutive_errors_increments_on_failure():
-    probe = RouteProbe(name="api")
+    probe = FastAPIRouteProbe(name="api")
 
     @probe.watch
     async def fail():
@@ -263,7 +263,7 @@ async def test_consecutive_errors_increments_on_failure():
 
 @pytest.mark.asyncio
 async def test_consecutive_errors_resets_on_success():
-    probe = RouteProbe(name="api")
+    probe = FastAPIRouteProbe(name="api")
 
     @probe.watch
     async def handler(fail: bool):
@@ -285,7 +285,7 @@ async def test_consecutive_errors_resets_on_success():
 
 @pytest.mark.asyncio
 async def test_healthy_when_avg_rtt_within_threshold():
-    probe = RouteProbe(name="api", max_avg_rtt_ms=10_000)
+    probe = FastAPIRouteProbe(name="api", max_avg_rtt_ms=10_000)
 
     @probe.watch
     async def handler():
@@ -298,7 +298,7 @@ async def test_healthy_when_avg_rtt_within_threshold():
 
 @pytest.mark.asyncio
 async def test_unhealthy_when_avg_rtt_exceeds_threshold():
-    probe = RouteProbe(name="api", max_avg_rtt_ms=1)  # 1 ms threshold
+    probe = FastAPIRouteProbe(name="api", max_avg_rtt_ms=1)  # 1 ms threshold
 
     @probe.watch
     async def handler():
@@ -313,7 +313,7 @@ async def test_unhealthy_when_avg_rtt_exceeds_threshold():
 
 @pytest.mark.asyncio
 async def test_no_rtt_threshold_by_default():
-    probe = RouteProbe(name="api")
+    probe = FastAPIRouteProbe(name="api")
     assert probe.max_avg_rtt_ms is None
 
     @probe.watch
@@ -332,7 +332,7 @@ async def test_no_rtt_threshold_by_default():
 
 @pytest.mark.asyncio
 async def test_min_max_rtt_tracked():
-    probe = RouteProbe(name="api")
+    probe = FastAPIRouteProbe(name="api")
 
     @probe.watch
     async def handler():
@@ -349,7 +349,7 @@ async def test_min_max_rtt_tracked():
 
 @pytest.mark.asyncio
 async def test_p95_rtt_none_before_requests():
-    probe = RouteProbe(name="api")
+    probe = FastAPIRouteProbe(name="api")
     result = await probe.check()
     # No requests yet — p95 not in details (or None)
     assert result.details.get("p95_rtt_ms") is None
@@ -357,7 +357,7 @@ async def test_p95_rtt_none_before_requests():
 
 @pytest.mark.asyncio
 async def test_p95_rtt_populated_after_requests():
-    probe = RouteProbe(name="api")
+    probe = FastAPIRouteProbe(name="api")
 
     @probe.watch
     async def handler():
@@ -377,7 +377,7 @@ async def test_p95_rtt_populated_after_requests():
 
 @pytest.mark.asyncio
 async def test_requests_per_minute_none_before_two_requests():
-    probe = RouteProbe(name="api")
+    probe = FastAPIRouteProbe(name="api")
 
     @probe.watch
     async def handler():
@@ -390,7 +390,7 @@ async def test_requests_per_minute_none_before_two_requests():
 
 @pytest.mark.asyncio
 async def test_requests_per_minute_populated_after_two_requests():
-    probe = RouteProbe(name="api")
+    probe = FastAPIRouteProbe(name="api")
 
     @probe.watch
     async def handler():
@@ -408,7 +408,7 @@ async def test_requests_per_minute_populated_after_two_requests():
 # ---------------------------------------------------------------------------
 
 def test_decorated_route_still_serves_responses():
-    probe = RouteProbe(name="items")
+    probe = FastAPIRouteProbe(name="items")
     app = FastAPI()
 
     @app.get("/items")
@@ -423,7 +423,7 @@ def test_decorated_route_still_serves_responses():
 
 
 def test_decorated_route_records_stats_via_real_requests():
-    probe = RouteProbe(name="items")
+    probe = FastAPIRouteProbe(name="items")
     app = FastAPI()
     registry = HealthRegistry(app, poll_interval_ms=None)
     registry.add(probe)
@@ -444,7 +444,7 @@ def test_decorated_route_records_stats_via_real_requests():
 
 
 def test_decorated_route_records_http_exception_status_code():
-    probe = RouteProbe(name="items", max_error_rate=1.0)  # never unhealthy
+    probe = FastAPIRouteProbe(name="items", max_error_rate=1.0)  # never unhealthy
     app = FastAPI()
 
     @app.get("/items/{item_id}")
@@ -464,7 +464,7 @@ def test_decorated_route_records_http_exception_status_code():
 
 
 def test_watch_preserves_function_name():
-    probe = RouteProbe(name="api")
+    probe = FastAPIRouteProbe(name="api")
 
     @probe.watch
     async def my_handler():
@@ -474,7 +474,7 @@ def test_watch_preserves_function_name():
 
 
 def test_watch_preserves_sync_function_name():
-    probe = RouteProbe(name="api")
+    probe = FastAPIRouteProbe(name="api")
 
     @probe.watch
     def my_sync_handler():
@@ -489,7 +489,7 @@ def test_watch_preserves_sync_function_name():
 
 @pytest.mark.asyncio
 async def test_probe_result_latency_ms_equals_avg_rtt():
-    probe = RouteProbe(name="api")
+    probe = FastAPIRouteProbe(name="api")
 
     @probe.watch
     async def handler():
@@ -508,7 +508,7 @@ async def test_probe_result_latency_ms_equals_avg_rtt():
 
 @pytest.mark.asyncio
 async def test_probe_name_in_result():
-    probe = RouteProbe(name="checkout")
+    probe = FastAPIRouteProbe(name="checkout")
 
     @probe.watch
     async def handler():

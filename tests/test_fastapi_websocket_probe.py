@@ -1,4 +1,4 @@
-"""Tests for WebSocketProbe.
+"""Tests for FastAPIWebSocketProbe.
 
 FastAPI's WebSocket and WebSocketDisconnect are real Starlette types that
 require an ASGI transport to function properly.  Tests that exercise the
@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.testclient import TestClient
-from fastapi_watch import HealthRegistry, WebSocketProbe
+from fastapi_watch import HealthRegistry, FastAPIWebSocketProbe
 from fastapi_watch.models import ProbeStatus
 from fastapi_watch.probes.websocket import _WebSocketWrapper, _find_ws_param
 
@@ -77,7 +77,7 @@ def test_find_ws_param_prefers_annotation_over_name():
 
 @pytest.mark.asyncio
 async def test_wrapper_counts_receive_text():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
     wrapper = _WebSocketWrapper(ws, probe)
 
@@ -88,7 +88,7 @@ async def test_wrapper_counts_receive_text():
 
 @pytest.mark.asyncio
 async def test_wrapper_counts_receive_bytes():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
     wrapper = _WebSocketWrapper(ws, probe)
 
@@ -98,7 +98,7 @@ async def test_wrapper_counts_receive_bytes():
 
 @pytest.mark.asyncio
 async def test_wrapper_counts_receive_json():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
     wrapper = _WebSocketWrapper(ws, probe)
 
@@ -108,7 +108,7 @@ async def test_wrapper_counts_receive_json():
 
 @pytest.mark.asyncio
 async def test_wrapper_counts_receive():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
     wrapper = _WebSocketWrapper(ws, probe)
 
@@ -118,7 +118,7 @@ async def test_wrapper_counts_receive():
 
 @pytest.mark.asyncio
 async def test_wrapper_counts_send_text():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
     wrapper = _WebSocketWrapper(ws, probe)
 
@@ -129,7 +129,7 @@ async def test_wrapper_counts_send_text():
 
 @pytest.mark.asyncio
 async def test_wrapper_counts_send_bytes():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
     wrapper = _WebSocketWrapper(ws, probe)
 
@@ -139,7 +139,7 @@ async def test_wrapper_counts_send_bytes():
 
 @pytest.mark.asyncio
 async def test_wrapper_counts_send_json():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
     wrapper = _WebSocketWrapper(ws, probe)
 
@@ -149,7 +149,7 @@ async def test_wrapper_counts_send_json():
 
 @pytest.mark.asyncio
 async def test_wrapper_counts_send():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
     wrapper = _WebSocketWrapper(ws, probe)
 
@@ -159,7 +159,7 @@ async def test_wrapper_counts_send():
 
 @pytest.mark.asyncio
 async def test_wrapper_forwards_receive_return_value():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
     wrapper = _WebSocketWrapper(ws, probe)
 
@@ -169,7 +169,7 @@ async def test_wrapper_forwards_receive_return_value():
 
 @pytest.mark.asyncio
 async def test_wrapper_forwards_unknown_attributes():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
     ws.url = "ws://localhost/chat"
     wrapper = _WebSocketWrapper(ws, probe)
@@ -183,7 +183,7 @@ async def test_wrapper_forwards_unknown_attributes():
 
 @pytest.mark.asyncio
 async def test_check_before_any_connections_is_healthy():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     result = await probe.check()
     assert result.status == ProbeStatus.HEALTHY
     assert result.details["message"] == "no connections observed yet"
@@ -191,7 +191,7 @@ async def test_check_before_any_connections_is_healthy():
 
 @pytest.mark.asyncio
 async def test_latency_ms_zero_before_any_connections():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     result = await probe.check()
     assert result.latency_ms == 0.0
 
@@ -202,7 +202,7 @@ async def test_latency_ms_zero_before_any_connections():
 
 @pytest.mark.asyncio
 async def test_total_connections_increments():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
 
     @probe.watch
@@ -217,7 +217,7 @@ async def test_total_connections_increments():
 
 @pytest.mark.asyncio
 async def test_active_connections_zero_after_close():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
 
     @probe.watch
@@ -231,7 +231,7 @@ async def test_active_connections_zero_after_close():
 
 @pytest.mark.asyncio
 async def test_active_connections_positive_during_handler():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
     observed = []
 
@@ -245,7 +245,7 @@ async def test_active_connections_positive_during_handler():
 
 @pytest.mark.asyncio
 async def test_duration_recorded_after_close():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
 
     @probe.watch
@@ -264,7 +264,7 @@ async def test_duration_recorded_after_close():
 
 @pytest.mark.asyncio
 async def test_websocket_disconnect_not_counted_as_error():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
 
     @probe.watch
@@ -281,7 +281,7 @@ async def test_websocket_disconnect_not_counted_as_error():
 
 @pytest.mark.asyncio
 async def test_unhandled_exception_counted_as_error():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
 
     @probe.watch
@@ -297,7 +297,7 @@ async def test_unhandled_exception_counted_as_error():
 
 @pytest.mark.asyncio
 async def test_unhandled_exception_is_reraised():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
 
     @probe.watch
@@ -310,7 +310,7 @@ async def test_unhandled_exception_is_reraised():
 
 @pytest.mark.asyncio
 async def test_websocket_disconnect_is_reraised():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
 
     @probe.watch
@@ -323,7 +323,7 @@ async def test_websocket_disconnect_is_reraised():
 
 @pytest.mark.asyncio
 async def test_error_rate_calculated_correctly():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
 
     @probe.watch
@@ -347,7 +347,7 @@ async def test_error_rate_calculated_correctly():
 
 @pytest.mark.asyncio
 async def test_consecutive_errors_increments_on_error():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
 
     @probe.watch
@@ -364,7 +364,7 @@ async def test_consecutive_errors_increments_on_error():
 
 @pytest.mark.asyncio
 async def test_consecutive_errors_resets_on_clean_close():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
 
     @probe.watch
@@ -384,7 +384,7 @@ async def test_consecutive_errors_resets_on_clean_close():
 @pytest.mark.asyncio
 async def test_disconnect_does_not_reset_consecutive_errors():
     """WebSocketDisconnect is a normal close, not an error — but it does reset the counter."""
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
 
     @probe.watch
@@ -412,7 +412,7 @@ async def test_disconnect_does_not_reset_consecutive_errors():
 
 @pytest.mark.asyncio
 async def test_unhealthy_when_error_rate_exceeds_threshold():
-    probe = WebSocketProbe(name="chat", max_error_rate=0.1)
+    probe = FastAPIWebSocketProbe(name="chat", max_error_rate=0.1)
     ws = _make_mock_ws()
 
     @probe.watch
@@ -433,7 +433,7 @@ async def test_unhealthy_when_error_rate_exceeds_threshold():
 
 @pytest.mark.asyncio
 async def test_healthy_when_error_rate_within_threshold():
-    probe = WebSocketProbe(name="chat", max_error_rate=0.5)
+    probe = FastAPIWebSocketProbe(name="chat", max_error_rate=0.5)
     ws = _make_mock_ws()
 
     @probe.watch
@@ -449,7 +449,7 @@ async def test_healthy_when_error_rate_within_threshold():
 
 @pytest.mark.asyncio
 async def test_unhealthy_when_active_connections_below_minimum():
-    probe = WebSocketProbe(name="feed", min_active_connections=1)
+    probe = FastAPIWebSocketProbe(name="feed", min_active_connections=1)
     ws = _make_mock_ws()
 
     @probe.watch
@@ -465,7 +465,7 @@ async def test_unhealthy_when_active_connections_below_minimum():
 
 @pytest.mark.asyncio
 async def test_healthy_when_active_connections_meets_minimum():
-    probe = WebSocketProbe(name="feed", min_active_connections=1)
+    probe = FastAPIWebSocketProbe(name="feed", min_active_connections=1)
     ws = _make_mock_ws()
     long_task = None
 
@@ -490,7 +490,7 @@ async def test_healthy_when_active_connections_meets_minimum():
 
 @pytest.mark.asyncio
 async def test_min_active_connections_zero_disabled():
-    probe = WebSocketProbe(name="chat", min_active_connections=0)
+    probe = FastAPIWebSocketProbe(name="chat", min_active_connections=0)
     ws = _make_mock_ws()
 
     @probe.watch
@@ -510,7 +510,7 @@ async def test_min_active_connections_zero_disabled():
 
 @pytest.mark.asyncio
 async def test_messages_received_via_watch():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
 
     @probe.watch
@@ -525,7 +525,7 @@ async def test_messages_received_via_watch():
 
 @pytest.mark.asyncio
 async def test_messages_sent_via_watch():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
 
     @probe.watch
@@ -540,7 +540,7 @@ async def test_messages_sent_via_watch():
 
 @pytest.mark.asyncio
 async def test_messages_accumulate_across_connections():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
 
     @probe.watch
@@ -561,7 +561,7 @@ async def test_messages_accumulate_across_connections():
 
 @pytest.mark.asyncio
 async def test_min_max_duration_tracked():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
 
     @probe.watch
@@ -582,7 +582,7 @@ async def test_min_max_duration_tracked():
 # ---------------------------------------------------------------------------
 
 def test_websocket_endpoint_serves_messages():
-    probe = WebSocketProbe(name="echo")
+    probe = FastAPIWebSocketProbe(name="echo")
     app = FastAPI()
 
     @app.websocket("/ws")
@@ -599,7 +599,7 @@ def test_websocket_endpoint_serves_messages():
 
 
 def test_websocket_probe_registered_in_health_status():
-    probe = WebSocketProbe(name="echo")
+    probe = FastAPIWebSocketProbe(name="echo")
     app = FastAPI()
     registry = HealthRegistry(app, poll_interval_ms=None)
     registry.add(probe)
@@ -627,7 +627,7 @@ def test_websocket_probe_registered_in_health_status():
 
 
 def test_watch_preserves_function_name():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
 
     @probe.watch
     async def my_ws_handler(websocket: WebSocket):
@@ -642,7 +642,7 @@ def test_watch_preserves_function_name():
 
 @pytest.mark.asyncio
 async def test_probe_name_in_result():
-    probe = WebSocketProbe(name="notifications")
+    probe = FastAPIWebSocketProbe(name="notifications")
     ws = _make_mock_ws()
 
     @probe.watch
@@ -656,7 +656,7 @@ async def test_probe_name_in_result():
 
 @pytest.mark.asyncio
 async def test_latency_ms_reflects_avg_duration():
-    probe = WebSocketProbe(name="chat")
+    probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
 
     @probe.watch

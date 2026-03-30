@@ -38,7 +38,7 @@ class _WebSocketWrapper:
     if per-message counting matters.
     """
 
-    def __init__(self, ws: Any, probe: "WebSocketProbe") -> None:
+    def __init__(self, ws: Any, probe: "FastAPIWebSocketProbe") -> None:
         self._ws = ws
         self._probe = probe
 
@@ -90,7 +90,7 @@ class _WebSocketWrapper:
         self._probe._messages_sent += 1
 
 
-class WebSocketProbe(BaseProbe):
+class FastAPIWebSocketProbe(BaseProbe):
     """Health probe that instruments a FastAPI WebSocket handler via the :meth:`watch` decorator.
 
     Collects per-endpoint connection stats from real traffic and reports them as a
@@ -124,7 +124,7 @@ class WebSocketProbe(BaseProbe):
 
     Usage::
 
-        ws_probe = WebSocketProbe(name="chat", max_error_rate=0.05)
+        ws_probe = FastAPIWebSocketProbe(name="chat", max_error_rate=0.05)
 
         @app.websocket("/ws/chat")
         @ws_probe.watch
