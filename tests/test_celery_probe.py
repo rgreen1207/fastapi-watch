@@ -1,6 +1,6 @@
 """Tests for CeleryProbe."""
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 from fastapi_watch.models import ProbeStatus
 from fastapi_watch.probes.celery import CeleryProbe, _clean_task, _clean_scheduled
 
@@ -136,17 +136,41 @@ async def test_no_workers_unhealthy_when_min_workers_required():
     assert result.details["workers_online"] == 0
 
 
+# ---------------------------------------------------------------------------
+# Ping-only (default, detailed=False)
+# ---------------------------------------------------------------------------
+
 @pytest.mark.asyncio
-async def test_fewer_workers_than_required():
-    app = _make_app(
-        ping={_WORKER: {"ok": "pong"}},
-        active={_WORKER: []},
-        reserved={_WORKER: []},
-        scheduled={_WORKER: []},
-        registered={_WORKER: ["myapp.tasks.send_email"]},
-        stats={_WORKER: _STATS},
-        active_queues={_WORKER: _QUEUES},
-    )
+async def test_ping_only_workers_online_healthy():
+    app = _make_app(ping={_WORKER: {"ok": "pong"}})
+    probe = CeleryProbe(app)
+
+    result = await probe.check()
+
+    assert result.status == ProbeStatus.HEALTHY
+    assert result.details["workers_online"] == 1
+    assert result.details["workers"] == [_WORKER]
+
+
+@pytest.mark.asyncio
+async def test_ping_only_does_not_call_detailed_inspectors():
+    app = _make_app(ping={_WORKER: {"ok": "pong"}})
+    inspector = app.control.inspect.return_value
+    probe = CeleryProbe(app)
+
+    await probe.check()
+
+    inspector.active.assert_not_called()
+    inspector.reserved.assert_not_called()
+    inspector.scheduled.assert_not_called()
+    inspector.registered.assert_not_called()
+    inspector.stats.assert_not_called()
+    inspector.active_queues.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fewer_workers_than_required_ping_only():
+    app = _make_app(ping={_WORKER: {"ok": "pong"}})
     probe = CeleryProbe(app, min_workers=3)
 
     result = await probe.check()
@@ -154,15 +178,28 @@ async def test_fewer_workers_than_required():
     assert result.status == ProbeStatus.UNHEALTHY
     assert "1 worker(s) online" in result.error
     assert "expected at least 3" in result.error
-    assert result.details["workers_online"] == 1
+
+
+@pytest.mark.asyncio
+async def test_multiple_workers_ping_only():
+    worker2 = "celery@host2"
+    app = _make_app(ping={_WORKER: {"ok": "pong"}, worker2: {"ok": "pong"}})
+    probe = CeleryProbe(app, min_workers=2)
+
+    result = await probe.check()
+
+    assert result.status == ProbeStatus.HEALTHY
+    assert result.details["workers_online"] == 2
+    assert _WORKER in result.details["workers"]
+    assert worker2 in result.details["workers"]
 
 
 # ---------------------------------------------------------------------------
-# Workers online — healthy
+# Detailed inspection (detailed=True)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_workers_online_healthy():
+async def test_detailed_workers_online_healthy():
     app = _make_app(
         ping={_WORKER: {"ok": "pong"}},
         active={_WORKER: [_ACTIVE_TASK]},
@@ -172,12 +209,11 @@ async def test_workers_online_healthy():
         stats={_WORKER: _STATS},
         active_queues={_WORKER: _QUEUES},
     )
-    probe = CeleryProbe(app)
+    probe = CeleryProbe(app, detailed=True)
 
     result = await probe.check()
 
     assert result.status == ProbeStatus.HEALTHY
-    assert result.error is None
     assert result.details["workers_online"] == 1
 
     w = result.details["workers"][_WORKER]
@@ -193,7 +229,31 @@ async def test_workers_online_healthy():
 
 
 @pytest.mark.asyncio
-async def test_registered_tasks_sorted():
+async def test_detailed_calls_all_inspectors():
+    app = _make_app(
+        ping={_WORKER: {"ok": "pong"}},
+        active={_WORKER: []},
+        reserved={_WORKER: []},
+        scheduled={_WORKER: []},
+        registered={_WORKER: []},
+        stats={_WORKER: _STATS},
+        active_queues={_WORKER: _QUEUES},
+    )
+    inspector = app.control.inspect.return_value
+    probe = CeleryProbe(app, detailed=True)
+
+    await probe.check()
+
+    inspector.active.assert_called_once()
+    inspector.reserved.assert_called_once()
+    inspector.scheduled.assert_called_once()
+    inspector.registered.assert_called_once()
+    inspector.stats.assert_called_once()
+    inspector.active_queues.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_detailed_registered_tasks_sorted():
     app = _make_app(
         ping={_WORKER: {"ok": "pong"}},
         active={_WORKER: []},
@@ -203,7 +263,7 @@ async def test_registered_tasks_sorted():
         stats={_WORKER: _STATS},
         active_queues={_WORKER: _QUEUES},
     )
-    probe = CeleryProbe(app)
+    probe = CeleryProbe(app, detailed=True)
     result = await probe.check()
 
     tasks = result.details["workers"][_WORKER]["registered_tasks"]
@@ -211,7 +271,7 @@ async def test_registered_tasks_sorted():
 
 
 @pytest.mark.asyncio
-async def test_active_tasks_cleaned():
+async def test_detailed_active_tasks_cleaned():
     app = _make_app(
         ping={_WORKER: {"ok": "pong"}},
         active={_WORKER: [_ACTIVE_TASK]},
@@ -221,7 +281,7 @@ async def test_active_tasks_cleaned():
         stats={_WORKER: _STATS},
         active_queues={_WORKER: _QUEUES},
     )
-    probe = CeleryProbe(app)
+    probe = CeleryProbe(app, detailed=True)
     result = await probe.check()
 
     active = result.details["workers"][_WORKER]["active"]
@@ -230,37 +290,8 @@ async def test_active_tasks_cleaned():
     assert active[0]["id"] == "abc-123"
 
 
-# ---------------------------------------------------------------------------
-# Multiple workers
-# ---------------------------------------------------------------------------
-
 @pytest.mark.asyncio
-async def test_multiple_workers_all_reported():
-    worker2 = "celery@host2"
-    app = _make_app(
-        ping={_WORKER: {"ok": "pong"}, worker2: {"ok": "pong"}},
-        active={_WORKER: [], worker2: []},
-        reserved={_WORKER: [], worker2: []},
-        scheduled={_WORKER: [], worker2: []},
-        registered={_WORKER: [], worker2: []},
-        stats={_WORKER: _STATS, worker2: _STATS},
-        active_queues={_WORKER: _QUEUES, worker2: _QUEUES},
-    )
-    probe = CeleryProbe(app, min_workers=2)
-    result = await probe.check()
-
-    assert result.status == ProbeStatus.HEALTHY
-    assert result.details["workers_online"] == 2
-    assert _WORKER in result.details["workers"]
-    assert worker2 in result.details["workers"]
-
-
-# ---------------------------------------------------------------------------
-# Inspect returns None for some calls
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_none_inspect_results_handled_gracefully():
+async def test_detailed_none_inspect_results_handled_gracefully():
     app = _make_app(
         ping={_WORKER: {"ok": "pong"}},
         active=None,
@@ -270,7 +301,7 @@ async def test_none_inspect_results_handled_gracefully():
         stats=None,
         active_queues=None,
     )
-    probe = CeleryProbe(app)
+    probe = CeleryProbe(app, detailed=True)
     result = await probe.check()
 
     assert result.status == ProbeStatus.HEALTHY
@@ -314,6 +345,11 @@ def test_custom_name():
 def test_default_min_workers():
     probe = CeleryProbe(MagicMock())
     assert probe.min_workers == 0
+
+
+def test_default_detailed_false():
+    probe = CeleryProbe(MagicMock())
+    assert probe.detailed is False
 
 
 @pytest.mark.asyncio
