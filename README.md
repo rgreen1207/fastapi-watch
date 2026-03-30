@@ -105,7 +105,6 @@ pip install "fastapi-watch[memcached]"    # Memcached         (aiomcache)
 pip install "fastapi-watch[rabbitmq]"     # RabbitMQ          (aio-pika + aiohttp)
 pip install "fastapi-watch[kafka]"        # Kafka             (aiokafka)
 pip install "fastapi-watch[mongo]"        # MongoDB           (motor)
-pip install "fastapi-watch[http]"         # HTTP endpoint     (aiohttp)
 pip install "fastapi-watch[celery]"       # Celery workers    (celery)
 
 # Or pull everything in one shot
@@ -2316,79 +2315,58 @@ registry.add(MongoProbe(url="mongodb://localhost:27017"))
 
 ---
 
-### Watching an HTTP endpoint
+### Watching outgoing HTTP calls
 
-```bash
-pip install "fastapi-watch[http]"
-```
-
-`HttpProbe` performs an HTTP request against an upstream URL and checks the response status code. All standard HTTP methods are supported, so you can probe read and write endpoints alike.
+`HttpProbe` passively observes outgoing HTTP calls your app makes to external services. Rather than making its own synthetic requests (which would burn API credits or trip rate limits), it instruments the functions in your code via the `@probe.watch` decorator — recording latency and errors from real traffic only.
 
 ```python
 from fastapi_watch.probes import HttpProbe
 
-# GET (default) — simple health check
-registry.add(HttpProbe(url="https://api.upstream.com/health"))
+stripe_probe = HttpProbe(name="stripe", max_error_rate=0.05, max_avg_rtt_ms=500)
 
-# POST — probe a write endpoint, expect 201
-registry.add(HttpProbe(
-    url="https://api.example.com/items",
-    method="POST",
-    json={"name": "probe-test"},
-    expected_status=201,
-    name="items-write",
-))
+@stripe_probe.watch
+async def charge_customer(amount: int, currency: str) -> dict:
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://api.stripe.com/v1/charges",
+            json={"amount": amount, "currency": currency},
+        ) as response:
+            response.raise_for_status()
+            return await response.json()
 
-# PUT — probe a replace endpoint
-registry.add(HttpProbe(
-    url="https://api.example.com/items/probe-test",
-    method="PUT",
-    json={"name": "probe-test", "active": True},
-    name="items-replace",
-))
-
-# PATCH — probe a partial-update endpoint
-registry.add(HttpProbe(
-    url="https://api.example.com/items/probe-test",
-    method="PATCH",
-    json={"active": False},
-    name="items-update",
-))
-
-# DELETE — probe a delete endpoint, expect 204
-registry.add(HttpProbe(
-    url="https://api.example.com/items/probe-test",
-    method="DELETE",
-    headers={"Authorization": "Bearer <token>"},
-    expected_status=204,
-    name="items-delete",
-))
+registry.add(stripe_probe)
 ```
+
+Every call to `charge_customer` is silently timed. If it raises an exception it is counted as an error. The exception still propagates normally — the probe never interferes with your code's behaviour.
+
+Works with both `async def` and `def` functions, and any HTTP library.
 
 **Details returned:**
 
 ```json
 {
-  "method": "POST",
-  "status_code": 201,
-  "content_type": "application/json",
-  "response_bytes": 43
+  "call_count": 142,
+  "error_count": 3,
+  "error_rate": 0.0211,
+  "consecutive_errors": 0,
+  "last_rtt_ms": 87.4,
+  "avg_rtt_ms": 91.2,
+  "p95_rtt_ms": 143.7,
+  "min_rtt_ms": 61.0,
+  "max_rtt_ms": 312.5
 }
 ```
-
-`details` is populated for both healthy and unhealthy responses so you can see what status code an upstream actually returned.
 
 **Constructor arguments:**
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `url` | required | URL to request |
-| `method` | `"GET"` | HTTP method: `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS` |
-| `json` | `None` | JSON body sent with the request (ignored for `GET`, `HEAD`, `OPTIONS`) |
-| `headers` | `None` | Dict of HTTP headers to include |
-| `timeout` | `5.0` | Request timeout in seconds |
-| `name` | URL host | Probe label |
-| `expected_status` | `200` | HTTP status code considered healthy |
+| `name` | `"http"` | Probe label |
+| `max_error_rate` | `0.1` | Error-rate threshold above which the probe is UNHEALTHY (0–1) |
+| `max_avg_rtt_ms` | `None` | Average-RTT threshold in milliseconds. `None` disables it |
+| `window_size` | `100` | Number of recent calls used for percentile calculations |
+| `ema_alpha` | `0.1` | Smoothing factor for the exponential moving average (0–1) |
+| `poll_interval_ms` | `None` | Per-probe poll interval override |
 
 ---
 
@@ -2565,7 +2543,7 @@ registry.add(SqlAlchemyProbe(engine=engine, name="primary-db"))
 
 | Probe | Extra | Key constructor args | Details fields |
 |-------|-------|---------------------|----------------|
-| `HttpProbe` | `http` | `url`, `method`, `json`, `headers`, `timeout`, `name`, `expected_status` | `method`, `status_code`, `content_type`, `response_bytes` |
+| `HttpProbe` | built-in | `name`, `max_error_rate`, `max_avg_rtt_ms`, `window_size`, `ema_alpha` | `call_count`, `error_count`, `error_rate`, `consecutive_errors`, `last_rtt_ms`, `avg_rtt_ms`, `p95_rtt_ms`, `min_rtt_ms`, `max_rtt_ms` |
 
 #### Testing / placeholder
 
