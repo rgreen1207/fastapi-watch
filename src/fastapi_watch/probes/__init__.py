@@ -12,20 +12,30 @@ from .mongo import MongoProbe
 from .memcached import MemcachedProbe
 from .kafka import KafkaProbe
 from .http import HttpProbe
+from .event_loop import EventLoopProbe
+from .disk import DiskProbe
+from .tcp import TCPProbe
+from .smtp import SMTPProbe
+from .threshold import ThresholdProbe
 
 __all__ = [
     "BaseProbe",
     "CeleryProbe",
-    "MemoryProbe",
-    "SqlAlchemyProbe",
-    "PostgreSQLProbe",
-    "MySQLProbe",
-    "RedisProbe",
-    "MemcachedProbe",
-    "RabbitMQProbe",
-    "KafkaProbe",
-    "MongoProbe",
+    "DiskProbe",
+    "EventLoopProbe",
     "HttpProbe",
+    "KafkaProbe",
+    "MemcachedProbe",
+    "MemoryProbe",
+    "MongoProbe",
+    "MySQLProbe",
+    "PostgreSQLProbe",
+    "RabbitMQProbe",
+    "RedisProbe",
     "RouteProbe",
+    "SMTPProbe",
+    "SqlAlchemyProbe",
+    "TCPProbe",
+    "ThresholdProbe",
     "WebSocketProbe",
 ]

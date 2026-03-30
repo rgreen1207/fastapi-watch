@@ -61,11 +61,11 @@ def test_render_healthy_report_shows_all_systems_operational():
     assert "All Systems Operational" in html
 
 
-def test_render_unhealthy_report_shows_service_degraded():
+def test_render_unhealthy_report_shows_unhealthy():
     probes = [ProbeResult(name="db", status=ProbeStatus.UNHEALTHY, error="down")]
     report = _make_report(probes)
     html = render_dashboard(report, stream_url="/health/status/stream")
-    assert "Service Degraded" in html
+    assert "Unhealthy" in html
 
 
 def test_render_healthy_header_class():

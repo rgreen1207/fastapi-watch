@@ -14,6 +14,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 
 from .dashboard import render_dashboard
 from .models import HealthReport, ProbeResult, ProbeStatus
+from .prometheus import render_prometheus
 from .probe_router import ProbeRouter
 from .probes.base import BaseProbe
 
@@ -209,6 +210,10 @@ class HealthRegistry:
         self._circuit_cooldown_ms: int = circuit_breaker_cooldown_ms
         self._circuit_open_until: dict[str, float] = {}
         self._circuit_err_count: dict[str, int] = {}
+        self._circuit_trips: dict[str, int] = {}  # lifetime trip count per probe
+
+        # Maintenance mode
+        self._maintenance_until: datetime | None = None
 
         # Webhook
         self._webhook_url: str | None = webhook_url
@@ -265,6 +270,33 @@ class HealthRegistry:
         """
         self._started = True
         return self
+
+    def set_maintenance(self, until: datetime | None = None) -> "HealthRegistry":
+        """Enter maintenance mode.
+
+        While active, ``GET /health/ready`` returns ``200 {"status": "maintenance"}``
+        and state-change webhooks are suppressed.  The dashboard shows a
+        maintenance banner.
+
+        Args:
+            until: When maintenance ends.  ``None`` means indefinite —
+                call :meth:`clear_maintenance` to exit.
+
+        Returns ``self`` for chaining.
+        """
+        self._maintenance_until = until
+        return self
+
+    def clear_maintenance(self) -> "HealthRegistry":
+        """Exit maintenance mode immediately. Returns ``self`` for chaining."""
+        self._maintenance_until = None
+        return self
+
+    def _in_maintenance(self) -> bool:
+        """Return True if the registry is currently in maintenance mode."""
+        if self._maintenance_until is None:
+            return False
+        return datetime.now(self._tzinfo) < self._maintenance_until
 
     def on_state_change(
         self,
@@ -329,16 +361,21 @@ class HealthRegistry:
         if self._circuit_breaker_enabled:
             open_until = self._circuit_open_until.get(probe.name, 0.0)
             if loop.time() < open_until:
+                cb_info = {
+                    "open": True,
+                    "consecutive_failures": self._circuit_err_count.get(probe.name, 0),
+                    "trips_total": self._circuit_trips.get(probe.name, 0),
+                }
                 cached = self._probe_cache.get(probe.name)
                 if cached is not None:
-                    details = {**(cached.details or {}), "circuit_breaker_open": True}
+                    details = {**(cached.details or {}), "circuit_breaker": cb_info}
                     return cached.model_copy(update={"critical": critical, "details": details})
                 return ProbeResult(
                     name=probe.name,
                     status=ProbeStatus.UNHEALTHY,
                     critical=critical,
                     error="circuit breaker open — probe temporarily suspended",
-                    details={"circuit_breaker_open": True},
+                    details={"circuit_breaker": cb_info},
                 )
 
         # Run the probe
@@ -366,7 +403,8 @@ class HealthRegistry:
 
         # Update circuit breaker state
         if self._circuit_breaker_enabled:
-            if result.is_healthy:
+            if result.is_passing:
+                # HEALTHY or DEGRADED — probe is responding; reset failure count
                 self._circuit_err_count.pop(probe.name, None)
                 self._circuit_open_until.pop(probe.name, None)
             else:
@@ -384,6 +422,7 @@ class HealthRegistry:
                 self._circuit_err_count[probe.name] = count
                 if count >= threshold:
                     self._circuit_open_until[probe.name] = loop.time() + cooldown_ms / 1000
+                    self._circuit_trips[probe.name] = self._circuit_trips.get(probe.name, 0) + 1
                     if self._logger:
                         self._logger.warning(
                             "Probe %r circuit opened after %d failures; "
@@ -392,6 +431,17 @@ class HealthRegistry:
                             count,
                             cooldown_ms / 1000,
                         )
+
+            # Inject circuit breaker stats into result details
+            cb_info = {
+                "open": probe.name in self._circuit_open_until
+                        and loop.time() < self._circuit_open_until.get(probe.name, 0.0),
+                "consecutive_failures": self._circuit_err_count.get(probe.name, 0),
+                "trips_total": self._circuit_trips.get(probe.name, 0),
+            }
+            result = result.model_copy(
+                update={"details": {**(result.details or {}), "circuit_breaker": cb_info}}
+            )
 
         return result
 
@@ -535,6 +585,7 @@ class HealthRegistry:
                 self._probe_states[r.name] = r.status
             return
 
+        in_maintenance = self._in_maintenance()
         for result in results:
             old = self._probe_states.get(result.name)
             self._probe_states[result.name] = result.status
@@ -543,7 +594,7 @@ class HealthRegistry:
                     ret = cb(result.name, old, result.status)
                     if asyncio.iscoroutine(ret):
                         await ret
-                if self._webhook_url is not None:
+                if self._webhook_url is not None and not in_maintenance:
                     asyncio.create_task(
                         self._post_webhook(result.name, old, result.status)
                     )
@@ -618,6 +669,8 @@ class HealthRegistry:
             dependencies=auth_deps,
         )
         async def readiness() -> Response:
+            if registry._in_maintenance():
+                return JSONResponse({"status": "maintenance"}, status_code=200)
             if registry._in_grace_period():
                 return JSONResponse({"status": "starting"}, status_code=503)
             results = await registry._get_results()
@@ -626,7 +679,9 @@ class HealthRegistry:
                 checked_at=registry._last_checked_at,
                 timezone=registry._timezone_name,
             )
-            code = 200 if report.status == ProbeStatus.HEALTHY else 503
+            # HEALTHY and DEGRADED both return 200 — traffic still flows.
+            # Only UNHEALTHY causes 503.
+            code = 503 if report.status == ProbeStatus.UNHEALTHY else 200
             return Response(
                 content=report.model_dump_json(),
                 status_code=code,
@@ -685,7 +740,7 @@ class HealthRegistry:
                 results = list(
                     await asyncio.gather(*(p.check() for p in registry._startup_probes))
                 )
-                if not all(r.is_healthy for r in results):
+                if not all(r.is_passing for r in results):
                     report = HealthReport.from_results(results)
                     return Response(
                         content=report.model_dump_json(),
@@ -722,14 +777,36 @@ class HealthRegistry:
                 headers=sse_headers,
             )
 
+        @self.app.get(
+            f"{prefix}/metrics",
+            tags=tags,
+            summary="Prometheus metrics",
+            description=(
+                "Probe health exported in Prometheus text format 0.0.4.  "
+                "Scraped by Prometheus or any compatible agent without extra deps."
+            ),
+            dependencies=auth_deps,
+        )
+        async def prometheus_metrics() -> Response:
+            results = await registry._get_results()
+            trips = registry._circuit_trips if registry._circuit_breaker_enabled else {}
+            return Response(
+                content=render_prometheus(results, trips),
+                media_type="text/plain; version=0.0.4; charset=utf-8",
+            )
+
         if dashboard is not False:
             if callable(dashboard):
                 _renderer: Callable[..., str] = dashboard
             else:
                 _stream_url = f"{prefix}/status/stream"
 
-                def _renderer(report: HealthReport) -> str:
-                    return render_dashboard(report, stream_url=_stream_url)
+                def _renderer(report: HealthReport, maintenance: bool = False) -> str:
+                    return render_dashboard(
+                        report,
+                        stream_url=_stream_url,
+                        maintenance_banner=maintenance,
+                    )
 
             @self.app.get(
                 f"{prefix}/dashboard",
@@ -746,4 +823,4 @@ class HealthRegistry:
                     checked_at=registry._last_checked_at,
                     timezone=registry._timezone_name,
                 )
-                return HTMLResponse(content=_renderer(report))
+                return HTMLResponse(content=_renderer(report, registry._in_maintenance()))
