@@ -63,6 +63,7 @@ Open `/health/dashboard` for a live HTML page that shows all probe results, upda
 - [Built-in probes](#built-in-probes)
   - [App-wide request metrics probe](#app-wide-request-metrics-probe)
   - [Watching a FastAPI route](#watching-a-fastapi-route)
+  - [Watching a WebSocket handler](#watching-a-websocket-handler)
   - [Event loop lag](#event-loop-lag)
   - [Disk space](#disk-space)
   - [TCP / DNS reachability](#tcp--dns-reachability)
@@ -1605,6 +1606,104 @@ registry = HealthRegistry(app, routers=[users_health_router])
 
 ---
 
+### Watching a WebSocket handler
+
+`WebSocketProbe` is a passive observer — it instruments a WebSocket handler using the `@probe.watch` decorator and collects real-traffic statistics on every connection without making synthetic connections.
+
+No extra install required. `WebSocketProbe` is included in the base package.
+
+```python
+from fastapi import FastAPI, WebSocket
+from fastapi_watch import HealthRegistry, WebSocketProbe
+
+app = FastAPI()
+
+chat_probe = WebSocketProbe(name="chat", max_error_rate=0.05)
+
+@app.websocket("/ws/chat")
+@chat_probe.watch
+async def chat(websocket: WebSocket):
+    await websocket.accept()
+    while True:
+        msg = await websocket.receive_text()
+        await websocket.send_text(msg)
+
+registry = HealthRegistry(app)
+registry.add(chat_probe)
+```
+
+The `@watch` decorator injects a transparent proxy around the real `WebSocket` object. The proxy counts every `receive_*` and `send_*` call; all other WebSocket behaviour (`accept`, `close`, headers, state, etc.) is forwarded to the underlying socket unchanged.
+
+`WebSocketDisconnect` is treated as a normal close and is never counted as an error. Any other unhandled exception increments `error_count`.
+
+#### Metrics collected
+
+| Metric | Description |
+|--------|-------------|
+| `active_connections` | Sockets currently open |
+| `total_connections` | All connections since the probe was created |
+| `messages_received` | Total messages received across all connections |
+| `messages_sent` | Total messages sent across all connections |
+| `error_count` | Connections that closed due to an unhandled exception |
+| `error_rate` | `error_count / total_connections` |
+| `consecutive_errors` | Unbroken run of error closes; resets to 0 on any clean close |
+| `avg_duration_ms` | Exponential moving average of connection lifetimes |
+| `min_duration_ms` / `max_duration_ms` | All-time connection duration bounds |
+
+#### Health thresholds
+
+- **`max_error_rate`** (default `0.1`) — UNHEALTHY if more than 10 % of connections close with an error.
+- **`min_active_connections`** (default `0`, disabled) — UNHEALTHY if fewer than N sockets are open at check time. Useful for services that maintain persistent connections (live dashboards, data feeds).
+
+```python
+WebSocketProbe(
+    name="feed",
+    max_error_rate=0.01,          # fail if >1% of connections error
+    min_active_connections=5,     # fail if fewer than 5 sockets are open
+)
+```
+
+#### Example probe result
+
+```json
+{
+  "name": "chat",
+  "status": "healthy",
+  "critical": true,
+  "latency_ms": 312.5,
+  "error": null,
+  "details": {
+    "active_connections": 14,
+    "total_connections": 502,
+    "messages_received": 18340,
+    "messages_sent": 18290,
+    "error_count": 2,
+    "error_rate": 0.004,
+    "consecutive_errors": 0,
+    "avg_duration_ms": 312.5,
+    "min_duration_ms": 0.8,
+    "max_duration_ms": 95412.1
+  }
+}
+```
+
+#### Before the first connection
+
+Until at least one connection has been handled, `WebSocketProbe.check()` returns `HEALTHY` with a `"no connections observed yet"` message in `details`.
+
+#### Constructor arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `name` | `"websocket"` | Probe label |
+| `max_error_rate` | `0.1` | Error-rate threshold (0–1) above which the probe is UNHEALTHY |
+| `min_active_connections` | `0` | Minimum open sockets required. `0` disables the check |
+| `window_size` | `100` | Number of recent connection durations kept for EMA calculations |
+| `ema_alpha` | `0.1` | EMA smoothing factor (0–1). Higher = reacts faster to changes |
+| `timeout` | `None` | Passed to the registry for the `check()` call; not used internally |
+
+---
+
 ### Event loop lag
 
 `EventLoopProbe` measures how long the asyncio event loop was blocked by scheduling a zero-delay coroutine (`asyncio.sleep(0)`) and timing how long it actually takes to resume. A lag spike means CPU-bound work or slow synchronous calls are blocking the loop.
@@ -1662,7 +1761,7 @@ registry.add(DiskProbe(
   "total_gb": 500.1,
   "used_gb": 423.5,
   "free_gb": 76.6,
-  "used_percent": 84.7
+  "percent_used": 84.7
 }
 ```
 
@@ -1724,13 +1823,13 @@ from fastapi_watch.probes import SMTPProbe
 registry.add(SMTPProbe(host="smtp.internal", port=25))
 
 # With STARTTLS
-registry.add(SMTPProbe(host="smtp.gmail.com", port=587, starttls=True))
+registry.add(SMTPProbe(host="smtp.gmail.com", port=587, use_tls=True))
 
 # With STARTTLS and authentication
 registry.add(SMTPProbe(
     host="smtp.sendgrid.net",
     port=587,
-    starttls=True,
+    use_tls=True,
     username="apikey",
     password="SG.xxxxx",
     name="sendgrid",
@@ -1756,7 +1855,7 @@ registry.add(SMTPProbe(
 | `host` | required | SMTP server hostname |
 | `port` | `25` | SMTP port |
 | `timeout` | `5.0` | Connection + handshake timeout in seconds |
-| `starttls` | `False` | Upgrade to TLS with STARTTLS after EHLO |
+| `use_tls` | `False` | Upgrade to TLS with STARTTLS after EHLO |
 | `username` | `None` | SMTP auth username. `None` skips authentication |
 | `password` | `None` | SMTP auth password |
 | `name` | `"smtp"` | Probe label |
@@ -2362,10 +2461,11 @@ registry.add(SqlAlchemyProbe(engine=engine, name="primary-db"))
 |-------|-------|---------------------|----------------|
 | `RequestMetricsMiddleware` + `RequestMetricsProbe` | built-in | `per_route`, `max_error_rate`, `max_avg_rtt_ms` | `request_count`, `error_count`, `error_rate`, `avg_rtt_ms`, `consecutive_errors`; + `routes` dict when `per_route=True` |
 | `RouteProbe` | built-in | `name`, `max_error_rate`, `max_avg_rtt_ms`, `window_size`, `ema_alpha` | `request_count`, `error_count`, `error_rate`, `consecutive_errors`, `last_status_code`, `last_rtt_ms`, `avg_rtt_ms`, `p95_rtt_ms`, `min_rtt_ms`, `max_rtt_ms`, `requests_per_minute` |
+| `WebSocketProbe` | built-in | `name`, `max_error_rate`, `min_active_connections`, `window_size`, `ema_alpha` | `active_connections`, `total_connections`, `messages_received`, `messages_sent`, `error_count`, `error_rate`, `consecutive_errors`, `avg_duration_ms`, `min_duration_ms`, `max_duration_ms` |
 | `EventLoopProbe` | built-in | `name`, `warn_ms`, `fail_ms` | `lag_ms` |
-| `DiskProbe` | built-in | `path`, `warn_percent`, `fail_percent`, `name` | `path`, `total_gb`, `used_gb`, `free_gb`, `used_percent` |
+| `DiskProbe` | built-in | `path`, `warn_percent`, `fail_percent`, `name` | `path`, `total_gb`, `used_gb`, `free_gb`, `percent_used` |
 | `TCPProbe` | built-in | `host`, `port`, `timeout`, `name` | `host`, `port`, `resolved_ip` |
-| `SMTPProbe` | built-in | `host`, `port`, `timeout`, `starttls`, `username`, `password`, `name` | `host`, `port`, `banner`, `tls`, `extensions` |
+| `SMTPProbe` | built-in | `host`, `port`, `timeout`, `use_tls`, `username`, `password`, `name` | `host`, `port`, `banner`, `tls`, `extensions` |
 | `ThresholdProbe` | built-in | `probe`, `name`, `warn_if`, `fail_if` | (delegates to inner probe) |
 
 #### Databases
