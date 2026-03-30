@@ -77,13 +77,11 @@ class PassiveProbe(BaseProbe):
         max_avg_rtt_ms: float | None = None,
         window_size: int = 100,
         ema_alpha: float = 0.1,
-        poll_interval_ms: int | None = None,
     ) -> None:
         self.name = name
         self.max_error_rate = max_error_rate
         self.max_avg_rtt_ms = max_avg_rtt_ms
         self.ema_alpha = ema_alpha
-        self.poll_interval_ms = poll_interval_ms
 
         self._lock = threading.Lock()
         self._call_count: int = 0

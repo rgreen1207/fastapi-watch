@@ -498,19 +498,21 @@ This means your GET endpoints are fast under all conditions, regardless of wheth
 
 ## Per-probe poll frequency
 
-By default every probe uses the registry's `poll_interval_ms`. Set `poll_interval_ms` on any probe to override this for that probe only. Probes with their own interval run on their own schedule — a slow probe doesn't delay fast ones.
+By default every probe uses the registry's `poll_interval_ms`. Set `poll_interval_ms` on any active probe to override this for that probe only. Probes with their own interval run on their own schedule — a slow probe doesn't delay fast ones.
+
+**Passive probes** (`HttpProbe`, `SMTPProbe`, `RedisProbe`, `PostgreSQLProbe`, `MySQLProbe`, `SqlAlchemyProbe`, `MongoProbe`, `FastAPIRouteProbe`, `FastAPIWebSocketProbe`) do not accept `poll_interval_ms` — their `check()` only reads in-memory stats so they always use the registry default, which is fine since no external calls are made.
 
 ```python
 registry = HealthRegistry(app, poll_interval_ms=60_000)  # global: every 60 s
 
-registry.add(PostgreSQLProbe(url="postgresql://...", poll_interval_ms=30_000))  # every 30 s
-registry.add(RedisProbe(url="redis://...", poll_interval_ms=10_000))            # every 10 s
-registry.add(NoOpProbe())                                                        # uses global: 60 s
+registry.add(TCPProbe("db.internal", 5432, poll_interval_ms=30_000))  # every 30 s
+registry.add(KafkaProbe("broker:9092", poll_interval_ms=10_000))      # every 10 s
+registry.add(NoOpProbe())                                              # uses global: 60 s
 ```
 
 The minimum enforced interval is 1000 ms — lower values are clamped. Pass `poll_interval_ms=None` on the probe to explicitly use the registry default. Probes without a custom interval are always in sync with the registry-level setting.
 
-All built-in probes expose `poll_interval_ms` as a constructor argument. Custom probes inherit the attribute from `BaseProbe`:
+Active probes expose `poll_interval_ms` as a constructor argument. Custom probes inherit the attribute from `BaseProbe`:
 
 ```python
 class MyServiceProbe(BaseProbe):
@@ -1890,7 +1892,6 @@ Every call to `send_welcome_email` is silently timed. Exceptions are counted as 
 | `max_avg_rtt_ms` | `None` | Average-RTT threshold in milliseconds. `None` disables it |
 | `window_size` | `100` | Number of recent calls used for percentile calculations |
 | `ema_alpha` | `0.1` | Smoothing factor for the exponential moving average (0–1) |
-| `poll_interval_ms` | `None` | Uses registry default |
 
 ---
 
@@ -2364,7 +2365,6 @@ Works with both `async def` and `def` functions, and any HTTP library.
 | `max_avg_rtt_ms` | `None` | Average-RTT threshold in milliseconds. `None` disables it |
 | `window_size` | `100` | Number of recent calls used for percentile calculations |
 | `ema_alpha` | `0.1` | Smoothing factor for the exponential moving average (0–1) |
-| `poll_interval_ms` | `None` | Per-probe poll interval override |
 
 ---
 
