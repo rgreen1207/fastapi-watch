@@ -4,8 +4,6 @@ Add :class:`RequestMetricsMiddleware` to your FastAPI app and pass it to
 :class:`RequestMetricsProbe` to get automatic, app-wide request telemetry
 without decorating individual routes.
 """
-from __future__ import annotations
-
 import threading
 import time
 from collections import deque
