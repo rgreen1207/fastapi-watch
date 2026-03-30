@@ -5,7 +5,7 @@ from collections import deque
 from typing import Any, Callable
 
 from ..models import ProbeResult, ProbeStatus
-from .base import BaseProbe
+from .base import BaseProbe, _update_ema
 
 
 def _find_ws_param(func: Callable) -> str | None:
@@ -188,18 +188,9 @@ class WebSocketProbe(BaseProbe):
         else:
             self._consecutive_errors = 0
 
-        if self._avg_duration_ms is None:
-            self._avg_duration_ms = duration_ms
-        else:
-            self._avg_duration_ms = (
-                self.ema_alpha * duration_ms
-                + (1 - self.ema_alpha) * self._avg_duration_ms
-            )
-
-        if self._min_duration_ms is None or duration_ms < self._min_duration_ms:
-            self._min_duration_ms = duration_ms
-        if self._max_duration_ms is None or duration_ms > self._max_duration_ms:
-            self._max_duration_ms = duration_ms
+        self._avg_duration_ms = _update_ema(self._avg_duration_ms, duration_ms, self.ema_alpha)
+        self._min_duration_ms = duration_ms if self._min_duration_ms is None else min(self._min_duration_ms, duration_ms)
+        self._max_duration_ms = duration_ms if self._max_duration_ms is None else max(self._max_duration_ms, duration_ms)
 
         self._duration_window.append(duration_ms)
 

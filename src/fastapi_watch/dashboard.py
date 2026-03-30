@@ -458,20 +458,33 @@ _JS = r"""
 """
 
 # ---------------------------------------------------------------------------
+# Status label / badge lookups
+# ---------------------------------------------------------------------------
+
+_STATUS_LABEL = {
+    ProbeStatus.HEALTHY: "Healthy",
+    ProbeStatus.DEGRADED: "Degraded",
+    ProbeStatus.UNHEALTHY: "Unhealthy",
+}
+_STATUS_BADGE_CLS = {
+    ProbeStatus.HEALTHY: "badge-healthy",
+    ProbeStatus.DEGRADED: "badge-degraded",
+    ProbeStatus.UNHEALTHY: "badge-unhealthy",
+}
+_STATUS_TEXT = {
+    ProbeStatus.HEALTHY: ("All Systems Operational", "All probes are passing."),
+    ProbeStatus.DEGRADED: ("Degraded", "One or more probes are warning."),
+    ProbeStatus.UNHEALTHY: ("Unhealthy", "One or more probes are failing."),
+}
+
+# ---------------------------------------------------------------------------
 # Per-probe card renderer
 # ---------------------------------------------------------------------------
 
 def _probe_card(probe: ProbeResult) -> str:
     status_cls = probe.status.value  # "healthy" | "degraded" | "unhealthy"
-    if probe.status == ProbeStatus.HEALTHY:
-        status_label = "Healthy"
-        badge_cls = "badge-healthy"
-    elif probe.status == ProbeStatus.DEGRADED:
-        status_label = "Degraded"
-        badge_cls = "badge-degraded"
-    else:
-        status_label = "Unhealthy"
-        badge_cls = "badge-unhealthy"
+    status_label = _STATUS_LABEL[probe.status]
+    badge_cls = _STATUS_BADGE_CLS[probe.status]
 
     latency = f"{probe.latency_ms:.2f} ms" if probe.latency_ms else "—"
 
@@ -488,24 +501,15 @@ def _probe_card(probe: ProbeResult) -> str:
         f'<div class="probe-error"{error_style}>{_e(probe.error or "")}</div>'
     )
 
-    # Details table rows
-    detail_rows = ""
-    if probe.details:
-        for k, v in probe.details.items():
-            if v is None:
-                continue
-            detail_rows += (
-                f"<tr>"
-                f"<td>{_fmt_detail_key(k)}</td>"
-                f"<td>{_fmt_detail_value(k, v)}</td>"
-                f"</tr>"
-            )
-
     details_html = ""
-    if detail_rows:
-        details_html = (
-            f'<table class="details-table"><tbody>{detail_rows}</tbody></table>'
+    if probe.details:
+        rows = "".join(
+            f"<tr><td>{_fmt_detail_key(k)}</td><td>{_fmt_detail_value(k, v)}</td></tr>"
+            for k, v in probe.details.items()
+            if v is not None
         )
+        if rows:
+            details_html = f'<table class="details-table"><tbody>{rows}</tbody></table>'
 
     return (
         f'<div class="probe-card {status_cls}" data-probe="{_e(probe.name)}">'
@@ -532,15 +536,7 @@ def render_dashboard(
     maintenance_banner: bool = False,
 ) -> str:
     header_cls = report.status.value  # "healthy" | "degraded" | "unhealthy"
-    if report.status == ProbeStatus.HEALTHY:
-        status_text = "All Systems Operational"
-        status_subtitle = "All probes are passing."
-    elif report.status == ProbeStatus.DEGRADED:
-        status_text = "Degraded"
-        status_subtitle = "One or more probes are warning."
-    else:
-        status_text = "Unhealthy"
-        status_subtitle = "One or more probes are failing."
+    status_text, status_subtitle = _STATUS_TEXT[report.status]
 
     if report.checked_at:
         tz = report.timezone or "UTC"

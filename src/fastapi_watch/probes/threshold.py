@@ -4,6 +4,14 @@ from ..models import ProbeResult, ProbeStatus
 from .base import BaseProbe
 
 
+def _safe_eval(fn: Callable[[dict], bool], details: dict) -> bool:
+    """Call *fn(details)*, returning False if it raises."""
+    try:
+        return bool(fn(details))
+    except Exception:
+        return False
+
+
 class ThresholdProbe(BaseProbe):
     """Wraps another probe and applies callable thresholds to its details.
 
@@ -65,24 +73,10 @@ class ThresholdProbe(BaseProbe):
 
         details = result.details or {}
 
-        if self.fail_if is not None:
-            try:
-                triggered = self.fail_if(details)
-            except Exception:
-                triggered = False
-            if triggered:
-                return result.model_copy(
-                    update={"name": self.name, "status": ProbeStatus.UNHEALTHY}
-                )
+        if self.fail_if is not None and _safe_eval(self.fail_if, details):
+            return result.model_copy(update={"name": self.name, "status": ProbeStatus.UNHEALTHY})
 
-        if self.warn_if is not None:
-            try:
-                triggered = self.warn_if(details)
-            except Exception:
-                triggered = False
-            if triggered:
-                return result.model_copy(
-                    update={"name": self.name, "status": ProbeStatus.DEGRADED}
-                )
+        if self.warn_if is not None and _safe_eval(self.warn_if, details):
+            return result.model_copy(update={"name": self.name, "status": ProbeStatus.DEGRADED})
 
         return result.model_copy(update={"name": self.name})

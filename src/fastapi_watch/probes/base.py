@@ -1,6 +1,20 @@
 from abc import ABC, abstractmethod
+from collections import deque
 
 from ..models import ProbeResult
+
+
+def _update_ema(current: float | None, value: float, alpha: float) -> float:
+    """Return an updated exponential moving average."""
+    return value if current is None else alpha * value + (1 - alpha) * current
+
+
+def _calc_p95(window: deque) -> float | None:
+    """Return the 95th-percentile value from a deque, or None if empty."""
+    if not window:
+        return None
+    s = sorted(window)
+    return round(s[max(0, int(len(s) * 0.95) - 1)], 2)
 
 
 class BaseProbe(ABC):

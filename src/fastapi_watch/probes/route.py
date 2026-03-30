@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from ..models import ProbeResult, ProbeStatus
-from .base import BaseProbe
+from .base import BaseProbe, _calc_p95, _update_ema
 
 
 class RouteProbe(BaseProbe):
@@ -104,16 +104,9 @@ class RouteProbe(BaseProbe):
             else:
                 self._consecutive_errors = 0
 
-            # Exponential moving average
-            if self._avg_rtt_ms is None:
-                self._avg_rtt_ms = rtt_ms
-            else:
-                self._avg_rtt_ms = self.ema_alpha * rtt_ms + (1 - self.ema_alpha) * self._avg_rtt_ms
-
-            if self._min_rtt_ms is None or rtt_ms < self._min_rtt_ms:
-                self._min_rtt_ms = rtt_ms
-            if self._max_rtt_ms is None or rtt_ms > self._max_rtt_ms:
-                self._max_rtt_ms = rtt_ms
+            self._avg_rtt_ms = _update_ema(self._avg_rtt_ms, rtt_ms, self.ema_alpha)
+            self._min_rtt_ms = rtt_ms if self._min_rtt_ms is None else min(self._min_rtt_ms, rtt_ms)
+            self._max_rtt_ms = rtt_ms if self._max_rtt_ms is None else max(self._max_rtt_ms, rtt_ms)
 
             self._rtt_window.append(rtt_ms)
 
@@ -129,11 +122,7 @@ class RouteProbe(BaseProbe):
 
     @property
     def _p95_rtt_ms(self) -> float | None:
-        if not self._rtt_window:
-            return None
-        sorted_rtts = sorted(self._rtt_window)
-        idx = max(0, int(len(sorted_rtts) * 0.95) - 1)
-        return round(sorted_rtts[idx], 2)
+        return _calc_p95(self._rtt_window)
 
     @property
     def _requests_per_minute(self) -> float | None:
