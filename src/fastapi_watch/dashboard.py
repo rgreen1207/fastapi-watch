@@ -1,4 +1,14 @@
-"""Server-side rendered HTML health dashboard."""
+"""Server-side rendered HTML health dashboard.
+
+:func:`render_dashboard` produces a single self-contained HTML page from a
+:class:`~fastapi_watch.models.HealthReport`.  The page auto-refreshes via a
+Server-Sent Events stream so probe cards update in real-time without a full
+page reload.
+
+The dashboard is enabled by default in :class:`~fastapi_watch.HealthRegistry`
+and served at ``<prefix>/dashboard``.  Pass ``dashboard=False`` to disable it,
+or pass a custom renderer callable to replace the default design.
+"""
 import html as _html
 from typing import Any
 

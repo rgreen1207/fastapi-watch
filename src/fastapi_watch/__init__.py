@@ -1,5 +1,6 @@
+from .alerts import BaseAlerter, WebhookAlerter, SlackAlerter, TeamsAlerter, PagerDutyAlerter
 from .registry import HealthRegistry
-from .probe_router import ProbeRouter
+from .probe_group import ProbeGroup
 from .probes.base import BaseProbe, PassiveProbe
 from .probes.route import FastAPIRouteProbe
 from .probes.websocket import FastAPIWebSocketProbe
@@ -13,10 +14,15 @@ from .models import AlertRecord, ProbeStatus, ProbeResult, HealthReport
 from .storage import InMemoryProbeStorage, ProbeStorage
 
 __all__ = [
+    "BaseAlerter",
+    "WebhookAlerter",
+    "SlackAlerter",
+    "TeamsAlerter",
+    "PagerDutyAlerter",
     "BaseProbe",
     "PassiveProbe",
     "HealthRegistry",
-    "ProbeRouter",
+    "ProbeGroup",
     "FastAPIRouteProbe",
     "FastAPIWebSocketProbe",
     "EventLoopProbe",
