@@ -250,6 +250,116 @@ async def test_cache_hit_miss_recording():
     assert result.details["cache_misses"] == 2
 
 
+@pytest.mark.asyncio
+async def test_auto_cache_tracking_lru_cache():
+    """@probe.watch on an @lru_cache function auto-tracks hits/misses."""
+    from functools import lru_cache
+    probe = HttpProbe(name="stripe")
+
+    @lru_cache(maxsize=128)
+    def get_value(key: int) -> int:
+        return key * 2
+
+    watched = probe.watch(get_value)
+
+    watched(1)  # miss
+    watched(1)  # hit
+    watched(2)  # miss
+
+    result = await probe.check()
+    assert result.details["cache_hits"] == 1
+    assert result.details["cache_misses"] == 2
+    assert result.details["cache_maxsize"] == 128
+    assert result.details["cache_currsize"] == 2
+
+
+@pytest.mark.asyncio
+async def test_auto_cache_tracking_async_cache_info():
+    """@probe.watch on an async function with cache_info() auto-tracks hits/misses."""
+    probe = HttpProbe(name="stripe")
+    _cache: dict = {}
+    hits = 0
+    misses = 0
+
+    async def fetch(key: int) -> int:
+        nonlocal hits, misses
+        if key in _cache:
+            hits += 1
+        else:
+            misses += 1
+            _cache[key] = key * 2
+        return _cache[key]
+
+    from collections import namedtuple
+    CacheInfo = namedtuple("CacheInfo", ["hits", "misses", "maxsize", "currsize"])
+    fetch.cache_info = lambda: CacheInfo(hits, misses, 128, len(_cache))  # type: ignore[attr-defined]
+
+    watched = probe.watch(fetch)
+
+    await watched(1)  # miss
+    await watched(1)  # hit
+    await watched(2)  # miss
+
+    result = await probe.check()
+    assert result.details["cache_hits"] == 1
+    assert result.details["cache_misses"] == 2
+
+
+@pytest.mark.asyncio
+async def test_cache_reporting_false_skips_tracking():
+    """cache_reporting=False disables auto cache tracking even on @lru_cache functions."""
+    from functools import lru_cache
+    probe = HttpProbe(name="stripe", cache_reporting=False)
+
+    @lru_cache(maxsize=64)
+    def get_value(key: int) -> int:
+        return key
+
+    watched = probe.watch(get_value)
+    watched(1)
+    watched(1)
+
+    result = await probe.check()
+    assert "cache_hits" not in (result.details or {})
+
+
+@pytest.mark.asyncio
+async def test_cache_window_auto_sized_from_maxsize():
+    """Window auto-sizes to cache maxsize when cache_window_size is not set."""
+    from functools import lru_cache
+    probe = HttpProbe(name="stripe")
+
+    @lru_cache(maxsize=5)
+    def get_value(key: int) -> int:
+        return key
+
+    watched = probe.watch(get_value)
+    assert probe._cache_window_size == 5
+
+
+@pytest.mark.asyncio
+async def test_cache_time_window():
+    """cache_time_window_s filters events older than T seconds."""
+    import time as _time
+    probe = HttpProbe(name="stripe", cache_time_window_s=60)
+
+    # Inject an old event directly (>60s ago)
+    probe._cache_timed_events.append((_time.monotonic() - 120, True))
+    # And a recent hit/miss
+    probe.record_cache_hit()
+    probe.record_cache_miss()
+
+    @probe.watch
+    async def call():
+        return "ok"
+
+    await call()
+    result = await probe.check()
+    # Old event excluded; only the recent hit and miss count
+    assert result.details["cache_hits"] == 1
+    assert result.details["cache_misses"] == 1
+
+
 # ---------------------------------------------------------------------------
 # last_error_at / last_success_at
 # ---------------------------------------------------------------------------
