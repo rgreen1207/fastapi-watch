@@ -160,14 +160,14 @@ class FastAPIRouteProbe(BaseProbe):
             self._request_timestamps.append(now.timestamp())
 
             # status window — track distribution incrementally
-            fam = f"{status_code // 100}xx"
+            status_family = f"{status_code // 100}xx"
             if len(self._status_window) == self._status_window.maxlen:
-                evicted_fam = f"{self._status_window[0] // 100}xx"
-                self._status_counts[evicted_fam] -= 1
-                if not self._status_counts[evicted_fam]:
-                    del self._status_counts[evicted_fam]
+                evicted_family = f"{self._status_window[0] // 100}xx"
+                self._status_counts[evicted_family] -= 1
+                if not self._status_counts[evicted_family]:
+                    del self._status_counts[evicted_family]
             self._status_window.append(status_code)
-            self._status_counts[fam] = self._status_counts.get(fam, 0) + 1
+            self._status_counts[status_family] = self._status_counts.get(status_family, 0) + 1
 
             is_error = status_code >= self.min_error_status
             # outcome window — track failures incrementally
@@ -363,9 +363,9 @@ class FastAPIRouteProbe(BaseProbe):
             "max_rtt_ms": self._max_rtt_ms,
         }
 
-        rpm = self._requests_per_minute
-        if rpm is not None:
-            details["requests_per_minute"] = rpm
+        requests_per_minute = self._requests_per_minute
+        if requests_per_minute is not None:
+            details["requests_per_minute"] = requests_per_minute
         if self.slow_call_threshold_ms is not None and self._rtt_window:
             details["slow_calls"] = self._slow_call_count
         if self._last_error is not None:
@@ -379,8 +379,8 @@ class FastAPIRouteProbe(BaseProbe):
             details["cache_misses"] = len(self._cache_window) - self._cache_hit_count
         if self._last_error_at is not None:
             details["last_error_at"] = self._last_error_at.isoformat()
-        w = self._outcome_window
-        if w and self._outcome_failure_count / len(w) >= 0.99 and self._last_success_at is not None:
+        outcome_window = self._outcome_window
+        if outcome_window and self._outcome_failure_count / len(outcome_window) >= 0.99 and self._last_success_at is not None:
             details["last_success_at"] = self._last_success_at.isoformat()
 
         return ProbeResult(

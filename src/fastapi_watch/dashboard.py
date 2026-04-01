@@ -99,8 +99,8 @@ def _fmt_detail_value(key: str, value: Any) -> str:
     if isinstance(value, float):
         if key.endswith("_ms"):
             return f"{value:.2f} ms"
-        s = f"{value:.4f}".rstrip("0").rstrip(".")
-        return s
+        formatted_value = f"{value:.4f}".rstrip("0").rstrip(".")
+        return formatted_value
     if isinstance(value, int) and key.endswith("_ms"):
         return f"{value} ms"
     if key == "circuit_breaker" and isinstance(value, dict):
@@ -570,8 +570,7 @@ _JS = r"""
     if (key.endsWith('_ms') && typeof val === 'number') return val.toFixed(2) + ' ms';
     if (typeof val === 'boolean') return val ? 'yes' : 'no';
     if (typeof val === 'number') {
-      var s = val.toFixed(4).replace(/\.?0+$/, '');
-      return s;
+      return val.toFixed(4).replace(/\.?0+$/, '');
     }
     if (key === 'circuit_breaker' && typeof val === 'object' && val !== null) {
       var failures = val.consecutive_failures || 0;
@@ -583,17 +582,17 @@ _JS = r"""
       return 'closed' + tripStr;
     }
     if ((key === 'status_distribution' || key === 'error_types') && typeof val === 'object' && val !== null) {
-      return Object.keys(val).sort().map(function(k) { return k + ': ' + val[k]; }).join(', ');
+      return Object.keys(val).sort().map(function(dictKey) { return dictKey + ': ' + val[dictKey]; }).join(', ');
     }
     if (typeof val === 'object') return '—';
     return String(val);
   }
 
-  function statusLabel(s) {
-    return s === 'healthy' ? 'Healthy' : s === 'degraded' ? 'Degraded' : 'Unhealthy';
+  function statusLabel(status) {
+    return status === 'healthy' ? 'Healthy' : status === 'degraded' ? 'Degraded' : 'Unhealthy';
   }
-  function statusBadgeCls(s) {
-    return s === 'healthy' ? 'badge-healthy' : s === 'degraded' ? 'badge-degraded' : 'badge-unhealthy';
+  function statusBadgeCls(status) {
+    return status === 'healthy' ? 'badge-healthy' : status === 'degraded' ? 'badge-degraded' : 'badge-unhealthy';
   }
 
   function escAttr(s) {
@@ -643,16 +642,16 @@ _JS = r"""
       var lastErr = probe.details.last_error || null;
       var TS_KEYS = {last_error: 1, last_error_at: 1, last_success_at: 1};
       var rows = '';
-      Object.entries(probe.details).forEach(function(kv) {
-        var k = kv[0], v = kv[1];
-        if (v == null || TS_KEYS[k]) return;
+      Object.entries(probe.details).forEach(function(entry) {
+        var key = entry[0], val = entry[1];
+        if (val == null || TS_KEYS[key]) return;
         var label;
-        if (k === 'error_count' && typeof v === 'number' && v > 0 && lastErr) {
+        if (key === 'error_count' && typeof val === 'number' && val > 0 && lastErr) {
           label = '<span class="error-count-btn" data-error="' + escAttr(lastErr) + '" tabindex="0">Error Count &#9658;</span>';
         } else {
-          label = k.replace(/_/g, ' ').replace(/\b\w/g, function(c) { return c.toUpperCase(); });
+          label = key.replace(/_/g, ' ').replace(/\b\w/g, function(char) { return char.toUpperCase(); });
         }
-        rows += '<tr><td>' + label + '</td><td>' + fmtDetailVal(k, v) + '</td></tr>';
+        rows += '<tr><td>' + label + '</td><td>' + fmtDetailVal(key, val) + '</td></tr>';
       });
       tbody.innerHTML = rows;
     }
@@ -687,9 +686,9 @@ _JS = r"""
       var msg = btn.getAttribute('data-error') || '(no error message)';
       tooltipEl.textContent = msg;
       tooltipEl.style.display = 'block';
-      var r = btn.getBoundingClientRect();
-      var top = r.bottom + 8 + window.scrollY;
-      var left = Math.min(r.left, window.innerWidth - 440);
+      var btnRect = btn.getBoundingClientRect();
+      var top = btnRect.bottom + 8 + window.scrollY;
+      var left = Math.min(btnRect.left, window.innerWidth - 440);
       tooltipEl.style.top = top + 'px';
       tooltipEl.style.left = Math.max(8, left) + 'px';
       e.stopPropagation();
@@ -764,10 +763,10 @@ def _probe_card(probe: ProbeResult) -> str:
 
     _TS_KEYS = {"last_error", "last_error_at", "last_success_at"}
 
-    d = probe.details or {}
-    last_error = d.get("last_error")
-    last_error_at = d.get("last_error_at")
-    last_success_at = d.get("last_success_at")
+    probe_details = probe.details or {}
+    last_error = probe_details.get("last_error")
+    last_error_at = probe_details.get("last_error_at")
+    last_success_at = probe_details.get("last_success_at")
 
     ts_parts = []
     if last_error_at:
@@ -845,8 +844,8 @@ def render_dashboard(
 
     if report.checked_at:
         tz = report.timezone or "UTC"
-        ts = report.checked_at.strftime("%Y-%m-%d %H:%M:%S")
-        checked_at_text = f"Last checked {ts} {tz}"
+        checked_at_str = report.checked_at.strftime("%Y-%m-%d %H:%M:%S")
+        checked_at_text = f"Last checked {checked_at_str} {tz}"
     else:
         checked_at_text = ""
 
