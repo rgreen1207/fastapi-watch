@@ -145,7 +145,7 @@ async def get_session(session_id: str):
 registry.add(redis_probe)
 ```
 
-Passive probes collect: `request_count`, `error_count`, `error_rate`, `avg_rtt_ms`, `p95_rtt_ms`, `min_rtt_ms`, `max_rtt_ms`, `consecutive_errors`. `FastAPIRouteProbe` also tracks `last_status_code` and `requests_per_minute`.
+Passive probes collect: `call_count`, `error_count`, `error_rate`, `avg_rtt_ms`, `p50_rtt_ms`, `p95_rtt_ms`, `p99_rtt_ms`, `min_rtt_ms`, `max_rtt_ms`, `consecutive_errors`, `error_types`, plus `last_error_at` (always after first error) and `last_success_at` (when mostly failing). `FastAPIRouteProbe` additionally tracks `last_status_code`, `requests_per_minute`, and `status_distribution`. Optional: `slow_calls` (when `slow_call_threshold_ms` is set) and `cache_hits`/`cache_misses` (via `record_cache_hit()` / `record_cache_miss()`).
 
 ### Custom probe
 

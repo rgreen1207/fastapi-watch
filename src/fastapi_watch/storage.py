@@ -155,8 +155,8 @@ class InMemoryProbeStorage:
         # Alert log (capped at max_alerts; oldest dropped when full, TTL applied on read)
         self._alerts: deque[tuple[float, AlertRecord]] = deque(maxlen=self._max_alerts)
 
-    def _result_expired(self, ts: float) -> bool:
-        return self._result_ttl > 0 and (time.monotonic() - ts) > self._result_ttl
+    def _result_expired(self, recorded_at: float) -> bool:
+        return self._result_ttl > 0 and (time.monotonic() - recorded_at) > self._result_ttl
 
     async def get_latest(self, name: str) -> ProbeResult | None:
         result = self._cache.get(name)
@@ -172,8 +172,8 @@ class InMemoryProbeStorage:
         now = time.monotonic()
         if self._result_ttl > 0:
             expired = [
-                name for name, ts in self._cache_times.items()
-                if (now - ts) > self._result_ttl
+                name for name, recorded_at in self._cache_times.items()
+                if (now - recorded_at) > self._result_ttl
             ]
             for name in expired:
                 self._cache.pop(name, None)
@@ -202,7 +202,7 @@ class InMemoryProbeStorage:
         for name, entries in self._history.items():
             if self._result_ttl > 0:
                 times = self._history_times.get(name, deque())
-                valid = [r for r, ts in zip(entries, times) if (now - ts) <= self._result_ttl]
+                valid = [result for result, recorded_at in zip(entries, times) if (now - recorded_at) <= self._result_ttl]
             else:
                 valid = list(entries)
             if valid:
