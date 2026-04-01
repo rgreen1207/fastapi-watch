@@ -636,6 +636,35 @@ async def test_cache_hit_miss_recording():
     assert result.details["cache_misses"] == 1
 
 
+@pytest.mark.asyncio
+async def test_auto_cache_tracking_lru_cache():
+    """@probe.watch on an @lru_cache function auto-tracks hits/misses."""
+    from functools import lru_cache
+    probe = FastAPIRouteProbe(name="api")
+
+    @lru_cache(maxsize=128)
+    def get_value(key: int) -> int:
+        return key * 2
+
+    watched = probe.watch(get_value)
+
+    watched(1)  # miss
+    watched(1)  # hit
+    watched(1)  # hit
+    watched(2)  # miss
+
+    @probe.watch
+    async def handler():
+        return {}
+
+    await handler()
+    result = await probe.check()
+    assert result.details["cache_hits"] == 2
+    assert result.details["cache_misses"] == 2
+    assert result.details["cache_maxsize"] == 128
+    assert result.details["cache_currsize"] == 2
+
+
 # ---------------------------------------------------------------------------
 # last_error_at / last_success_at
 # ---------------------------------------------------------------------------
