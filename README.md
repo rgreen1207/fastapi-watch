@@ -148,7 +148,7 @@ async def get_session(session_id: str):
 registry.add(redis_probe)
 ```
 
-Passive probes collect: `call_count`, `error_count`, `error_rate`, `avg_rtt_ms`, `p50_rtt_ms`, `p95_rtt_ms`, `p99_rtt_ms`, `min_rtt_ms`, `max_rtt_ms`, `consecutive_errors`, `error_types`, plus `last_error_at` (always after first error) and `last_success_at` (when mostly failing). `FastAPIRouteProbe` additionally tracks `last_status_code`, `requests_per_minute`, and `status_distribution`. Optional: `slow_calls` (when `slow_call_threshold_ms` is set) and `cache_hits`/`cache_misses` (via `record_cache_hit()` / `record_cache_miss()`).
+Passive probes collect: `call_count`, `error_count`, `error_rate`, `avg_rtt_ms`, `p50_rtt_ms`, `p95_rtt_ms`, `p99_rtt_ms`, `min_rtt_ms`, `max_rtt_ms`, `consecutive_errors`, `error_types`, plus `last_error_at` (always after first error) and `last_success_at` (when mostly failing). `FastAPIRouteProbe` additionally tracks `last_status_code`, `requests_per_minute`, and `status_distribution`. Optional: `slow_calls` (when `slow_call_threshold_ms` is set). Cache tracking is automatic when `@probe.watch` wraps an `@lru_cache` or `@alru_cache` function — `cache_hits`, `cache_misses`, `cache_maxsize`, and `cache_currsize` appear in probe details with no extra setup. The window defaults to the last 120 seconds; set `cache_window_size=N` to use the last N lookups instead, or `cache_time_window_s=T` for a custom time window. Disable with `cache_reporting=False`.
 
 ### Custom probe
 

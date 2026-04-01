@@ -1,5 +1,21 @@
 # Release Notes
 
+## v1.5.9
+
+**Automatic cache hit/miss tracking for `@lru_cache` and `@alru_cache`.**
+
+### New Features
+- **Automatic cache tracking** — `@probe.watch` now auto-detects `@lru_cache` and `@alru_cache` decorated functions. Cache hits, misses, `cache_maxsize`, and `cache_currsize` are reported in probe details with no additional setup required
+- **Time-based cache window** — cache hit/miss counts default to the last 120 seconds (`cache_time_window_s=120.0`). Old events outside the window are excluded automatically
+- **Count-based cache window** — set `cache_window_size=N` to use the last N lookups instead of a time window. When wrapping a `@lru_cache` function and `cache_window_size` is not set, the window is auto-sized to the cache's `maxsize`
+- **`cache_reporting=False`** — opt out of automatic cache tracking per-probe
+- **`cache_maxsize` / `cache_currsize`** — LRU cache capacity and current fill level included in probe details, useful for monitoring cache saturation
+
+### Breaking Changes
+- `record_cache_hit()` and `record_cache_miss()` are still available for manual tracking (e.g. Redis or custom caches), but the `track_cache()` method has been removed — apply `@probe.watch` directly to the cached function instead
+
+---
+
 ## v1.5.8
 
 **Probe telemetry, dashboard improvements, performance optimizations, and custom dashboard support.**

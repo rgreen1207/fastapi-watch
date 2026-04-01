@@ -755,7 +755,8 @@ Works with both `async def` and `def`. Preserves function signature — FastAPI 
 | `slow_calls` | Requests exceeding `slow_call_threshold_ms` in the last `window_size` requests (only when threshold is set) |
 | `status_distribution` | Count per HTTP status family (`2xx`/`3xx`/`4xx`/`5xx`) over the last `cache_window_size` requests |
 | `error_types` | Count per exception class over the last `cache_window_size` errors (exceptions only, not status-code-only errors) |
-| `cache_hits` / `cache_misses` | Hit and miss counts over the last `cache_window_size` lookups (populated via `record_cache_hit()` / `record_cache_miss()`) |
+| `cache_hits` / `cache_misses` | Hit and miss counts over the last `cache_window_size` lookups or `cache_time_window_s` seconds (auto-tracked when `@probe.watch` wraps an `@lru_cache` / `@alru_cache` function; also populated manually via `record_cache_hit()` / `record_cache_miss()`) |
+| `cache_maxsize` / `cache_currsize` | LRU cache capacity and current fill level (reported when auto-tracking is active) |
 | `last_error_at` | ISO timestamp of the most recent error; always shown once any error has occurred |
 | `last_success_at` | ISO timestamp of the most recent success; shown only when ≥99% of the outcome window are failures |
 
@@ -780,7 +781,9 @@ Before the first request, `check()` returns `HEALTHY` with `"no requests observe
 | `timeout` | `None` | Passed to registry for `check()` |
 | `min_error_status` | `500` | Minimum status code counted as an error |
 | `slow_call_threshold_ms` | `None` | Requests above this threshold increment `slow_calls`; disabled when `None` |
-| `cache_window_size` | `None` | Window for `status_distribution`, `error_types`, and cache counters; defaults to `window_size` |
+| `cache_window_size` | `None` | Override the cache hit/miss window to the last N lookups; auto-detected from the LRU cache's `maxsize` when not set |
+| `cache_time_window_s` | `120.0` | When `cache_window_size` is not set, count hits/misses over the last T seconds (default 120 s) |
+| `cache_reporting` | `True` | Set to `False` to disable automatic cache tracking even when wrapping `@lru_cache` / `@alru_cache` functions |
 | `circuit_breaker_enabled` | `True` | Set to `False` to disable the circuit breaker for this probe regardless of the registry setting |
 
 **With ProbeGroup:**
@@ -1120,7 +1123,7 @@ registry.add(db_probe)
 | Probe | Extra | Key args | Details fields |
 |-------|-------|----------|----------------|
 | `RequestMetricsMiddleware` + `RequestMetricsProbe` | built-in | `per_route`, `max_error_rate`, `max_avg_rtt_ms` | `request_count`, `error_count`, `error_rate`, `avg_rtt_ms`, `consecutive_errors`; + `routes` when `per_route=True` |
-| `FastAPIRouteProbe` | built-in | `name`, `max_error_rate`, `max_avg_rtt_ms`, `min_error_status`, `slow_call_threshold_ms`, `cache_window_size`, `circuit_breaker_enabled` | `request_count`, `error_count`, `error_rate`, `consecutive_errors`, `last_status_code`, `last_rtt_ms`, `avg_rtt_ms`, `p50_rtt_ms`, `p95_rtt_ms`, `p99_rtt_ms`, `min_rtt_ms`, `max_rtt_ms`, `requests_per_minute`, `slow_calls`\*, `status_distribution`, `error_types`, `cache_hits`\*, `cache_misses`\*, `last_error_at`\*, `last_success_at`\* |
+| `FastAPIRouteProbe` | built-in | `name`, `max_error_rate`, `max_avg_rtt_ms`, `min_error_status`, `slow_call_threshold_ms`, `cache_window_size`, `cache_time_window_s`, `cache_reporting`, `circuit_breaker_enabled` | `request_count`, `error_count`, `error_rate`, `consecutive_errors`, `last_status_code`, `last_rtt_ms`, `avg_rtt_ms`, `p50_rtt_ms`, `p95_rtt_ms`, `p99_rtt_ms`, `min_rtt_ms`, `max_rtt_ms`, `requests_per_minute`, `slow_calls`\*, `status_distribution`, `error_types`, `cache_hits`\*, `cache_misses`\*, `cache_maxsize`\*, `cache_currsize`\*, `last_error_at`\*, `last_success_at`\* |
 | `FastAPIWebSocketProbe` | built-in | `name`, `max_error_rate`, `min_active_connections` | `active_connections`, `total_connections`, `messages_received`, `messages_sent`, `error_count`, `error_rate`, `consecutive_errors`, `avg_duration_ms` |
 | `EventLoopProbe` | built-in | `warn_ms`, `fail_ms` | `lag_ms` |
 | `TCPProbe` | built-in | `host`, `port`, `timeout` | `host`, `port`, `resolved_ips`, `connect_ms` |
