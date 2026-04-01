@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from ..models import ProbeResult, ProbeStatus
-from .base import BaseProbe, _calc_p95, _update_ema
+from .base import BaseProbe, _calc_percentiles, _update_ema
 
 
 class FastAPIRouteProbe(BaseProbe):
@@ -21,14 +21,17 @@ class FastAPIRouteProbe(BaseProbe):
 
     * ``last_rtt_ms`` — handler execution time for the most recent request
     * ``avg_rtt_ms`` — exponential moving average RTT (smoothed by ``ema_alpha``)
-    * ``p95_rtt_ms`` — 95th-percentile RTT over the last ``window_size`` requests
+    * ``p50_rtt_ms`` / ``p95_rtt_ms`` / ``p99_rtt_ms`` — percentile RTTs over the last ``window_size`` requests
     * ``min_rtt_ms`` / ``max_rtt_ms`` — all-time bounds
     * ``last_status_code`` — HTTP status of the most recent request
     * ``request_count`` — total requests observed
-    * ``error_count`` — requests that raised an ``HTTPException`` or unhandled exception
+    * ``error_count`` — requests at or above ``min_error_status``
     * ``error_rate`` — ``error_count / request_count``
     * ``consecutive_errors`` — unbroken run of failures (resets on any success)
     * ``requests_per_minute`` — throughput computed from the request timestamp window
+    * ``slow_calls`` — requests exceeding ``slow_call_threshold_ms`` in the last ``window_size`` requests (when threshold is set)
+    * ``status_distribution`` — count per status-code family (2xx/3xx/4xx/5xx) over the last ``cache_window_size`` requests
+    * ``error_types`` — count per exception class over the last ``cache_window_size`` errors (exceptions only, not status-code-only errors)
 
     Health thresholds (probe reports ``UNHEALTHY`` when exceeded):
 
@@ -50,13 +53,17 @@ class FastAPIRouteProbe(BaseProbe):
         name: Probe name shown in health reports.
         max_error_rate: Error-rate threshold above which the probe is UNHEALTHY (0–1).
         max_avg_rtt_ms: Average-RTT threshold in milliseconds. ``None`` disables it.
-        window_size: Number of recent requests used for percentile and throughput calculations.
+        window_size: Rolling window for RTT percentiles, throughput, and slow-call counts.
         ema_alpha: Smoothing factor for the exponential moving average (0–1).
             Higher values make the average react faster to changes.
         timeout: Passed to the registry; not used internally.
         min_error_status: HTTP status codes at or above this value are counted
             as errors (default ``500``).  4xx client errors such as 404 are not
             counted as errors by default; set to ``400`` to include them.
+        cache_window_size: Rolling window for cache hit/miss counts, status
+            distribution, and error-type breakdown. Defaults to ``window_size``.
+        slow_call_threshold_ms: Requests taking longer than this (ms) are counted
+            as slow calls. ``None`` disables the counter.
     """
 
     def __init__(
@@ -70,6 +77,9 @@ class FastAPIRouteProbe(BaseProbe):
         timeout: float | None = None,
         poll_interval_ms: int | None = None,
         min_error_status: int = 500,
+        circuit_breaker_enabled: bool = True,
+        cache_window_size: int | None = None,
+        slow_call_threshold_ms: float | None = None,
     ) -> None:
         self.name = name
         self.timeout = timeout
@@ -78,6 +88,10 @@ class FastAPIRouteProbe(BaseProbe):
         self.max_avg_rtt_ms = max_avg_rtt_ms
         self.ema_alpha = ema_alpha
         self.min_error_status = min_error_status
+        self.circuit_breaker_enabled = circuit_breaker_enabled
+        self.slow_call_threshold_ms = slow_call_threshold_ms
+
+        _stats_window = cache_window_size if cache_window_size is not None else window_size
 
         self._label: str | None = None
         self._lock = threading.Lock()
@@ -91,29 +105,103 @@ class FastAPIRouteProbe(BaseProbe):
         self._max_rtt_ms: float | None = None
         self._rtt_window: deque[float] = deque(maxlen=window_size)
         self._request_timestamps: deque[float] = deque(maxlen=window_size)
+        self._outcome_window: deque[bool] = deque(maxlen=window_size)  # True=success, False=failure
+        self._outcome_failure_count: int = 0
+        self._cache_window: deque[bool] = deque(maxlen=_stats_window)
+        self._cache_hit_count: int = 0
+        self._status_window: deque[int] = deque(maxlen=_stats_window)
+        self._status_counts: dict[str, int] = {}
+        self._error_type_window: deque[str] = deque(maxlen=_stats_window)
+        self._error_type_counts: dict[str, int] = {}
+        self._slow_call_count: int = 0
+        self._last_error: str | None = None
+        self._last_error_at: datetime | None = None
+        self._last_success_at: datetime | None = None
 
     # ------------------------------------------------------------------
     # Internal recording (called by the wrapper on every request)
     # ------------------------------------------------------------------
 
-    def _record(self, status_code: int, rtt_ms: float) -> None:
+    def record_cache_hit(self) -> None:
+        """Record a cache hit.
+
+        Counts are tracked over the last ``cache_window_size`` (or ``window_size``)
+        cache lookups; older entries are dropped automatically as new ones arrive.
+        """
+        with self._lock:
+            if len(self._cache_window) == self._cache_window.maxlen and self._cache_window[0]:
+                self._cache_hit_count -= 1
+            self._cache_window.append(True)
+            self._cache_hit_count += 1
+
+    def record_cache_miss(self) -> None:
+        """Record a cache miss.
+
+        Counts are tracked over the last ``cache_window_size`` (or ``window_size``)
+        cache lookups; older entries are dropped automatically as new ones arrive.
+        """
+        with self._lock:
+            if len(self._cache_window) == self._cache_window.maxlen and self._cache_window[0]:
+                self._cache_hit_count -= 1
+            self._cache_window.append(False)
+
+    def _record(
+        self,
+        status_code: int,
+        rtt_ms: float,
+        error_msg: str | None = None,
+        error_type: str | None = None,
+    ) -> None:
+        now = datetime.now(timezone.utc)
         with self._lock:
             self._request_count += 1
             self._last_status_code = status_code
             self._last_rtt_ms = rtt_ms
-            self._request_timestamps.append(datetime.now(timezone.utc).timestamp())
+            self._request_timestamps.append(now.timestamp())
+
+            # status window — track distribution incrementally
+            status_family = f"{status_code // 100}xx"
+            if len(self._status_window) == self._status_window.maxlen:
+                evicted_family = f"{self._status_window[0] // 100}xx"
+                self._status_counts[evicted_family] -= 1
+                if not self._status_counts[evicted_family]:
+                    del self._status_counts[evicted_family]
+            self._status_window.append(status_code)
+            self._status_counts[status_family] = self._status_counts.get(status_family, 0) + 1
 
             is_error = status_code >= self.min_error_status
+            # outcome window — track failures incrementally
+            if len(self._outcome_window) == self._outcome_window.maxlen:
+                if not self._outcome_window[0]:
+                    self._outcome_failure_count -= 1
+            self._outcome_window.append(not is_error)
             if is_error:
                 self._error_count += 1
                 self._consecutive_errors += 1
+                self._outcome_failure_count += 1
+                self._last_error_at = now
+                self._last_error = error_msg or f"HTTP {status_code}"
+                if error_type is not None:
+                    if len(self._error_type_window) == self._error_type_window.maxlen:
+                        evicted = self._error_type_window[0]
+                        self._error_type_counts[evicted] -= 1
+                        if not self._error_type_counts[evicted]:
+                            del self._error_type_counts[evicted]
+                    self._error_type_window.append(error_type)
+                    self._error_type_counts[error_type] = self._error_type_counts.get(error_type, 0) + 1
             else:
                 self._consecutive_errors = 0
+                self._last_success_at = now
 
             self._avg_rtt_ms = _update_ema(self._avg_rtt_ms, rtt_ms, self.ema_alpha)
             self._min_rtt_ms = rtt_ms if self._min_rtt_ms is None else min(self._min_rtt_ms, rtt_ms)
             self._max_rtt_ms = rtt_ms if self._max_rtt_ms is None else max(self._max_rtt_ms, rtt_ms)
-
+            # slow call tracking — update before appending so we can read window[0]
+            if self.slow_call_threshold_ms is not None:
+                if len(self._rtt_window) == self._rtt_window.maxlen and self._rtt_window[0] > self.slow_call_threshold_ms:
+                    self._slow_call_count -= 1
+                if rtt_ms > self.slow_call_threshold_ms:
+                    self._slow_call_count += 1
             self._rtt_window.append(rtt_ms)
 
     # ------------------------------------------------------------------
@@ -125,10 +213,6 @@ class FastAPIRouteProbe(BaseProbe):
         if self._request_count == 0:
             return 0.0
         return self._error_count / self._request_count
-
-    @property
-    def _p95_rtt_ms(self) -> float | None:
-        return _calc_p95(self._rtt_window)
 
     @property
     def _requests_per_minute(self) -> float | None:
@@ -185,12 +269,23 @@ class FastAPIRouteProbe(BaseProbe):
                     rtt_ms = round((time.perf_counter() - start) * 1000, 2)
                     # Honour explicit status codes set on a Response return value.
                     status_code = getattr(result, "status_code", 200)
-                    self._record(status_code, rtt_ms)
+                    try:
+                        self._record(status_code, rtt_ms)
+                    except Exception:
+                        pass
                     return result
                 except Exception as exc:
                     rtt_ms = round((time.perf_counter() - start) * 1000, 2)
                     status_code = getattr(exc, "status_code", 500)
-                    self._record(status_code, rtt_ms)
+                    try:
+                        self._record(
+                            status_code,
+                            rtt_ms,
+                            error_msg=f"{type(exc).__name__}: {exc}",
+                            error_type=type(exc).__name__,
+                        )
+                    except Exception:
+                        pass
                     raise
 
             return async_wrapper
@@ -202,12 +297,23 @@ class FastAPIRouteProbe(BaseProbe):
                     result = func(*args, **kwargs)
                     rtt_ms = round((time.perf_counter() - start) * 1000, 2)
                     status_code = getattr(result, "status_code", 200)
-                    self._record(status_code, rtt_ms)
+                    try:
+                        self._record(status_code, rtt_ms)
+                    except Exception:
+                        pass
                     return result
                 except Exception as exc:
                     rtt_ms = round((time.perf_counter() - start) * 1000, 2)
                     status_code = getattr(exc, "status_code", 500)
-                    self._record(status_code, rtt_ms)
+                    try:
+                        self._record(
+                            status_code,
+                            rtt_ms,
+                            error_msg=f"{type(exc).__name__}: {exc}",
+                            error_type=type(exc).__name__,
+                        )
+                    except Exception:
+                        pass
                     raise
 
             return sync_wrapper
@@ -239,6 +345,7 @@ class FastAPIRouteProbe(BaseProbe):
             )
 
         status = ProbeStatus.UNHEALTHY if reasons else ProbeStatus.HEALTHY
+        p50, p95, p99 = _calc_percentiles(self._rtt_window, 0.5, 0.95, 0.99)
 
         details: dict[str, Any] = {
             **({"description": self._label} if self._label is not None else {}),
@@ -249,14 +356,32 @@ class FastAPIRouteProbe(BaseProbe):
             "last_status_code": self._last_status_code,
             "last_rtt_ms": self._last_rtt_ms,
             "avg_rtt_ms": round(avg_rtt, 2),
-            "p95_rtt_ms": self._p95_rtt_ms,
+            "p50_rtt_ms": p50,
+            "p95_rtt_ms": p95,
+            "p99_rtt_ms": p99,
             "min_rtt_ms": self._min_rtt_ms,
             "max_rtt_ms": self._max_rtt_ms,
         }
 
-        rpm = self._requests_per_minute
-        if rpm is not None:
-            details["requests_per_minute"] = rpm
+        requests_per_minute = self._requests_per_minute
+        if requests_per_minute is not None:
+            details["requests_per_minute"] = requests_per_minute
+        if self.slow_call_threshold_ms is not None and self._rtt_window:
+            details["slow_calls"] = self._slow_call_count
+        if self._last_error is not None:
+            details["last_error"] = self._last_error
+        if self._status_counts:
+            details["status_distribution"] = dict(self._status_counts)
+        if self._error_type_counts:
+            details["error_types"] = dict(self._error_type_counts)
+        if self._cache_window:
+            details["cache_hits"] = self._cache_hit_count
+            details["cache_misses"] = len(self._cache_window) - self._cache_hit_count
+        if self._last_error_at is not None:
+            details["last_error_at"] = self._last_error_at.isoformat()
+        outcome_window = self._outcome_window
+        if outcome_window and self._outcome_failure_count / len(outcome_window) >= 0.99 and self._last_success_at is not None:
+            details["last_success_at"] = self._last_success_at.isoformat()
 
         return ProbeResult(
             name=self.name,
