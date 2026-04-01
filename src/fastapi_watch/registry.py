@@ -1,9 +1,11 @@
 import asyncio
 import base64
+import importlib.util
 import logging
 import secrets
 import signal as _signal
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import AsyncGenerator, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
@@ -135,6 +137,9 @@ class HealthRegistry:
         groups: :class:`~fastapi_watch.ProbeGroup` instances to merge at startup.
         dashboard: ``True`` (default) — built-in HTML dashboard.  ``False`` — omit the
             route.  Callable ``(report: HealthReport) -> str`` — custom renderer.
+            ``str`` or ``Path`` — path to a ``.html`` file (served as-is) or a ``.py``
+            file that exports a ``render_dashboard(report, stream_url, maintenance_banner)``
+            callable.
         circuit_breaker: Enable the circuit breaker (default ``True``).  When a probe
             fails *circuit_breaker_threshold* times consecutively it is suspended for
             *circuit_breaker_cooldown_ms* ms, avoiding repeated calls to a broken
@@ -186,7 +191,7 @@ class HealthRegistry:
         history_size: int = 120,
         timezone: str = "UTC",
         groups: list[ProbeGroup] | None = None,
-        dashboard: bool | Callable[..., str] = True,
+        dashboard: bool | Callable[..., str] | str | Path = True,
         circuit_breaker: bool = True,
         circuit_breaker_threshold: int = 5,
         circuit_breaker_cooldown_ms: int = 600_000,
@@ -398,12 +403,19 @@ class HealthRegistry:
         await self._fire_state_changes(results)
         return results
 
+    def _is_cb_active(self, probe: BaseProbe) -> bool:
+        """Return True if the circuit breaker is active for this probe."""
+        if not probe.circuit_breaker_enabled:
+            return False
+        return self._circuit_breaker_enabled
+
     async def _safe_check(self, probe: BaseProbe, critical: bool) -> ProbeResult:
         """Run one probe with circuit-breaker and timeout handling."""
         loop = asyncio.get_running_loop()
+        cb_active = self._is_cb_active(probe)
 
         # Circuit breaker — skip probe while circuit is open
-        if self._circuit_breaker_enabled:
+        if cb_active:
             open_until = self._circuit_open_until.get(probe.name, 0.0)
             if loop.time() < open_until:
                 cb_info = self._cb_info(probe.name, True)
@@ -443,7 +455,7 @@ class HealthRegistry:
             )
 
         # Update circuit breaker state
-        if self._circuit_breaker_enabled:
+        if cb_active:
             if result.is_passing:
                 # HEALTHY or DEGRADED — probe is responding; reset failure count
                 self._circuit_err_count.pop(probe.name, None)
@@ -734,7 +746,7 @@ class HealthRegistry:
     def _register_routes(
         self,
         tags: list[str],
-        dashboard: bool | Callable[..., str] = True,
+        dashboard: bool | Callable[..., str] | str | Path = True,
     ) -> None:
         registry = self
         prefix = self.prefix
@@ -960,6 +972,22 @@ class HealthRegistry:
         if dashboard is not False:
             if callable(dashboard):
                 _renderer: Callable[..., str] = dashboard
+            elif isinstance(dashboard, (str, Path)):
+                dashboard_path = Path(dashboard)
+                if dashboard_path.suffix in (".html", ".htm"):
+                    _html_content = dashboard_path.read_text(encoding="utf-8")
+
+                    def _renderer(report: HealthReport, maintenance: bool = False) -> str:
+                        return _html_content
+                elif dashboard_path.suffix == ".py":
+                    _spec = importlib.util.spec_from_file_location("_custom_dashboard", dashboard_path)
+                    _mod = importlib.util.module_from_spec(_spec)
+                    _spec.loader.exec_module(_mod)
+                    _renderer = _mod.render_dashboard
+                else:
+                    raise ValueError(
+                        f"dashboard file must be .html, .htm, or .py — got {dashboard_path.suffix!r}"
+                    )
             else:
                 _stream_url = f"{prefix}/status/stream"
 

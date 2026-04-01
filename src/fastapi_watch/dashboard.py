@@ -27,17 +27,26 @@ _FIELD_GLOSSARY: list[tuple[str, str]] = [
     # Request / call counts
     ("request_count",        "Total requests observed by this probe since startup."),
     ("call_count",           "Total calls instrumented by this probe since startup (passive probes)."),
-    ("error_count",          "Requests or calls that returned a status code at or above the error threshold (default: 500)."),
+    ("error_count",          "Requests or calls that returned a status code at or above the error threshold (default: 500). Click to reveal the last recorded error."),
     ("error_rate",           "Fraction of requests counted as errors (error_count ÷ request_count)."),
     ("consecutive_errors",   "Unbroken run of error responses since the last success; resets to 0 on any success."),
     ("last_status_code",     "HTTP status code returned by the most recent request."),
     ("requests_per_minute",  "Estimated throughput computed from recent request timestamps."),
+    # Cache counters
+    ("cache_hits",           "Cache hits in the last window of lookups (record_cache_hit()). Older entries roll off automatically."),
+    ("cache_misses",         "Cache misses in the last window of lookups (record_cache_miss()). Older entries roll off automatically."),
     # RTT / latency
     ("last_rtt_ms",          "Execution time for the most recent request or call."),
     ("avg_rtt_ms",           "Exponential moving average response time; smoothed to reduce noise from outliers."),
+    ("p50_rtt_ms",           "Median (50th-percentile) response time over the last window of requests."),
     ("p95_rtt_ms",           "95th-percentile response time over the last window of requests."),
+    ("p99_rtt_ms",           "99th-percentile response time over the last window of requests — worst case for nearly all users."),
     ("min_rtt_ms",           "Fastest response time ever recorded by this probe."),
     ("max_rtt_ms",           "Slowest response time ever recorded by this probe."),
+    ("slow_calls",           "Requests exceeding slow_call_threshold_ms in the last window_size calls."),
+    # Distribution
+    ("status_distribution",  "Count of responses per HTTP status-code family (2xx/3xx/4xx/5xx) over the last cache_window_size requests."),
+    ("error_types",          "Count per exception class over the last cache_window_size errors (exceptions only, not status-code-only errors)."),
     # Circuit breaker
     ("circuit_breaker",      "Circuit breaker state. Counts consecutive failures and suspends the probe after repeated failures to avoid hammering a broken dependency, then retries after a cooldown."),
     # Route breakdown
@@ -90,8 +99,8 @@ def _fmt_detail_value(key: str, value: Any) -> str:
     if isinstance(value, float):
         if key.endswith("_ms"):
             return f"{value:.2f} ms"
-        s = f"{value:.4f}".rstrip("0").rstrip(".")
-        return s
+        formatted_value = f"{value:.4f}".rstrip("0").rstrip(".")
+        return formatted_value
     if isinstance(value, int) and key.endswith("_ms"):
         return f"{value} ms"
     if key == "circuit_breaker" and isinstance(value, dict):
@@ -101,6 +110,9 @@ def _fmt_detail_value(key: str, value: Any) -> str:
         if value.get("open"):
             return _e(f"open — suspended ({failures} consecutive failure{'s' if failures != 1 else ''}{trip_str})")
         return _e(f"closed{trip_str}")
+    if key in ("status_distribution", "error_types") and isinstance(value, dict):
+        parts = ", ".join(f"{k}: {v}" for k, v in sorted(value.items()))
+        return _e(parts) if parts else "—"
     if isinstance(value, dict):
         return "—"
     return _e(value)
@@ -460,6 +472,45 @@ body {
   color: #475569;
 }
 
+/* ── Probe timestamps ────────────────────────────────────────── */
+
+.probe-timestamps {
+  padding: 0 16px 8px;
+  font-size: 11px;
+  color: #94a3b8;
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+/* ── Error count tooltip ─────────────────────────────────────── */
+
+.error-count-btn {
+  cursor: pointer;
+  color: #dc2626;
+  text-decoration: underline dotted;
+  font-weight: 600;
+}
+.error-count-btn:hover { color: #991b1b; }
+
+.error-tooltip-popup {
+  display: none;
+  position: fixed;
+  z-index: 9999;
+  background: #1e293b;
+  color: #f1f5f9;
+  font-size: 12px;
+  font-family: ui-monospace, monospace;
+  padding: 10px 14px;
+  border-radius: 7px;
+  max-width: 420px;
+  word-break: break-word;
+  box-shadow: 0 4px 24px rgba(0,0,0,.4);
+  pointer-events: none;
+  white-space: pre-wrap;
+  line-height: 1.5;
+}
+
 /* ── Footer ──────────────────────────────────────────────────── */
 
 .footer {
@@ -519,8 +570,7 @@ _JS = r"""
     if (key.endsWith('_ms') && typeof val === 'number') return val.toFixed(2) + ' ms';
     if (typeof val === 'boolean') return val ? 'yes' : 'no';
     if (typeof val === 'number') {
-      var s = val.toFixed(4).replace(/\.?0+$/, '');
-      return s;
+      return val.toFixed(4).replace(/\.?0+$/, '');
     }
     if (key === 'circuit_breaker' && typeof val === 'object' && val !== null) {
       var failures = val.consecutive_failures || 0;
@@ -531,15 +581,26 @@ _JS = r"""
       }
       return 'closed' + tripStr;
     }
+    if ((key === 'status_distribution' || key === 'error_types') && typeof val === 'object' && val !== null) {
+      return Object.keys(val).sort().map(function(dictKey) { return dictKey + ': ' + val[dictKey]; }).join(', ');
+    }
     if (typeof val === 'object') return '—';
     return String(val);
   }
 
-  function statusLabel(s) {
-    return s === 'healthy' ? 'Healthy' : s === 'degraded' ? 'Degraded' : 'Unhealthy';
+  function statusLabel(status) {
+    return status === 'healthy' ? 'Healthy' : status === 'degraded' ? 'Degraded' : 'Unhealthy';
   }
-  function statusBadgeCls(s) {
-    return s === 'healthy' ? 'badge-healthy' : s === 'degraded' ? 'badge-degraded' : 'badge-unhealthy';
+  function statusBadgeCls(status) {
+    return status === 'healthy' ? 'badge-healthy' : status === 'degraded' ? 'badge-degraded' : 'badge-unhealthy';
+  }
+
+  function escAttr(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/"/g, '&quot;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
   }
 
   function updateCard(probe) {
@@ -563,14 +624,34 @@ _JS = r"""
       errEl.style.display = probe.error ? '' : 'none';
     }
 
+    var tsEl = card.querySelector('.probe-timestamps');
+    if (tsEl && probe.details) {
+      var tsParts = [];
+      if (probe.details.last_error_at) {
+        tsParts.push('last error: ' + String(probe.details.last_error_at).slice(0, 19).replace('T', ' ') + ' UTC');
+      }
+      if (probe.details.last_success_at) {
+        tsParts.push('last success: ' + String(probe.details.last_success_at).slice(0, 19).replace('T', ' ') + ' UTC');
+      }
+      tsEl.innerHTML = tsParts.join(' &bull; ');
+      tsEl.style.display = tsParts.length ? '' : 'none';
+    }
+
     var tbody = card.querySelector('.details-table tbody');
     if (tbody && probe.details) {
+      var lastErr = probe.details.last_error || null;
+      var TS_KEYS = {last_error: 1, last_error_at: 1, last_success_at: 1};
       var rows = '';
-      Object.entries(probe.details).forEach(function(kv) {
-        var k = kv[0], v = kv[1];
-        if (v == null) return;
-        var label = k.replace(/_/g, ' ').replace(/\b\w/g, function(c) { return c.toUpperCase(); });
-        rows += '<tr><td>' + label + '</td><td>' + fmtDetailVal(k, v) + '</td></tr>';
+      Object.entries(probe.details).forEach(function(entry) {
+        var key = entry[0], val = entry[1];
+        if (val == null || TS_KEYS[key]) return;
+        var label;
+        if (key === 'error_count' && typeof val === 'number' && val > 0 && lastErr) {
+          label = '<span class="error-count-btn" data-error="' + escAttr(lastErr) + '" tabindex="0">Error Count &#9658;</span>';
+        } else {
+          label = key.replace(/_/g, ' ').replace(/\b\w/g, function(char) { return char.toUpperCase(); });
+        }
+        rows += '<tr><td>' + label + '</td><td>' + fmtDetailVal(key, val) + '</td></tr>';
       });
       tbody.innerHTML = rows;
     }
@@ -592,6 +673,33 @@ _JS = r"""
 
     (report.probes || []).forEach(updateCard);
   }
+
+  // Error tooltip popup
+  var tooltipEl = document.createElement('div');
+  tooltipEl.id = 'error-tooltip';
+  tooltipEl.className = 'error-tooltip-popup';
+  document.body.appendChild(tooltipEl);
+
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest('.error-count-btn');
+    if (btn) {
+      var msg = btn.getAttribute('data-error') || '(no error message)';
+      tooltipEl.textContent = msg;
+      tooltipEl.style.display = 'block';
+      var btnRect = btn.getBoundingClientRect();
+      var top = btnRect.bottom + 8 + window.scrollY;
+      var left = Math.min(btnRect.left, window.innerWidth - 440);
+      tooltipEl.style.top = top + 'px';
+      tooltipEl.style.left = Math.max(8, left) + 'px';
+      e.stopPropagation();
+    } else {
+      tooltipEl.style.display = 'none';
+    }
+  });
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') tooltipEl.style.display = 'none';
+  });
 
   var source = new EventSource(streamUrl);
 
@@ -653,13 +761,40 @@ def _probe_card(probe: ProbeResult) -> str:
         f'<div class="probe-error"{error_style}>{_e(probe.error or "")}</div>'
     )
 
+    _TS_KEYS = {"last_error", "last_error_at", "last_success_at"}
+
+    probe_details = probe.details or {}
+    last_error = probe_details.get("last_error")
+    last_error_at = probe_details.get("last_error_at")
+    last_success_at = probe_details.get("last_success_at")
+
+    ts_parts = []
+    if last_error_at:
+        ts_parts.append(f"last error: {str(last_error_at)[:19].replace('T', ' ')} UTC")
+    if last_success_at:
+        ts_parts.append(f"last success: {str(last_success_at)[:19].replace('T', ' ')} UTC")
+    ts_inner = " &bull; ".join(_e(p) for p in ts_parts)
+    ts_style = "" if ts_parts else ' style="display:none"'
+    timestamps_html = f'<div class="probe-timestamps"{ts_style}>{ts_inner}</div>'
+
     details_html = ""
     if probe.details:
-        rows = "".join(
-            f"<tr><td>{_fmt_detail_key(k)}</td><td>{_fmt_detail_value(k, v)}</td></tr>"
-            for k, v in probe.details.items()
-            if v is not None
-        )
+        rows_parts = []
+        for k, v in probe.details.items():
+            if v is None or k in _TS_KEYS:
+                continue
+            if k == "error_count" and isinstance(v, int) and v > 0 and last_error:
+                key_cell = (
+                    f'<span class="error-count-btn" '
+                    f'data-error="{_e(last_error)}" tabindex="0">'
+                    f'Error Count &#9658;</span>'
+                )
+            else:
+                key_cell = _fmt_detail_key(k)
+            rows_parts.append(
+                f"<tr><td>{key_cell}</td><td>{_fmt_detail_value(k, v)}</td></tr>"
+            )
+        rows = "".join(rows_parts)
         if rows:
             details_html = f'<table class="details-table"><tbody>{rows}</tbody></table>'
 
@@ -672,6 +807,7 @@ def _probe_card(probe: ProbeResult) -> str:
         f'    <span class="probe-latency">{latency}</span>'
         f'    {status_badge}'
         f'  </div>'
+        f'  {timestamps_html}'
         f'  {error_html}'
         f'  {details_html}'
         f'</div>'
@@ -708,8 +844,8 @@ def render_dashboard(
 
     if report.checked_at:
         tz = report.timezone or "UTC"
-        ts = report.checked_at.strftime("%Y-%m-%d %H:%M:%S")
-        checked_at_text = f"Last checked {ts} {tz}"
+        checked_at_str = report.checked_at.strftime("%Y-%m-%d %H:%M:%S")
+        checked_at_text = f"Last checked {checked_at_str} {tz}"
     else:
         checked_at_text = ""
 

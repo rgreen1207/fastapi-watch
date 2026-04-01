@@ -34,19 +34,5 @@ class RedisProbe(PassiveProbe):
         registry.add(redis_probe)
     """
 
-    def __init__(
-        self,
-        name: str = "redis",
-        *,
-        max_error_rate: float = 0.1,
-        max_avg_rtt_ms: float | None = None,
-        window_size: int = 100,
-        ema_alpha: float = 0.1,
-    ) -> None:
-        super().__init__(
-            name,
-            max_error_rate=max_error_rate,
-            max_avg_rtt_ms=max_avg_rtt_ms,
-            window_size=window_size,
-            ema_alpha=ema_alpha,
-        )
+    def __init__(self, name: str = "redis", **kwargs) -> None:
+        super().__init__(name, **kwargs)

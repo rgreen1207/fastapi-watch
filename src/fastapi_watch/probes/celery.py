@@ -91,9 +91,9 @@ class CeleryProbe(BaseProbe):
     # ------------------------------------------------------------------
 
     def _inspect(self) -> dict[str, Any]:
-        i = self.app.control.inspect(timeout=self.timeout)
+        inspector = self.app.control.inspect(timeout=self.timeout)
 
-        ping = i.ping() or {}
+        ping = inspector.ping() or {}
         workers = list(ping.keys())
 
         if not workers:
@@ -103,12 +103,12 @@ class CeleryProbe(BaseProbe):
             return {"workers_online": len(workers), "workers": workers}
 
         # detailed=True — full inspection (additional broadcasts per call)
-        active = i.active() or {}
-        reserved = i.reserved() or {}
-        scheduled = i.scheduled() or {}
-        registered = i.registered() or {}
-        stats = i.stats() or {}
-        active_queues = i.active_queues() or {}
+        active = inspector.active() or {}
+        reserved = inspector.reserved() or {}
+        scheduled = inspector.scheduled() or {}
+        registered = inspector.registered() or {}
+        stats = inspector.stats() or {}
+        active_queues = inspector.active_queues() or {}
 
         worker_details: dict[str, Any] = {}
         for worker in workers:
