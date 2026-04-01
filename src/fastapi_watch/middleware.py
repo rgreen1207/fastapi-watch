@@ -14,7 +14,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from .models import ProbeResult, ProbeStatus
-from .probes.base import BaseProbe, _calc_p95, _update_ema
+from .probes.base import BaseProbe, _calc_percentiles, _update_ema
 
 
 # ---------------------------------------------------------------------------
@@ -66,22 +66,27 @@ class _RouteStats:
             ec = self._error_count
             error_rate = ec / rc if rc > 0 else 0.0
             avg = round(self._avg_rtt_ms or 0.0, 2)
-            p95 = _calc_p95(self._rtt_window)
+            ce = self._consecutive_errors
+            rtt_copy = list(self._rtt_window)
             rpm: float | None = None
-            ts = list(self._request_timestamps)
+            ts = self._request_timestamps
             if len(ts) >= 2:
                 span = ts[-1] - ts[0]
                 if span > 0:
                     rpm = round((len(ts) - 1) / span * 60, 2)
-            return {
-                "request_count": rc,
-                "error_count": ec,
-                "error_rate": round(error_rate, 4),
-                "consecutive_errors": self._consecutive_errors,
-                "avg_rtt_ms": avg,
-                "p95_rtt_ms": p95,
-                "requests_per_minute": rpm,
-            }
+        # sort outside the lock — reduces lock hold time under concurrent recording
+        p50, p95, p99 = _calc_percentiles(rtt_copy, 0.5, 0.95, 0.99)
+        return {
+            "request_count": rc,
+            "error_count": ec,
+            "error_rate": round(error_rate, 4),
+            "consecutive_errors": ce,
+            "avg_rtt_ms": avg,
+            "p50_rtt_ms": p50,
+            "p95_rtt_ms": p95,
+            "p99_rtt_ms": p99,
+            "requests_per_minute": rpm,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -233,10 +238,11 @@ class RequestMetricsProbe(BaseProbe):
 
         if self._middleware.per_route:
             with self._middleware._routes_lock:
-                details["routes"] = {
-                    path: stats.snapshot()
-                    for path, stats in sorted(self._middleware._routes.items())
-                }
+                routes_copy = list(self._middleware._routes.items())
+            details["routes"] = {
+                path: stats.snapshot()
+                for path, stats in sorted(routes_copy)
+            }
 
         return ProbeResult(
             name=self.name,

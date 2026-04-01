@@ -42,6 +42,9 @@ class RedisProbe(PassiveProbe):
         max_avg_rtt_ms: float | None = None,
         window_size: int = 100,
         ema_alpha: float = 0.1,
+        circuit_breaker_enabled: bool = True,
+        cache_window_size: int | None = None,
+        slow_call_threshold_ms: float | None = None,
     ) -> None:
         super().__init__(
             name,
@@ -49,4 +52,7 @@ class RedisProbe(PassiveProbe):
             max_avg_rtt_ms=max_avg_rtt_ms,
             window_size=window_size,
             ema_alpha=ema_alpha,
+            circuit_breaker_enabled=circuit_breaker_enabled,
+            cache_window_size=cache_window_size,
+            slow_call_threshold_ms=slow_call_threshold_ms,
         )
