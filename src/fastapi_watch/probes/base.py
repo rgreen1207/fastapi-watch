@@ -156,6 +156,8 @@ class PassiveProbe(BaseProbe):
         circuit_breaker_enabled: bool = True,
         cache_window_size: int | None = None,
         slow_call_threshold_ms: float | None = None,
+        cache_reporting: bool = True,
+        cache_time_window_s: float = 120.0,
     ) -> None:
         self.name = name
         self.max_error_rate = max_error_rate
@@ -163,6 +165,11 @@ class PassiveProbe(BaseProbe):
         self.ema_alpha = ema_alpha
         self.circuit_breaker_enabled = circuit_breaker_enabled
         self.slow_call_threshold_ms = slow_call_threshold_ms
+        self.cache_reporting = cache_reporting
+        self.cache_time_window_s = cache_time_window_s
+        # None = not explicitly set; auto-detected from cache maxsize in watch()
+        self._cache_window_size: int | None = cache_window_size
+        self._cache_window_size_explicit: bool = cache_window_size is not None
 
         _stats_window = cache_window_size if cache_window_size is not None else window_size
 
@@ -178,8 +185,11 @@ class PassiveProbe(BaseProbe):
         self._request_timestamps: deque[float] = deque(maxlen=window_size)
         self._outcome_window: deque[bool] = deque(maxlen=window_size)  # True=success, False=failure
         self._outcome_failure_count: int = 0
-        self._cache_window: deque[bool] = deque(maxlen=_stats_window)
-        self._cache_hit_count: int = 0
+        # Cache events stored as (monotonic_timestamp, is_hit); window capped to avoid unbounded growth.
+        _cache_event_cap = max(cache_window_size or 0, 10000)
+        self._cache_timed_events: deque[tuple[float, bool]] = deque(maxlen=_cache_event_cap)
+        self._cache_maxsize: int | None = None
+        self._cache_currsize: int | None = None
         self._error_type_window: deque[str] = deque(maxlen=_stats_window)
         self._error_type_counts: dict[str, int] = {}
         self._slow_call_count: int = 0
@@ -188,27 +198,23 @@ class PassiveProbe(BaseProbe):
         self._last_success_at: datetime | None = None
 
     def record_cache_hit(self) -> None:
-        """Record a cache hit.
+        """Record a cache hit manually.
 
-        Counts are tracked over the last ``cache_window_size`` (or ``window_size``)
-        cache lookups; older entries are dropped automatically as new ones arrive.
+        Use this when you are not using ``@lru_cache`` / ``@alru_cache`` but
+        still want to track cache performance (e.g. Redis lookups).  When
+        ``@probe.watch`` wraps a cached function, hits and misses are recorded
+        automatically and you do not need to call this directly.
         """
         with self._lock:
-            if len(self._cache_window) == self._cache_window.maxlen and self._cache_window[0]:
-                self._cache_hit_count -= 1
-            self._cache_window.append(True)
-            self._cache_hit_count += 1
+            self._cache_timed_events.append((time.monotonic(), True))
 
     def record_cache_miss(self) -> None:
-        """Record a cache miss.
+        """Record a cache miss manually.
 
-        Counts are tracked over the last ``cache_window_size`` (or ``window_size``)
-        cache lookups; older entries are dropped automatically as new ones arrive.
+        See :meth:`record_cache_hit` for when to use this method.
         """
         with self._lock:
-            if len(self._cache_window) == self._cache_window.maxlen and self._cache_window[0]:
-                self._cache_hit_count -= 1
-            self._cache_window.append(False)
+            self._cache_timed_events.append((time.monotonic(), False))
 
     def _record(
         self,
@@ -266,15 +272,40 @@ class PassiveProbe(BaseProbe):
 
         Works with both ``async def`` and ``def``. Records latency and whether
         the call raised an exception. Re-raises all exceptions unchanged.
+
+        If the decorated function has a ``cache_info()`` method (i.e. it is
+        wrapped with ``@lru_cache`` or ``@alru_cache``) and ``cache_reporting``
+        is ``True`` (the default), cache hits and misses are recorded
+        automatically.  ``cache_maxsize`` and ``cache_currsize`` are also
+        included in the probe details so you can monitor cache saturation.
+        Set ``cache_reporting=False`` on the probe to opt out.
         """
+        _has_cache = self.cache_reporting and callable(getattr(func, "cache_info", None))
+
+        # Auto-detect window size from cache maxsize on first wrap (if not explicitly set).
+        if _has_cache and not self._cache_window_size_explicit:
+            detected_maxsize = func.cache_info().maxsize
+            if detected_maxsize is not None:
+                self._cache_window_size = detected_maxsize
+
         if asyncio.iscoroutinefunction(func):
             @functools.wraps(func)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                hits_before = func.cache_info().hits if _has_cache else 0
                 start = time.perf_counter()
                 try:
                     result = await func(*args, **kwargs)
+                    rtt_ms = round((time.perf_counter() - start) * 1000, 2)
                     try:
-                        self._record(round((time.perf_counter() - start) * 1000, 2), error=False)
+                        if _has_cache:
+                            info = func.cache_info()
+                            if info.hits > hits_before:
+                                self.record_cache_hit()
+                            else:
+                                self.record_cache_miss()
+                            self._cache_maxsize = info.maxsize
+                            self._cache_currsize = info.currsize
+                        self._record(rtt_ms, error=False)
                     except Exception:
                         pass
                     return result
@@ -293,11 +324,21 @@ class PassiveProbe(BaseProbe):
         else:
             @functools.wraps(func)
             def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+                hits_before = func.cache_info().hits if _has_cache else 0
                 start = time.perf_counter()
                 try:
                     result = func(*args, **kwargs)
+                    rtt_ms = round((time.perf_counter() - start) * 1000, 2)
                     try:
-                        self._record(round((time.perf_counter() - start) * 1000, 2), error=False)
+                        if _has_cache:
+                            info = func.cache_info()
+                            if info.hits > hits_before:
+                                self.record_cache_hit()
+                            else:
+                                self.record_cache_miss()
+                            self._cache_maxsize = info.maxsize
+                            self._cache_currsize = info.currsize
+                        self._record(rtt_ms, error=False)
                     except Exception:
                         pass
                     return result
@@ -357,9 +398,21 @@ class PassiveProbe(BaseProbe):
             details["last_error"] = self._last_error
         if self._error_type_counts:
             details["error_types"] = dict(self._error_type_counts)
-        if self._cache_window:
-            details["cache_hits"] = self._cache_hit_count
-            details["cache_misses"] = len(self._cache_window) - self._cache_hit_count
+        if self._cache_timed_events:
+            events = list(self._cache_timed_events)
+            if self._cache_window_size is not None:
+                window = events[-self._cache_window_size:]
+            else:
+                cutoff = time.monotonic() - self.cache_time_window_s
+                window = [entry for entry in events if entry[0] >= cutoff]
+            if window:
+                cache_hits = sum(1 for _, is_hit in window if is_hit)
+                details["cache_hits"] = cache_hits
+                details["cache_misses"] = len(window) - cache_hits
+                if self._cache_maxsize is not None:
+                    details["cache_maxsize"] = self._cache_maxsize
+                if self._cache_currsize is not None:
+                    details["cache_currsize"] = self._cache_currsize
         if self._last_error_at is not None:
             details["last_error_at"] = self._last_error_at.isoformat()
         outcome_window = self._outcome_window
