@@ -1,6 +1,6 @@
 # Release Notes
 
-## v1.5.7
+## v1.5.8
 
 **Probe telemetry, dashboard improvements, performance optimizations, and custom dashboard support.**
 
