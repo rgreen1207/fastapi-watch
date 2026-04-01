@@ -12,6 +12,9 @@
   <a href="https://pypi.org/project/fastapi-watch/">
     <img src="https://img.shields.io/pypi/pyversions/fastapi-watch" alt="Supported Python versions">
   </a>
+  <a href="https://pepy.tech/projects/fastapi-watch">
+    <img src="https://static.pepy.tech/personalized-badge/fastapi-watch?period=total&units=NONE&left_color=BLACK&right_color=GREEN&left_text=downloads" alt="PyPI Downloads">
+  </a>
 </p>
 
 ---
