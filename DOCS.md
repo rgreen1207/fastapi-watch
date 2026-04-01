@@ -747,9 +747,19 @@ Works with both `async def` and `def`. Preserves function signature — FastAPI 
 | `last_status_code` | HTTP status of the most recent request |
 | `last_rtt_ms` | RTT for the most recent request |
 | `avg_rtt_ms` | Exponential moving average RTT |
-| `p95_rtt_ms` | 95th-percentile over `window_size` requests |
+| `p50_rtt_ms` | Median RTT over the last `window_size` requests |
+| `p95_rtt_ms` | 95th-percentile RTT over the last `window_size` requests |
+| `p99_rtt_ms` | 99th-percentile RTT over the last `window_size` requests |
 | `min_rtt_ms` / `max_rtt_ms` | All-time bounds |
 | `requests_per_minute` | Throughput from the timestamp window; `null` until ≥2 requests |
+| `slow_calls` | Requests exceeding `slow_call_threshold_ms` in the last `window_size` requests (only when threshold is set) |
+| `status_distribution` | Count per HTTP status family (`2xx`/`3xx`/`4xx`/`5xx`) over the last `cache_window_size` requests |
+| `error_types` | Count per exception class over the last `cache_window_size` errors (exceptions only, not status-code-only errors) |
+| `cache_hits` / `cache_misses` | Hit and miss counts over the last `cache_window_size` lookups (populated via `record_cache_hit()` / `record_cache_miss()`) |
+| `last_error_at` | ISO timestamp of the most recent error; always shown once any error has occurred |
+| `last_success_at` | ISO timestamp of the most recent success; shown only when ≥99% of the outcome window are failures |
+
+Timestamps (`last_error_at`, `last_success_at`) are rendered in the dashboard as small subdued text above the details table, not as table rows.
 
 **Health thresholds:**
 - `max_error_rate` (default `0.1`) — UNHEALTHY if exceeded.
@@ -765,10 +775,13 @@ Before the first request, `check()` returns `HEALTHY` with `"no requests observe
 | `name` | `"route"` | Probe label |
 | `max_error_rate` | `0.1` | Error-rate threshold |
 | `max_avg_rtt_ms` | `None` | RTT threshold |
-| `window_size` | `100` | Window for percentile and throughput calculations |
+| `window_size` | `100` | Window for RTT percentiles, throughput, slow-call counts, and outcome tracking |
 | `ema_alpha` | `0.1` | EMA smoothing factor |
 | `timeout` | `None` | Passed to registry for `check()` |
 | `min_error_status` | `500` | Minimum status code counted as an error |
+| `slow_call_threshold_ms` | `None` | Requests above this threshold increment `slow_calls`; disabled when `None` |
+| `cache_window_size` | `None` | Window for `status_distribution`, `error_types`, and cache counters; defaults to `window_size` |
+| `circuit_breaker_enabled` | `True` | Set to `False` to disable the circuit breaker for this probe regardless of the registry setting |
 
 **With ProbeGroup:**
 
@@ -874,7 +887,7 @@ async def send_welcome_email(to: str) -> None:
 registry.add(smtp_probe)
 ```
 
-Details: `call_count`, `error_count`, `error_rate`, `consecutive_errors`, `last_rtt_ms`, `avg_rtt_ms`, `p95_rtt_ms`, `min_rtt_ms`, `max_rtt_ms`.
+Details: `call_count`, `error_count`, `error_rate`, `consecutive_errors`, `last_rtt_ms`, `avg_rtt_ms`, `p50_rtt_ms`, `p95_rtt_ms`, `p99_rtt_ms`, `min_rtt_ms`, `max_rtt_ms`, `error_types`, `last_error_at` (always when errors exist), `last_success_at` (when ≥99% failures).
 
 ---
 
@@ -1107,18 +1120,18 @@ registry.add(db_probe)
 | Probe | Extra | Key args | Details fields |
 |-------|-------|----------|----------------|
 | `RequestMetricsMiddleware` + `RequestMetricsProbe` | built-in | `per_route`, `max_error_rate`, `max_avg_rtt_ms` | `request_count`, `error_count`, `error_rate`, `avg_rtt_ms`, `consecutive_errors`; + `routes` when `per_route=True` |
-| `FastAPIRouteProbe` | built-in | `name`, `max_error_rate`, `max_avg_rtt_ms`, `min_error_status` | `request_count`, `error_count`, `error_rate`, `consecutive_errors`, `last_status_code`, `last_rtt_ms`, `avg_rtt_ms`, `p95_rtt_ms`, `min_rtt_ms`, `max_rtt_ms`, `requests_per_minute` |
+| `FastAPIRouteProbe` | built-in | `name`, `max_error_rate`, `max_avg_rtt_ms`, `min_error_status`, `slow_call_threshold_ms`, `cache_window_size`, `circuit_breaker_enabled` | `request_count`, `error_count`, `error_rate`, `consecutive_errors`, `last_status_code`, `last_rtt_ms`, `avg_rtt_ms`, `p50_rtt_ms`, `p95_rtt_ms`, `p99_rtt_ms`, `min_rtt_ms`, `max_rtt_ms`, `requests_per_minute`, `slow_calls`\*, `status_distribution`, `error_types`, `cache_hits`\*, `cache_misses`\*, `last_error_at`\*, `last_success_at`\* |
 | `FastAPIWebSocketProbe` | built-in | `name`, `max_error_rate`, `min_active_connections` | `active_connections`, `total_connections`, `messages_received`, `messages_sent`, `error_count`, `error_rate`, `consecutive_errors`, `avg_duration_ms` |
 | `EventLoopProbe` | built-in | `warn_ms`, `fail_ms` | `lag_ms` |
 | `TCPProbe` | built-in | `host`, `port`, `timeout` | `host`, `port`, `resolved_ips`, `connect_ms` |
-| `SMTPProbe` | built-in | `name`, `max_error_rate`, `max_avg_rtt_ms` | `call_count`, `error_count`, `error_rate`, `avg_rtt_ms`, `p95_rtt_ms` |
+| `SMTPProbe` | built-in | `name`, `max_error_rate`, `max_avg_rtt_ms`, `slow_call_threshold_ms`, `cache_window_size` | `call_count`, `error_count`, `error_rate`, `avg_rtt_ms`, `p50_rtt_ms`, `p95_rtt_ms`, `p99_rtt_ms`, `error_types`, `last_error_at`\* |
 | `ThresholdProbe` | built-in | `probe`, `warn_if`, `fail_if` | delegates to inner probe |
 
 #### Databases
 
 | Probe | Extra | Details |
 |-------|-------|---------|
-| `PostgreSQLProbe` | `postgres` | `call_count`, `error_count`, `error_rate`, `avg_rtt_ms`, `p95_rtt_ms` |
+| `PostgreSQLProbe` | `postgres` | `call_count`, `error_count`, `error_rate`, `avg_rtt_ms`, `p50_rtt_ms`, `p95_rtt_ms`, `p99_rtt_ms`, `error_types`, `last_error_at`\* |
 | `MySQLProbe` | `mysql` | same |
 | `SqlAlchemyProbe` | `sqlalchemy` | same |
 
@@ -1126,7 +1139,7 @@ registry.add(db_probe)
 
 | Probe | Extra | Details |
 |-------|-------|---------|
-| `RedisProbe` | `redis` | `call_count`, `error_count`, `error_rate`, `avg_rtt_ms`, `p95_rtt_ms` |
+| `RedisProbe` | `redis` | `call_count`, `error_count`, `error_rate`, `avg_rtt_ms`, `p50_rtt_ms`, `p95_rtt_ms`, `p99_rtt_ms`, `error_types`, `last_error_at`\* |
 | `MemcachedProbe` | `memcached` | — |
 
 #### Queues / messaging
@@ -1141,8 +1154,10 @@ registry.add(db_probe)
 
 | Probe | Extra | Details |
 |-------|-------|---------|
-| `HttpProbe` | built-in | `call_count`, `error_count`, `error_rate`, `avg_rtt_ms`, `p95_rtt_ms` |
-| `MongoProbe` | `mongo` | `call_count`, `error_count`, `error_rate`, `avg_rtt_ms`, `p95_rtt_ms` |
+| `HttpProbe` | built-in | `call_count`, `error_count`, `error_rate`, `avg_rtt_ms`, `p50_rtt_ms`, `p95_rtt_ms`, `p99_rtt_ms`, `error_types`, `last_error_at`\* |
+| `MongoProbe` | `mongo` | same |
+
+\* Conditional: `last_error_at` appears once any error has occurred; `last_success_at` appears only when ≥99% of the outcome window are failures; `slow_calls` only when `slow_call_threshold_ms` is set; `cache_hits`/`cache_misses` only when `record_cache_hit()`/`record_cache_miss()` have been called.
 
 #### Testing / placeholder
 

@@ -154,3 +154,169 @@ async def test_return_value_preserved():
 
     result = await call()
     assert result == {"id": "ch_123", "status": "succeeded"}
+
+
+# ---------------------------------------------------------------------------
+# Percentiles (p50, p99)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_p50_and_p99_rtt_present():
+    probe = HttpProbe(name="stripe")
+
+    @probe.watch
+    async def call():
+        return "ok"
+
+    for _ in range(3):
+        await call()
+
+    result = await probe.check()
+    assert result.details["p50_rtt_ms"] is not None
+    assert result.details["p99_rtt_ms"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Slow calls
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_slow_calls_counted():
+    import asyncio
+
+    probe = HttpProbe(name="stripe", slow_call_threshold_ms=1)
+
+    @probe.watch
+    async def slow_call():
+        await asyncio.sleep(0.05)
+        return "ok"
+
+    await slow_call()
+    result = await probe.check()
+    assert result.details["slow_calls"] == 1
+
+
+@pytest.mark.asyncio
+async def test_slow_calls_absent_without_threshold():
+    probe = HttpProbe(name="stripe")
+
+    @probe.watch
+    async def call():
+        return "ok"
+
+    await call()
+    result = await probe.check()
+    assert "slow_calls" not in result.details
+
+
+# ---------------------------------------------------------------------------
+# Error types
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_error_types_tracked():
+    probe = HttpProbe(name="stripe")
+
+    @probe.watch
+    async def call():
+        raise ConnectionError("refused")
+
+    with pytest.raises(ConnectionError):
+        await call()
+
+    result = await probe.check()
+    assert result.details["error_types"].get("ConnectionError") == 1
+
+
+# ---------------------------------------------------------------------------
+# Cache hit / miss
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_cache_hit_miss_recording():
+    probe = HttpProbe(name="stripe")
+
+    probe.record_cache_hit()
+    probe.record_cache_miss()
+    probe.record_cache_miss()
+
+    @probe.watch
+    async def call():
+        return "ok"
+
+    await call()
+    result = await probe.check()
+    assert result.details["cache_hits"] == 1
+    assert result.details["cache_misses"] == 2
+
+
+# ---------------------------------------------------------------------------
+# last_error_at / last_success_at
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_last_error_at_set_after_exception():
+    probe = HttpProbe(name="stripe")
+
+    @probe.watch
+    async def fail():
+        raise RuntimeError("down")
+
+    with pytest.raises(RuntimeError):
+        await fail()
+
+    result = await probe.check()
+    assert "last_error_at" in result.details
+
+
+@pytest.mark.asyncio
+async def test_last_error_at_absent_before_any_error():
+    probe = HttpProbe(name="stripe")
+
+    @probe.watch
+    async def call():
+        return "ok"
+
+    await call()
+    result = await probe.check()
+    assert "last_error_at" not in result.details
+
+
+@pytest.mark.asyncio
+async def test_last_success_at_absent_when_not_mostly_failing():
+    probe = HttpProbe(name="stripe", window_size=10)
+
+    @probe.watch
+    async def call(fail: bool):
+        if fail:
+            raise RuntimeError("err")
+        return "ok"
+
+    for _ in range(5):
+        await call(fail=False)
+    for _ in range(5):
+        with pytest.raises(RuntimeError):
+            await call(fail=True)
+
+    result = await probe.check()
+    # 50% failure — below the 99% threshold
+    assert "last_success_at" not in result.details
+
+
+@pytest.mark.asyncio
+async def test_last_success_at_shown_when_mostly_failing():
+    probe = HttpProbe(name="stripe", window_size=10)
+
+    @probe.watch
+    async def call(fail: bool):
+        if fail:
+            raise RuntimeError("err")
+        return "ok"
+
+    await call(fail=False)  # records last_success_at
+    for _ in range(10):
+        with pytest.raises(RuntimeError):
+            await call(fail=True)  # fills window with failures
+
+    result = await probe.check()
+    assert "last_success_at" in result.details
