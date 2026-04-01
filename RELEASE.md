@@ -34,10 +34,11 @@
 
 ## v1.5.5
 
-**Fix SSE streams blocking uvicorn hot-reload.**
+**Fix uvicorn hot-reload blocking (poll tasks and SSE streams).**
 
-- SSE connections now respect the shutdown signal and close cleanly when uvicorn reloads
-- Registered a shutdown handler so in-flight SSE streams do not hold the process open
+- Fixed poll task blocking clean shutdown on uvicorn reload — background poll tasks now exit promptly on shutdown signal
+- Fixed uvicorn reload blocking by registering the shutdown handler correctly on startup
+- Fixed SSE streams holding connections open during reload — SSE connections now close cleanly when a shutdown signal is received
 
 ---
 
@@ -74,6 +75,8 @@
 - Optional label argument on `@route_probe.watch("GET /users")` included in probe details as `description`
 - `PassiveProbe` exported publicly for users building custom passive probes
 - Pluggable alert storage backend with TTL, alert history, and `max_alerts` cap
+- Removed `DiskProbe` (was introduced in v1.3.0 but replaced by the more flexible `ThresholdProbe` pattern)
+- `MemoryProbe` renamed to `NoOpProbe`
 
 ---
 
@@ -91,6 +94,7 @@
 - `TCPProbe` — checks TCP connectivity to a host/port
 - `SMTPProbe` — checks SMTP server connectivity
 - `ThresholdProbe` — triggers unhealthy when a user-supplied metric crosses a threshold
+- Performance, correctness, and safety improvements across probes and registry internals
 
 ---
 
