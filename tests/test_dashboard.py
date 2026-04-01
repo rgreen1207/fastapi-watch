@@ -307,3 +307,64 @@ def test_dashboard_shows_probe_count_summary():
     resp = client.get("/health/dashboard")
     # Should show "2 / 2 probes healthy" or similar
     assert "2" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# render_dashboard — probe timestamps (last_error_at / last_success_at)
+# ---------------------------------------------------------------------------
+
+def test_render_last_error_at_not_in_details_table():
+    probes = [ProbeResult(
+        name="api",
+        status=ProbeStatus.UNHEALTHY,
+        error="failing",
+        details={"error_count": 5, "last_error_at": "2026-03-31T14:32:01+00:00"},
+    )]
+    html = render_dashboard(_make_report(probes), stream_url="/health/status/stream")
+    # Should NOT appear as a table row label
+    assert "Last Error At" not in html
+
+
+def test_render_last_success_at_not_in_details_table():
+    probes = [ProbeResult(
+        name="api",
+        status=ProbeStatus.UNHEALTHY,
+        error="failing",
+        details={"error_count": 5, "last_success_at": "2026-03-31T12:00:00+00:00"},
+    )]
+    html = render_dashboard(_make_report(probes), stream_url="/health/status/stream")
+    assert "Last Success At" not in html
+
+
+def test_render_timestamps_div_always_present():
+    probes = [ProbeResult(name="api", status=ProbeStatus.HEALTHY)]
+    html = render_dashboard(_make_report(probes), stream_url="/health/status/stream")
+    assert 'class="probe-timestamps"' in html
+
+
+def test_render_timestamps_div_hidden_when_no_timestamps():
+    probes = [ProbeResult(name="api", status=ProbeStatus.HEALTHY)]
+    html = render_dashboard(_make_report(probes), stream_url="/health/status/stream")
+    assert 'probe-timestamps" style="display:none"' in html
+
+
+def test_render_last_error_at_shown_in_timestamps_div():
+    probes = [ProbeResult(
+        name="api",
+        status=ProbeStatus.UNHEALTHY,
+        error="failing",
+        details={"last_error_at": "2026-03-31T14:32:01+00:00"},
+    )]
+    html = render_dashboard(_make_report(probes), stream_url="/health/status/stream")
+    assert "last error: 2026-03-31 14:32:01 UTC" in html
+
+
+def test_render_last_success_at_shown_in_timestamps_div():
+    probes = [ProbeResult(
+        name="api",
+        status=ProbeStatus.UNHEALTHY,
+        error="failing",
+        details={"last_success_at": "2026-03-31T12:00:00+00:00"},
+    )]
+    html = render_dashboard(_make_report(probes), stream_url="/health/status/stream")
+    assert "last success: 2026-03-31 12:00:00 UTC" in html

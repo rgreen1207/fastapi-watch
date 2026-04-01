@@ -518,3 +518,220 @@ async def test_probe_name_in_result():
     await handler()
     result = await probe.check()
     assert result.name == "checkout"
+
+
+# ---------------------------------------------------------------------------
+# Percentiles (p50, p99)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_p50_and_p99_rtt_present_after_requests():
+    probe = FastAPIRouteProbe(name="api")
+
+    @probe.watch
+    async def handler():
+        return {}
+
+    for _ in range(5):
+        await handler()
+
+    result = await probe.check()
+    assert result.details["p50_rtt_ms"] is not None
+    assert result.details["p99_rtt_ms"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Slow calls
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_slow_calls_counted_when_threshold_set():
+    probe = FastAPIRouteProbe(name="api", slow_call_threshold_ms=1)
+
+    @probe.watch
+    async def handler():
+        await asyncio.sleep(0.05)
+        return {}
+
+    await handler()
+    result = await probe.check()
+    assert "slow_calls" in result.details
+    assert result.details["slow_calls"] == 1
+
+
+@pytest.mark.asyncio
+async def test_slow_calls_absent_without_threshold():
+    probe = FastAPIRouteProbe(name="api")
+
+    @probe.watch
+    async def handler():
+        return {}
+
+    await handler()
+    result = await probe.check()
+    assert "slow_calls" not in result.details
+
+
+# ---------------------------------------------------------------------------
+# Status distribution
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_status_distribution_tracks_code_families():
+    probe = FastAPIRouteProbe(name="api", max_error_rate=1.0)
+
+    @probe.watch
+    async def handler(fail: bool):
+        if fail:
+            raise HTTPException(status_code=503)
+        return {}
+
+    for _ in range(3):
+        await handler(fail=False)
+    await _call(handler, fail=True)
+
+    result = await probe.check()
+    dist = result.details["status_distribution"]
+    assert dist.get("2xx") == 3
+    assert dist.get("5xx") == 1
+
+
+# ---------------------------------------------------------------------------
+# Error types
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_error_types_tracked_for_exceptions():
+    probe = FastAPIRouteProbe(name="api", max_error_rate=1.0)
+
+    @probe.watch
+    async def handler():
+        raise ValueError("bad input")
+
+    await _call(handler)
+    result = await probe.check()
+    assert "error_types" in result.details
+    assert result.details["error_types"].get("ValueError") == 1
+
+
+# ---------------------------------------------------------------------------
+# Cache hit / miss recording
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_cache_hit_miss_recording():
+    probe = FastAPIRouteProbe(name="api")
+
+    probe.record_cache_hit()
+    probe.record_cache_hit()
+    probe.record_cache_miss()
+
+    @probe.watch
+    async def handler():
+        return {}
+
+    await handler()
+    result = await probe.check()
+    assert result.details["cache_hits"] == 2
+    assert result.details["cache_misses"] == 1
+
+
+# ---------------------------------------------------------------------------
+# last_error_at / last_success_at
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_last_error_at_set_after_error():
+    probe = FastAPIRouteProbe(name="api")
+
+    @probe.watch
+    async def handler():
+        raise HTTPException(status_code=500)
+
+    await _call(handler)
+    result = await probe.check()
+    assert "last_error_at" in result.details
+    assert result.details["last_error_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_last_error_at_absent_before_any_error():
+    probe = FastAPIRouteProbe(name="api")
+
+    @probe.watch
+    async def handler():
+        return {}
+
+    await handler()
+    result = await probe.check()
+    assert "last_error_at" not in result.details
+
+
+@pytest.mark.asyncio
+async def test_last_success_at_absent_when_not_mostly_failing():
+    probe = FastAPIRouteProbe(name="api", window_size=10)
+
+    @probe.watch
+    async def handler(fail: bool):
+        if fail:
+            raise HTTPException(status_code=500)
+        return {}
+
+    for _ in range(5):
+        await handler(fail=False)
+    for _ in range(5):
+        await _call(handler, fail=True)
+
+    result = await probe.check()
+    # 50% failure rate — below the 99% threshold
+    assert "last_success_at" not in result.details
+
+
+@pytest.mark.asyncio
+async def test_last_success_at_shown_when_mostly_failing():
+    probe = FastAPIRouteProbe(name="api", window_size=10)
+
+    @probe.watch
+    async def handler(fail: bool):
+        if fail:
+            raise HTTPException(status_code=500)
+        return {}
+
+    await handler(fail=False)  # records last_success_at
+    for _ in range(10):
+        await _call(handler, fail=True)  # fills window with failures
+
+    result = await probe.check()
+    assert "last_success_at" in result.details
+    assert result.details["last_success_at"] is not None
+
+
+# ---------------------------------------------------------------------------
+# circuit_breaker_enabled
+# ---------------------------------------------------------------------------
+
+def test_circuit_breaker_disabled_via_init():
+    probe = FastAPIRouteProbe(name="api", circuit_breaker_enabled=False)
+    assert probe.circuit_breaker_enabled is False
+
+
+def test_circuit_breaker_enabled_by_default():
+    probe = FastAPIRouteProbe(name="api")
+    assert probe.circuit_breaker_enabled is True
+
+
+# ---------------------------------------------------------------------------
+# watch with label
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_watch_with_string_label():
+    probe = FastAPIRouteProbe(name="api")
+
+    @probe.watch("GET /users")
+    async def handler():
+        return {}
+
+    await handler()
+    result = await probe.check()
+    assert result.details.get("description") == "GET /users"
