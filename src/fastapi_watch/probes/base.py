@@ -20,17 +20,17 @@ def _calc_percentile(window: deque, p: float) -> float | None:
     """Return a single percentile from *window*, or ``None`` if empty."""
     if not window:
         return None
-    s = sorted(window)
-    return round(s[max(0, math.ceil(len(s) * p) - 1)], 2)
+    sorted_window = sorted(window)
+    return round(sorted_window[max(0, math.ceil(len(sorted_window) * p) - 1)], 2)
 
 
-def _calc_percentiles(window: deque, *ps: float) -> tuple[float | None, ...]:
+def _calc_percentiles(window: deque, *percentiles: float) -> tuple[float | None, ...]:
     """Return multiple percentiles from *window* in a single sort pass."""
     if not window:
-        return tuple(None for _ in ps)
-    s = sorted(window)
-    n = len(s)
-    return tuple(round(s[max(0, math.ceil(n * p) - 1)], 2) for p in ps)
+        return tuple(None for _ in percentiles)
+    sorted_window = sorted(window)
+    window_length = len(sorted_window)
+    return tuple(round(sorted_window[max(0, math.ceil(window_length * p) - 1)], 2) for p in percentiles)
 
 
 class BaseProbe(ABC):
@@ -362,8 +362,8 @@ class PassiveProbe(BaseProbe):
             details["cache_misses"] = len(self._cache_window) - self._cache_hit_count
         if self._last_error_at is not None:
             details["last_error_at"] = self._last_error_at.isoformat()
-        w = self._outcome_window
-        if w and self._outcome_failure_count / len(w) >= 0.99 and self._last_success_at is not None:
+        outcome_window = self._outcome_window
+        if outcome_window and self._outcome_failure_count / len(outcome_window) >= 0.99 and self._last_success_at is not None:
             details["last_success_at"] = self._last_success_at.isoformat()
 
         return ProbeResult(

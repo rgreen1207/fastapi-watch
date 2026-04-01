@@ -973,20 +973,20 @@ class HealthRegistry:
             if callable(dashboard):
                 _renderer: Callable[..., str] = dashboard
             elif isinstance(dashboard, (str, Path)):
-                p = Path(dashboard)
-                if p.suffix in (".html", ".htm"):
-                    _html_content = p.read_text(encoding="utf-8")
+                dashboard_path = Path(dashboard)
+                if dashboard_path.suffix in (".html", ".htm"):
+                    _html_content = dashboard_path.read_text(encoding="utf-8")
 
                     def _renderer(report: HealthReport, maintenance: bool = False) -> str:
                         return _html_content
-                elif p.suffix == ".py":
-                    _spec = importlib.util.spec_from_file_location("_custom_dashboard", p)
+                elif dashboard_path.suffix == ".py":
+                    _spec = importlib.util.spec_from_file_location("_custom_dashboard", dashboard_path)
                     _mod = importlib.util.module_from_spec(_spec)
                     _spec.loader.exec_module(_mod)
                     _renderer = _mod.render_dashboard
                 else:
                     raise ValueError(
-                        f"dashboard file must be .html, .htm, or .py — got {p.suffix!r}"
+                        f"dashboard file must be .html, .htm, or .py — got {dashboard_path.suffix!r}"
                     )
             else:
                 _stream_url = f"{prefix}/status/stream"

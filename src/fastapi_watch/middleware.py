@@ -62,30 +62,30 @@ class _RouteStats:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            rc = self._request_count
-            ec = self._error_count
-            error_rate = ec / rc if rc > 0 else 0.0
-            avg = round(self._avg_rtt_ms or 0.0, 2)
-            ce = self._consecutive_errors
+            request_count = self._request_count
+            error_count = self._error_count
+            error_rate = error_count / request_count if request_count > 0 else 0.0
+            avg_rtt_ms = round(self._avg_rtt_ms or 0.0, 2)
+            consecutive_errors = self._consecutive_errors
             rtt_copy = list(self._rtt_window)
-            rpm: float | None = None
-            ts = self._request_timestamps
-            if len(ts) >= 2:
-                span = ts[-1] - ts[0]
+            requests_per_minute: float | None = None
+            timestamps = self._request_timestamps
+            if len(timestamps) >= 2:
+                span = timestamps[-1] - timestamps[0]
                 if span > 0:
-                    rpm = round((len(ts) - 1) / span * 60, 2)
+                    requests_per_minute = round((len(timestamps) - 1) / span * 60, 2)
         # sort outside the lock — reduces lock hold time under concurrent recording
         p50, p95, p99 = _calc_percentiles(rtt_copy, 0.5, 0.95, 0.99)
         return {
-            "request_count": rc,
-            "error_count": ec,
+            "request_count": request_count,
+            "error_count": error_count,
             "error_rate": round(error_rate, 4),
-            "consecutive_errors": ce,
-            "avg_rtt_ms": avg,
+            "consecutive_errors": consecutive_errors,
+            "avg_rtt_ms": avg_rtt_ms,
             "p50_rtt_ms": p50,
             "p95_rtt_ms": p95,
             "p99_rtt_ms": p99,
-            "requests_per_minute": rpm,
+            "requests_per_minute": requests_per_minute,
         }
 
 
