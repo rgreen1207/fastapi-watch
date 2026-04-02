@@ -382,6 +382,23 @@ body {
   border-color: #1e40af;
   color: #fff;
 }
+.tag-filter-clear {
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 12px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: #94a3b8;
+  cursor: pointer;
+  font-weight: 500;
+  display: none;
+}
+.tag-filter-clear.visible {
+  display: inline-block;
+}
+.tag-filter-clear:hover {
+  color: #475569;
+}
 
 .badge {
   font-size: 10px;
@@ -750,6 +767,10 @@ _JS = r"""
         card.style.display = cardTags.some(function(t) { return activeTags.has(t); }) ? '' : 'none';
       });
     }
+    var clearBtn = document.getElementById('tag-filter-clear');
+    function syncClearBtn() {
+      if (clearBtn) clearBtn.className = activeTags.size ? 'tag-filter-clear visible' : 'tag-filter-clear';
+    }
     tagFilterEl.addEventListener('click', function(e) {
       var btn = e.target.closest('.tag-filter-btn');
       if (!btn) return;
@@ -757,7 +778,16 @@ _JS = r"""
       if (activeTags.has(tag)) { activeTags.delete(tag); btn.classList.remove('active'); }
       else { activeTags.add(tag); btn.classList.add('active'); }
       applyTagFilter();
+      syncClearBtn();
     });
+    if (clearBtn) {
+      clearBtn.addEventListener('click', function() {
+        activeTags.clear();
+        tagFilterEl.querySelectorAll('.tag-filter-btn').forEach(function(b) { b.classList.remove('active'); });
+        applyTagFilter();
+        syncClearBtn();
+      });
+    }
   }
 
   // Error tooltip popup
@@ -972,6 +1002,7 @@ def render_dashboard(
         tag_filter_html = (
             f'<div id="tag-filter" class="tag-filter">'
             f'<span class="tag-filter-label">Filter</span>{btns}'
+            f'<button id="tag-filter-clear" class="tag-filter-clear">Clear</button>'
             f'</div>'
         )
     else:

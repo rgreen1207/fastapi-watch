@@ -991,3 +991,69 @@ def test_discover_routes_refresh_evicts_old_probe():
 
     # Same count — old probe evicted, new one added
     assert count_after == count_before
+
+
+# ---------------------------------------------------------------------------
+# Feature: name_fn
+# ---------------------------------------------------------------------------
+
+def test_discover_routes_name_fn_customises_probe_name():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+
+    @app.get("/items")
+    async def list_items():
+        return {}
+
+    registry.discover_routes(name_fn=lambda r: r.path)
+
+    names = {p.name for p, _ in registry._probes}
+    assert "/items" in names
+    assert "list_items" not in names
+
+
+def test_discover_routes_name_fn_receives_route_object():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    seen_routes = []
+
+    @app.get("/items")
+    async def list_items():
+        return {}
+
+    def capture_name(route):
+        seen_routes.append(route)
+        return route.name
+
+    registry.discover_routes(name_fn=capture_name)
+    assert len(seen_routes) == 1
+
+
+def test_watch_router_name_fn_customises_probe_name():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    router = APIRouter()
+
+    @router.get("/products")
+    async def list_products():
+        return {}
+
+    app.include_router(router)
+    registry.watch_router(router, name_fn=lambda r: f"router:{r.name}")
+
+    names = {p.name for p, _ in registry._probes}
+    assert "router:list_products" in names
+
+
+def test_discover_routes_name_fn_none_uses_route_name():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+
+    @app.get("/items")
+    async def list_items():
+        return {}
+
+    registry.discover_routes(name_fn=None)
+
+    names = {p.name for p, _ in registry._probes}
+    assert "list_items" in names
