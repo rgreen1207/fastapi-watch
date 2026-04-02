@@ -312,11 +312,24 @@ body {
 .probe-card.degraded  .probe-indicator { background: #d97706; }
 .probe-card.unhealthy .probe-indicator { background: #dc2626; }
 
+.probe-name-group {
+  flex: 1;
+  min-width: 0;
+}
+
 .probe-name {
   font-weight: 600;
   font-size: 15px;
-  flex: 1;
   color: #0f172a;
+}
+
+.probe-description {
+  font-size: 11px;
+  color: #64748b;
+  margin-top: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .badge {
@@ -798,11 +811,19 @@ def _probe_card(probe: ProbeResult) -> str:
         if rows:
             details_html = f'<table class="details-table"><tbody>{rows}</tbody></table>'
 
+    description_html = (
+        f'<div class="probe-description">{_e(probe.description)}</div>'
+        if probe.description else ""
+    )
+
     return (
         f'<div class="probe-card {status_cls}" data-probe="{_e(probe.name)}">'
         f'  <div class="probe-card-header">'
         f'    <div class="probe-indicator"></div>'
-        f'    <div class="probe-name">{_e(probe.name)}</div>'
+        f'    <div class="probe-name-group">'
+        f'      <div class="probe-name">{_e(probe.name)}</div>'
+        f'      {description_html}'
+        f'    </div>'
         f'    {optional_badge}'
         f'    <span class="probe-latency">{latency}</span>'
         f'    {status_badge}'

@@ -73,6 +73,8 @@ class BaseProbe(ABC):
     """
 
     name: str = "unnamed"
+    description: str | None = None
+    tags: list[str] | None = None
     timeout: float | None = None  # seconds; None means no timeout
     poll_interval_ms: int | None = None
     circuit_breaker_threshold: int | None = None
@@ -149,6 +151,8 @@ class PassiveProbe(BaseProbe):
         self,
         name: str,
         *,
+        description: str | None = None,
+        tags: list[str] | None = None,
         max_error_rate: float = 0.1,
         max_avg_rtt_ms: float | None = None,
         window_size: int = 100,
@@ -160,6 +164,8 @@ class PassiveProbe(BaseProbe):
         cache_time_window_s: float = 120.0,
     ) -> None:
         self.name = name
+        self.description = description
+        self.tags = list(tags) if tags else []
         self.max_error_rate = max_error_rate
         self.max_avg_rtt_ms = max_avg_rtt_ms
         self.ema_alpha = ema_alpha

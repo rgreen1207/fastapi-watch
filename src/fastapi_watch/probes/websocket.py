@@ -151,6 +151,8 @@ class FastAPIWebSocketProbe(BaseProbe):
         self,
         name: str = "websocket",
         *,
+        description: str | None = None,
+        tags: list[str] | None = None,
         max_error_rate: float = 0.1,
         min_active_connections: int = 0,
         window_size: int = 100,
@@ -159,6 +161,8 @@ class FastAPIWebSocketProbe(BaseProbe):
         poll_interval_ms: int | None = None,
     ) -> None:
         self.name = name
+        self.description = description
+        self.tags = list(tags) if tags else []
         self.timeout = timeout
         self.poll_interval_ms = poll_interval_ms
         self.max_error_rate = max_error_rate
@@ -224,7 +228,7 @@ class FastAPIWebSocketProbe(BaseProbe):
         ws_param = _find_ws_param(func)
 
         @functools.wraps(func)
-        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:  # type: ignore[return]
             # Locate and wrap the WebSocket argument.
             ws_instance = kwargs.get(ws_param) if ws_param else None
             if ws_instance is None:
@@ -237,9 +241,11 @@ class FastAPIWebSocketProbe(BaseProbe):
                     pass
 
             if ws_instance is not None:
-                wrapped = _WebSocketWrapper(ws_instance, self)
+                wrapped_ws = _WebSocketWrapper(ws_instance, self)
                 if ws_param and ws_param in kwargs:
-                    kwargs = {**kwargs, ws_param: wrapped}
+                    kwargs = {**kwargs, ws_param: wrapped_ws}
+                else:
+                    args = tuple(wrapped_ws if a is ws_instance else a for a in args)
 
             start = time.perf_counter()
             self._active_connections += 1
@@ -262,6 +268,8 @@ class FastAPIWebSocketProbe(BaseProbe):
                 duration_ms = round((time.perf_counter() - start) * 1000, 2)
                 self._record_close(duration_ms, errored)
 
+        wrapper._fastapi_watch = "manual"
+        wrapper._fastapi_watch_probe = self
         return wrapper
 
     # ------------------------------------------------------------------

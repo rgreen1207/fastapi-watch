@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import AsyncGenerator, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
@@ -291,6 +291,211 @@ class HealthRegistry:
             self.add(probe, critical=critical)
         return self
 
+    def discover_routes(
+        self,
+        *,
+        exclude_paths: list[str] | None = None,
+        critical: bool = True,
+        tags: list[str] | None = None,
+        ws_probe_kwargs: dict | None = None,
+        **probe_kwargs,
+    ) -> "HealthRegistry":
+        """Automatically instrument all registered FastAPI routes.
+
+        Scans the app's route table and wraps each route handler with a
+        :class:`~fastapi_watch.probes.route.FastAPIRouteProbe` (HTTP) or
+        :class:`~fastapi_watch.probes.websocket.FastAPIWebSocketProbe` (WebSocket).
+        Call this after all routes are registered (e.g. at the end of your app
+        module or inside a lifespan startup hook).
+
+        Health endpoints under this registry's *prefix* are always excluded.
+
+        Args:
+            exclude_paths: Additional route paths to skip (e.g. ``["/internal/ping"]``).
+            critical: Whether the auto-created probes are critical (default ``True``).
+            tags: Tags attached to every auto-created probe; used to filter
+                ``/health/ready?tag=...`` and ``/health/status?tag=...``.
+            ws_probe_kwargs: Extra keyword arguments forwarded to each
+                :class:`~fastapi_watch.probes.websocket.FastAPIWebSocketProbe`
+                (e.g. ``{"min_active_connections": 1}``).  Separate from
+                *probe_kwargs* because WebSocket probes have different options.
+            **probe_kwargs: Extra keyword arguments forwarded to each
+                :class:`~fastapi_watch.probes.route.FastAPIRouteProbe`
+                (e.g. ``max_error_rate=0.05``).
+
+        Returns ``self`` for chaining.
+        """
+        from fastapi.routing import APIRoute
+        from .probes.route import FastAPIRouteProbe
+        from .probes.websocket import FastAPIWebSocketProbe
+
+        try:
+            from fastapi.routing import APIWebSocketRoute
+        except ImportError:
+            APIWebSocketRoute = None
+
+        excluded = set(exclude_paths or [])
+        _tags = list(tags) if tags else []
+        _ws_kwargs = ws_probe_kwargs or {}
+
+        for route in self.app.routes:
+            if route.path.startswith(self.prefix):
+                continue
+            if route.path in excluded:
+                continue
+            if not isinstance(route, APIRoute) and not (
+                APIWebSocketRoute is not None and isinstance(route, APIWebSocketRoute)
+            ):
+                continue
+
+            # Priority: manual (@probe.watch) > watch_router > discover_routes.
+            # Any prior instrumentation blocks discover_routes.
+            current = getattr(route.dependant, "call", None)
+            if getattr(current, "_fastapi_watch", None) is not None:
+                continue
+
+            if isinstance(route, APIRoute):
+                probe = FastAPIRouteProbe(
+                    name=route.name or route.path,
+                    description=route.path,
+                    tags=_tags,
+                    **probe_kwargs,
+                )
+                wrapped = probe.watch(route.endpoint)
+            elif APIWebSocketRoute is not None and isinstance(route, APIWebSocketRoute):
+                probe = FastAPIWebSocketProbe(
+                    name=route.name or route.path,
+                    description=route.path,
+                    tags=_tags,
+                    **_ws_kwargs,
+                )
+                wrapped = probe.watch(route.endpoint)
+            else:
+                continue
+
+            try:
+                wrapped._fastapi_watch = "discover"
+                wrapped._fastapi_watch_probe = probe
+                route.dependant.call = wrapped
+            except AttributeError:
+                continue
+            self.add(probe, critical=critical)
+
+        return self
+
+    def watch_router(
+        self,
+        router,
+        *,
+        tags: list[str] | None = None,
+        critical: bool = True,
+        exclude_paths: list[str] | None = None,
+        ws_probe_kwargs: dict | None = None,
+        **probe_kwargs,
+    ) -> "HealthRegistry":
+        """Instrument all routes belonging to a specific ``APIRouter``.
+
+        Like :meth:`discover_routes` but scoped to a single router — useful
+        when you want different tags, thresholds, or criticality per router.
+        Call it after ``app.include_router(router)`` so that FastAPI has
+        already baked the routes (with their final paths) into ``app.routes``.
+        Both HTTP and WebSocket routes are instrumented automatically.
+
+        Priority: ``@probe.watch`` (highest) > ``watch_router`` > ``discover_routes``.
+        Routes already instrumented by ``@probe.watch`` or a previous
+        ``watch_router`` call are silently skipped.  Routes previously
+        instrumented by ``discover_routes`` are replaced and the old probe
+        removed from the registry.
+
+        Args:
+            router: The ``APIRouter`` whose routes should be instrumented.
+            tags: Tags attached to every probe created for this router.
+            critical: Whether the auto-created probes are critical (default ``True``).
+            exclude_paths: Route paths to skip.
+            ws_probe_kwargs: Extra keyword arguments forwarded to each
+                :class:`~fastapi_watch.probes.websocket.FastAPIWebSocketProbe`
+                (e.g. ``{"min_active_connections": 1}``).
+            **probe_kwargs: Forwarded to each
+                :class:`~fastapi_watch.probes.route.FastAPIRouteProbe`.
+
+        Returns ``self`` for chaining.
+
+        Example::
+
+            app.include_router(users_router, prefix="/users")
+            app.include_router(orders_router, prefix="/orders")
+
+            registry.watch_router(users_router, tags=["users"], max_error_rate=0.05)
+            registry.watch_router(orders_router, tags=["orders"], critical=False)
+        """
+        from fastapi.routing import APIRoute
+        from .probes.route import FastAPIRouteProbe
+        from .probes.websocket import FastAPIWebSocketProbe
+
+        try:
+            from fastapi.routing import APIWebSocketRoute
+        except ImportError:
+            APIWebSocketRoute = None
+
+        excluded = set(exclude_paths or [])
+        _tags = list(tags) if tags else []
+        _ws_kwargs = ws_probe_kwargs or {}
+
+        router_routes = getattr(router, "routes", [])
+        router_endpoints = {r.endpoint for r in router_routes}
+
+        for route in self.app.routes:
+            if not isinstance(route, APIRoute) and not (
+                APIWebSocketRoute is not None and isinstance(route, APIWebSocketRoute)
+            ):
+                continue
+            if getattr(route, "endpoint", None) not in router_endpoints:
+                continue
+            if route.path in excluded:
+                continue
+
+            # Priority: manual > watch_router > discover_routes.
+            current = getattr(route.dependant, "call", None)
+            fw = getattr(current, "_fastapi_watch", None)
+            if fw in ("manual", "router"):
+                continue  # manual or watch_router already in place — don't touch it
+
+            # If discover_routes previously instrumented this route, evict its probe
+            # before replacing it so it doesn't linger as a ghost in the registry.
+            if fw == "discover":
+                old_probe = getattr(current, "_fastapi_watch_probe", None)
+                if old_probe is not None:
+                    self._probes = [(p, c) for p, c in self._probes if p is not old_probe]
+
+            if isinstance(route, APIRoute):
+                probe = FastAPIRouteProbe(
+                    name=route.name or route.path,
+                    description=route.path,
+                    tags=_tags,
+                    **probe_kwargs,
+                )
+                wrapped = probe.watch(route.endpoint)
+            elif APIWebSocketRoute is not None and isinstance(route, APIWebSocketRoute):
+                probe = FastAPIWebSocketProbe(
+                    name=route.name or route.path,
+                    description=route.path,
+                    tags=_tags,
+                    **_ws_kwargs,
+                )
+                wrapped = probe.watch(route.endpoint)
+            else:
+                continue
+
+            try:
+                wrapped._fastapi_watch = "router"
+                wrapped._fastapi_watch_probe = probe
+                route.dependant.call = wrapped
+            except AttributeError:
+                continue
+            self.add(probe, critical=critical)
+
+        return self
+
     def set_started(self) -> "HealthRegistry":
         """Mark the application as fully initialised.
 
@@ -390,7 +595,21 @@ class HealthRegistry:
         """Run a subset of probes, update the cache, history, and fire callbacks."""
         if not pairs:
             return []
-        results = list(await asyncio.gather(*(self._safe_check(p, c) for p, c in pairs)))
+        raw = list(await asyncio.gather(*(self._safe_check(p, c) for p, c in pairs)))
+        probe_meta = {p.name: p for p, _ in pairs}
+        results = []
+        for r in raw:
+            probe = probe_meta.get(r.name)
+            if probe is not None:
+                updates: dict = {}
+                if getattr(probe, "description", None) is not None and r.description is None:
+                    updates["description"] = probe.description
+                probe_tags = getattr(probe, "tags", None) or []
+                if probe_tags and not r.tags:
+                    updates["tags"] = probe_tags
+                if updates:
+                    r = r.model_copy(update=updates)
+            results.append(r)
         now_dt = datetime.now(self._tzinfo)
         run_time = asyncio.get_running_loop().time()
         async with self._cache_lock:
@@ -780,12 +999,14 @@ class HealthRegistry:
             description="Returns 200 if all critical probes pass, 503 otherwise.",
             dependencies=auth_deps,
         )
-        async def readiness() -> Response:
+        async def readiness(tag: str | None = Query(default=None)) -> Response:
             if registry._in_maintenance():
                 return JSONResponse({"status": "maintenance"}, status_code=200)
             if registry._in_grace_period():
                 return JSONResponse({"status": "starting"}, status_code=503)
             results = await registry._get_results()
+            if tag is not None:
+                results = [r for r in results if tag in r.tags]
             report = HealthReport.from_results(
                 results,
                 checked_at=registry._last_checked_at,
@@ -807,8 +1028,10 @@ class HealthRegistry:
             description="Returns full probe results. 200 when all healthy, 207 when any probe fails.",
             dependencies=auth_deps,
         )
-        async def health_status() -> Response:
+        async def health_status(tag: str | None = Query(default=None)) -> Response:
             results = await registry._get_results()
+            if tag is not None:
+                results = [r for r in results if tag in r.tags]
             report = HealthReport.from_results(
                 results,
                 checked_at=registry._last_checked_at,
