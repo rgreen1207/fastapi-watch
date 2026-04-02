@@ -26,7 +26,7 @@ _FIELD_GLOSSARY: list[tuple[str, str]] = [
     ("description",          "Label identifying the route or operation this probe covers."),
     # Request / call counts
     ("request_count",        "Total requests observed by this probe since startup."),
-    ("call_count",           "Total calls instrumented by this probe since startup (passive probes)."),
+    ("call_count",           "Total calls monitored by this probe since startup (passive probes)."),
     ("error_count",          "Requests or calls that returned a status code at or above the error threshold (default: 500). Click to reveal the last recorded error."),
     ("error_rate",           "Fraction of requests counted as errors (error_count ÷ request_count)."),
     ("consecutive_errors",   "Unbroken run of error responses since the last success; resets to 0 on any success."),

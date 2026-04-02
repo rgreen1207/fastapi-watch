@@ -4,7 +4,7 @@ from .base import PassiveProbe
 class RedisProbe(PassiveProbe):
     """Health probe that passively observes outgoing Redis calls via the :meth:`watch` decorator.
 
-    Instruments the functions in your code that interact with Redis, recording
+    Monitors the functions in your code that interact with Redis, recording
     latency and errors from real traffic rather than making synthetic commands
     on a poll timer.
 

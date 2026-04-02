@@ -99,7 +99,7 @@ class BaseProbe(ABC):
 class PassiveProbe(BaseProbe):
     """Base class for custom **passive** health probes.
 
-    Passive probes never make their own external calls. Instead they instrument
+    Passive probes never make their own external calls. Instead they monitor
     functions in your code via the inherited :meth:`watch` decorator. Every
     watched call is silently timed; exceptions are counted as errors and
     re-raised unchanged. :meth:`check` reports the accumulated stats.
@@ -274,7 +274,7 @@ class PassiveProbe(BaseProbe):
         return 0.0 if self._call_count == 0 else self._error_count / self._call_count
 
     def watch(self, func: Callable) -> Callable:
-        """Decorator that silently instruments a function call.
+        """Decorator that silently monitors a function call.
 
         Works with both ``async def`` and ``def``. Records latency and whether
         the call raised an exception. Re-raises all exceptions unchanged.

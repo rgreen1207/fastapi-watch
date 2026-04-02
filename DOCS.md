@@ -693,9 +693,9 @@ async def test_unhealthy_on_exception(monkeypatch):
 
 ## Route auto-discovery
 
-fastapi-watch provides three ways to instrument FastAPI routes. They have a fixed priority order and are safe to combine — when multiple approaches target the same route, the highest-priority one wins and the others skip it silently.
+fastapi-watch provides three ways to monitor FastAPI routes. They have a fixed priority order and are safe to combine — when multiple approaches target the same route, the highest-priority one wins and the others skip it silently.
 
-### Instrumentation priority
+### Monitoring priority
 
 | Priority | Method | When to use |
 |----------|--------|-------------|
@@ -730,7 +730,7 @@ registry.add(checkout_probe)
 
 ### `watch_router` — mid priority
 
-Instruments every route on a specific `APIRouter` with shared settings. Call it after `app.include_router` — FastAPI must have already baked the routes into `app.routes` before `watch_router` can find them. Skips routes already decorated with `@probe.watch`. Overrides any `discover_routes` instrumentation on the same routes.
+Monitors every route on a specific `APIRouter` with shared settings. Call it after `app.include_router` — FastAPI must have already baked the routes into `app.routes` before `watch_router` can find them. Skips routes already decorated with `@probe.watch`. Overrides any `discover_routes` monitoring on the same routes.
 
 ```python
 app.include_router(users_router, prefix="/users")
@@ -748,17 +748,17 @@ registry.watch_router(internal_router, tags=["internal"], critical=False)
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `router` | required | The `APIRouter` to instrument |
+| `router` | required | The `APIRouter` to monitor |
 | `tags` | `None` | Extra tags appended to every probe (FastAPI route tags are also merged in automatically) |
 | `critical` | `True` | Whether auto-created probes are critical |
 | `exclude_paths` | `None` | Route paths to skip; supports fnmatch glob patterns (e.g. `["/admin/*"]`) |
-| `include_methods` | `None` | Only instrument routes whose HTTP method matches (e.g. `["GET", "POST"]`); WebSocket routes are always included |
+| `include_methods` | `None` | Only monitor routes whose HTTP method matches (e.g. `["GET", "POST"]`); WebSocket routes are always included |
 | `ws_probe_kwargs` | `None` | Extra kwargs forwarded to each `FastAPIWebSocketProbe` |
 | `**probe_kwargs` | — | Forwarded to each `FastAPIRouteProbe` |
 
 ### `discover_routes` — lowest priority
 
-Scans all registered routes and instruments any that haven't already been covered. Call it from a lifespan startup handler so all `include_router` calls have already run. Routes under the health prefix are always excluded automatically.
+Scans all registered routes and monitors any that haven't already been covered. Call it from a lifespan startup handler so all `include_router` calls have already run. Routes under the health prefix are always excluded automatically.
 
 ```python
 @asynccontextmanager
@@ -773,11 +773,11 @@ async def lifespan(app):
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `exclude_paths` | `None` | Route paths to skip; supports fnmatch glob patterns (e.g. `["/internal/*", "/admin/*"]`) |
-| `include_methods` | `None` | Only instrument routes whose HTTP method matches (e.g. `["GET", "POST"]`); WebSocket routes always pass |
+| `include_methods` | `None` | Only monitor routes whose HTTP method matches (e.g. `["GET", "POST"]`); WebSocket routes always pass |
 | `critical` | `True` | Whether auto-created probes are critical |
 | `tags` | `None` | Extra tags appended to every probe (FastAPI route tags are also merged in automatically) |
 | `ws_probe_kwargs` | `None` | Extra kwargs forwarded to each `FastAPIWebSocketProbe` (e.g. `{"min_active_connections": 1}`) |
-| `refresh` | `False` | Re-instrument previously auto-discovered routes with updated options. `@probe.watch` and `watch_router` routes are never overridden even with `refresh=True` |
+| `refresh` | `False` | Re-monitor previously auto-discovered routes with updated options. `@probe.watch` and `watch_router` routes are never overridden even with `refresh=True` |
 | `**probe_kwargs` | — | Forwarded to each `FastAPIRouteProbe` (e.g. `max_error_rate=0.05`) |
 
 **Probe naming:** each probe is named after the handler function (`route.name`), which FastAPI sets from the function name by default — so probes have readable names like `list_users` and `create_order` without any configuration.
@@ -903,7 +903,7 @@ registry.add(probe)
 
 `FastAPIRouteProbe` collects real-traffic metrics from a FastAPI route — no synthetic requests.
 
-For most apps, [route auto-discovery](#route-auto-discovery) is the easiest way to instrument all routes at once. Use `FastAPIRouteProbe` directly when a specific route needs its own thresholds, description, or tags.
+For most apps, [route auto-discovery](#route-auto-discovery) is the easiest way to monitor all routes at once. Use `FastAPIRouteProbe` directly when a specific route needs its own thresholds, description, or tags.
 
 ```python
 from fastapi_watch import FastAPIRouteProbe
@@ -1006,7 +1006,7 @@ async def list_users():
 
 ### WebSocket probe
 
-`FastAPIWebSocketProbe` passively instruments a WebSocket handler.
+`FastAPIWebSocketProbe` passively monitors a WebSocket handler.
 
 ```python
 from fastapi_watch import FastAPIWebSocketProbe
@@ -1066,7 +1066,7 @@ Details: `host`, `port`, `resolved_ips`, `connect_ms`.
 
 ### SMTP
 
-`SMTPProbe` passively instruments outgoing email calls via `@probe.watch`. Works with any SMTP library.
+`SMTPProbe` passively monitors outgoing email calls via `@probe.watch`. Works with any SMTP library.
 
 ```python
 from fastapi_watch.probes import SMTPProbe
@@ -1113,7 +1113,7 @@ If the inner probe returns UNHEALTHY, it passes through unchanged. `fail_if` tak
 pip install "fastapi-watch[postgres]"
 ```
 
-`PostgreSQLProbe` passively instruments PostgreSQL calls via `@probe.watch`.
+`PostgreSQLProbe` passively monitors PostgreSQL calls via `@probe.watch`.
 
 ```python
 from fastapi_watch.probes import PostgreSQLProbe
@@ -1249,7 +1249,7 @@ registry.add(mongo_probe)
 
 ### HTTP calls
 
-`HttpProbe` passively instruments outgoing HTTP calls — no synthetic requests.
+`HttpProbe` passively monitors outgoing HTTP calls — no synthetic requests.
 
 ```python
 from fastapi_watch.probes import HttpProbe

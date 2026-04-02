@@ -4,7 +4,7 @@ from .base import PassiveProbe
 class MySQLProbe(PassiveProbe):
     """Health probe that passively observes outgoing MySQL / MariaDB calls via the :meth:`watch` decorator.
 
-    Instruments the functions in your code that query MySQL, recording
+    Monitors the functions in your code that query MySQL, recording
     latency and errors from real traffic rather than opening a synthetic
     connection and running queries on a poll timer.
 

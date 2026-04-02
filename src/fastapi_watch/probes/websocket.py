@@ -91,7 +91,7 @@ class _WebSocketWrapper:
 
 
 class FastAPIWebSocketProbe(BaseProbe):
-    """Health probe that instruments a FastAPI WebSocket handler via the :meth:`watch` decorator.
+    """Health probe that monitors a FastAPI WebSocket handler via the :meth:`watch` decorator.
 
     Collects per-endpoint connection stats from real traffic and reports them as a
     :class:`~fastapi_watch.models.ProbeResult`.  The probe is passive — it observes
@@ -213,7 +213,7 @@ class FastAPIWebSocketProbe(BaseProbe):
     # ------------------------------------------------------------------
 
     def watch(self, func: Callable) -> Callable:
-        """Decorator that instruments a WebSocket handler.
+        """Decorator that monitors a WebSocket handler.
 
         Injects a transparent :class:`_WebSocketWrapper` in place of the real
         ``WebSocket`` object so that message counts are collected without any
