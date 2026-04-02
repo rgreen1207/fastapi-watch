@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import AsyncGenerator, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
@@ -27,6 +27,27 @@ from .probes.base import BaseProbe
 from .storage import InMemoryProbeStorage, ProbeStorage
 
 _MIN_POLL_INTERVAL_MS = 1000
+_AUTO_HTTP_METHODS = frozenset({"HEAD", "OPTIONS"})
+
+
+def _route_description(route, APIWebSocketRoute) -> str:
+    """Return a human-readable route label: ``'GET /items/{id}'`` or ``'WS /ws/chat'``."""
+    if APIWebSocketRoute is not None and isinstance(route, APIWebSocketRoute):
+        return f"WS {route.path}"
+    all_methods = set(getattr(route, "methods", None) or set())
+    meaningful = sorted(all_methods - _AUTO_HTTP_METHODS) or sorted(all_methods)
+    return f"{' '.join(meaningful)} {route.path}"
+
+
+def _parse_tag_filter(tag: str | None) -> frozenset[str] | None:
+    """Parse a comma-separated tag query param into a frozenset, or None for no filter.
+
+    Treats empty strings, whitespace-only values, and None identically — all mean no filter.
+    """
+    if not tag:
+        return None
+    tags = frozenset(t.strip() for t in tag.split(",") if t.strip())
+    return tags or None
 
 
 def _normalize_interval(ms: int | None) -> int | None:
@@ -271,8 +292,15 @@ class HealthRegistry:
     # ------------------------------------------------------------------
 
     def include(self, group: ProbeGroup) -> "HealthRegistry":
-        """Include all probes from a :class:`~fastapi_watch.ProbeGroup`. Returns ``self``."""
+        """Include all probes from a :class:`~fastapi_watch.ProbeGroup`. Returns ``self``.
+
+        Group-level tags are merged into each probe's own tags (probe tags first,
+        group tags appended, duplicates removed).
+        """
         for probe, critical in group._probes:
+            if group.tags and hasattr(probe, "tags"):
+                existing = list(probe.tags or [])
+                probe.tags = list(dict.fromkeys(existing + group.tags))
             self.add(probe, critical=critical)
         return self
 
@@ -289,6 +317,293 @@ class HealthRegistry:
         """Add a list of probes. Returns ``self`` for chaining."""
         for probe in probes:
             self.add(probe, critical=critical)
+        return self
+
+    def discover_routes(
+        self,
+        *,
+        exclude_paths: list[str] | None = None,
+        include_paths: list[str] | None = None,
+        include_methods: list[str] | None = None,
+        critical: bool = True,
+        tags: list[str] | None = None,
+        ws_probe_kwargs: dict | None = None,
+        refresh: bool = False,
+        name_fn: "Callable | None" = None,
+        **probe_kwargs,
+    ) -> "HealthRegistry":
+        """Automatically monitor all registered FastAPI routes.
+
+        Scans the app's route table and wraps each route handler with a
+        :class:`~fastapi_watch.probes.route.FastAPIRouteProbe` (HTTP) or
+        :class:`~fastapi_watch.probes.websocket.FastAPIWebSocketProbe` (WebSocket).
+        Call this after all routes are registered (e.g. at the end of your app
+        module or inside a lifespan startup hook).
+
+        Health endpoints under this registry's *prefix* are always excluded.
+        FastAPI route tags (used for OpenAPI docs) are automatically merged into
+        probe tags; *tags* adds extra labels on top of those.
+
+        Args:
+            exclude_paths: Route paths to skip; supports fnmatch glob patterns
+                (e.g. ``["/internal/*", "/admin/*"]``).
+            include_paths: Whitelist of route paths to monitor; supports fnmatch
+                glob patterns (e.g. ``["/api/*"]``).  When provided, only routes
+                matching at least one pattern are monitored.  ``exclude_paths``
+                is applied after and takes precedence.
+            include_methods: Only monitor routes whose HTTP method is in this
+                list (e.g. ``["GET", "POST"]``).  WebSocket routes are always
+                included.  Defaults to all methods.
+            critical: Whether the auto-created probes are critical (default ``True``).
+            tags: Extra tags attached to every auto-created probe, in addition to
+                any FastAPI route tags already on each route.
+            ws_probe_kwargs: Extra keyword arguments forwarded to each
+                :class:`~fastapi_watch.probes.websocket.FastAPIWebSocketProbe`
+                (e.g. ``{"min_active_connections": 1}``).
+            refresh: Re-monitor routes that were previously auto-discovered.
+                Useful when routes are added dynamically or when options change.
+                ``@probe.watch`` and ``watch_router`` monitoring is never
+                overridden even with ``refresh=True``.
+            name_fn: Optional callable ``(route) -> str`` to customise probe names.
+                Receives the FastAPI route object and returns the desired probe name.
+                Defaults to ``route.name`` (the handler function name).
+            **probe_kwargs: Extra keyword arguments forwarded to each
+                :class:`~fastapi_watch.probes.route.FastAPIRouteProbe`
+                (e.g. ``max_error_rate=0.05``).
+
+        Returns ``self`` for chaining.
+        """
+        import fnmatch
+        from fastapi.routing import APIRoute
+        from .probes.route import FastAPIRouteProbe
+        from .probes.websocket import FastAPIWebSocketProbe
+
+        try:
+            from fastapi.routing import APIWebSocketRoute
+        except ImportError:
+            APIWebSocketRoute = None
+
+        excluded = list(exclude_paths or [])
+        included = list(include_paths or [])
+        _include_methods = {m.upper() for m in include_methods} if include_methods else None
+        _tags = list(tags) if tags else []
+        _ws_kwargs = ws_probe_kwargs or {}
+
+        for route in self.app.routes:
+            if route.path.startswith(self.prefix):
+                continue
+            if included and not any(fnmatch.fnmatch(route.path, p) for p in included):
+                continue
+            if any(fnmatch.fnmatch(route.path, p) for p in excluded):
+                continue
+            if not isinstance(route, APIRoute) and not (
+                APIWebSocketRoute is not None and isinstance(route, APIWebSocketRoute)
+            ):
+                continue
+            if _include_methods is not None and isinstance(route, APIRoute):
+                route_methods = set(getattr(route, "methods", None) or set())
+                if not route_methods & _include_methods:
+                    continue
+
+            current = getattr(route.dependant, "call", None)
+            fw = getattr(current, "_fastapi_watch", None)
+
+            if refresh:
+                if fw in ("manual", "router"):
+                    continue
+                if fw == "discover":
+                    old = getattr(current, "_fastapi_watch_probe", None)
+                    if old is not None:
+                        self._probes = [(p, c) for p, c in self._probes if p is not old]
+            else:
+                if fw is not None:
+                    continue
+
+            route_tags = list(getattr(route, "tags", None) or [])
+            probe_tags = list(dict.fromkeys(route_tags + _tags))
+            description = _route_description(route, APIWebSocketRoute)
+
+            probe_name = name_fn(route) if name_fn else (route.name or route.path)
+            if isinstance(route, APIRoute):
+                probe = FastAPIRouteProbe(
+                    name=probe_name,
+                    description=description,
+                    tags=probe_tags,
+                    **probe_kwargs,
+                )
+            else:
+                probe = FastAPIWebSocketProbe(
+                    name=probe_name,
+                    description=description,
+                    tags=probe_tags,
+                    **_ws_kwargs,
+                )
+
+            wrapped = probe.watch(route.endpoint)
+            try:
+                wrapped._fastapi_watch = "discover"
+                wrapped._fastapi_watch_probe = probe
+                route.dependant.call = wrapped
+            except AttributeError:
+                continue
+            self.add(probe, critical=critical)
+
+        return self
+
+    def watch_router(
+        self,
+        router,
+        *,
+        tags: list[str] | None = None,
+        critical: bool = True,
+        exclude_paths: list[str] | None = None,
+        include_paths: list[str] | None = None,
+        include_methods: list[str] | None = None,
+        ws_probe_kwargs: dict | None = None,
+        name_fn: "Callable | None" = None,
+        group: bool = False,
+        **probe_kwargs,
+    ) -> "HealthRegistry":
+        """Monitor all routes belonging to a specific ``APIRouter``.
+
+        Like :meth:`discover_routes` but scoped to a single router — useful
+        when you want different tags, thresholds, or criticality per router.
+        Call it after ``app.include_router(router)`` so that FastAPI has
+        already baked the routes (with their final paths) into ``app.routes``.
+        Both HTTP and WebSocket routes are monitored automatically.
+
+        FastAPI route tags are merged into probe tags; *tags* adds extra labels
+        on top of those.
+
+        Priority: ``@probe.watch`` (highest) > ``watch_router`` > ``discover_routes``.
+        Routes already monitored by ``@probe.watch`` or a previous
+        ``watch_router`` call are silently skipped.  Routes previously
+        monitored by ``discover_routes`` are replaced and the old probe
+        removed from the registry.
+
+        Args:
+            router: The ``APIRouter`` whose routes should be monitored.
+            tags: Extra tags attached to every probe, in addition to any FastAPI
+                route tags already on each route.
+            critical: Whether the auto-created probes are critical (default ``True``).
+            exclude_paths: Route paths to skip; supports fnmatch glob patterns
+                (e.g. ``["/admin/*"]``).
+            include_paths: Whitelist of route paths to monitor; supports fnmatch
+                glob patterns (e.g. ``["/users/*/profile"]``).  When provided,
+                only matching routes are monitored.  ``exclude_paths`` takes
+                precedence when both are set.
+            include_methods: Only monitor routes whose HTTP method is in this
+                list.  WebSocket routes are always included.
+            ws_probe_kwargs: Extra keyword arguments forwarded to each
+                :class:`~fastapi_watch.probes.websocket.FastAPIWebSocketProbe`.
+            name_fn: Optional callable ``(route) -> str`` to customise probe names.
+                Receives the FastAPI route object and returns the desired probe name.
+                Defaults to ``route.name`` (the handler function name).
+            group: When ``True``, all probes created for this router are collected
+                into a :class:`~fastapi_watch.ProbeGroup` before being registered,
+                so group-level tags propagate to every member probe.
+                Defaults to ``False``.
+            **probe_kwargs: Forwarded to each
+                :class:`~fastapi_watch.probes.route.FastAPIRouteProbe`.
+
+        Returns ``self`` for chaining.
+
+        Example::
+
+            app.include_router(users_router, prefix="/users")
+            app.include_router(orders_router, prefix="/orders")
+
+            registry.watch_router(users_router, tags=["users"], max_error_rate=0.05)
+            registry.watch_router(orders_router, tags=["orders"], critical=False)
+
+            # Monitor only write endpoints for the orders router
+            registry.watch_router(orders_router, include_methods=["POST", "PUT", "DELETE"])
+        """
+        import fnmatch
+        from fastapi.routing import APIRoute
+        from .probes.route import FastAPIRouteProbe
+        from .probes.websocket import FastAPIWebSocketProbe
+
+        try:
+            from fastapi.routing import APIWebSocketRoute
+        except ImportError:
+            APIWebSocketRoute = None
+
+        excluded = list(exclude_paths or [])
+        included = list(include_paths or [])
+        _include_methods = {m.upper() for m in include_methods} if include_methods else None
+        _tags = list(tags) if tags else []
+        _ws_kwargs = ws_probe_kwargs or {}
+
+        router_routes = getattr(router, "routes", [])
+        router_endpoints = {r.endpoint for r in router_routes}
+
+        probe_group: ProbeGroup | None = None
+        if group:
+            probe_group = ProbeGroup(tags=_tags or None)
+
+        for route in self.app.routes:
+            if not isinstance(route, APIRoute) and not (
+                APIWebSocketRoute is not None and isinstance(route, APIWebSocketRoute)
+            ):
+                continue
+            if getattr(route, "endpoint", None) not in router_endpoints:
+                continue
+            if included and not any(fnmatch.fnmatch(route.path, p) for p in included):
+                continue
+            if any(fnmatch.fnmatch(route.path, p) for p in excluded):
+                continue
+            if _include_methods is not None and isinstance(route, APIRoute):
+                route_methods = set(getattr(route, "methods", None) or set())
+                if not route_methods & _include_methods:
+                    continue
+
+            current = getattr(route.dependant, "call", None)
+            fw = getattr(current, "_fastapi_watch", None)
+            if fw in ("manual", "router"):
+                continue
+
+            if fw == "discover":
+                old = getattr(current, "_fastapi_watch_probe", None)
+                if old is not None:
+                    self._probes = [(p, c) for p, c in self._probes if p is not old]
+
+            route_tags = list(getattr(route, "tags", None) or [])
+            probe_tags = list(dict.fromkeys(route_tags + _tags))
+            description = _route_description(route, APIWebSocketRoute)
+
+            probe_name = name_fn(route) if name_fn else (route.name or route.path)
+            if isinstance(route, APIRoute):
+                probe = FastAPIRouteProbe(
+                    name=probe_name,
+                    description=description,
+                    tags=probe_tags,
+                    **probe_kwargs,
+                )
+            else:
+                probe = FastAPIWebSocketProbe(
+                    name=probe_name,
+                    description=description,
+                    tags=probe_tags,
+                    **_ws_kwargs,
+                )
+
+            wrapped = probe.watch(route.endpoint)
+            try:
+                wrapped._fastapi_watch = "router"
+                wrapped._fastapi_watch_probe = probe
+                route.dependant.call = wrapped
+            except AttributeError:
+                continue
+
+            if probe_group is not None:
+                probe_group.add(probe, critical=critical)
+            else:
+                self.add(probe, critical=critical)
+
+        if probe_group is not None:
+            self.include(probe_group)
+
         return self
 
     def set_started(self) -> "HealthRegistry":
@@ -390,7 +705,21 @@ class HealthRegistry:
         """Run a subset of probes, update the cache, history, and fire callbacks."""
         if not pairs:
             return []
-        results = list(await asyncio.gather(*(self._safe_check(p, c) for p, c in pairs)))
+        raw = list(await asyncio.gather(*(self._safe_check(p, c) for p, c in pairs)))
+        probe_meta = {p.name: p for p, _ in pairs}
+        results = []
+        for r in raw:
+            probe = probe_meta.get(r.name)
+            if probe is not None:
+                updates: dict = {}
+                if getattr(probe, "description", None) is not None and r.description is None:
+                    updates["description"] = probe.description
+                probe_tags = getattr(probe, "tags", None) or []
+                if probe_tags and not r.tags:
+                    updates["tags"] = probe_tags
+                if updates:
+                    r = r.model_copy(update=updates)
+            results.append(r)
         now_dt = datetime.now(self._tzinfo)
         run_time = asyncio.get_running_loop().time()
         async with self._cache_lock:
@@ -675,6 +1004,7 @@ class HealthRegistry:
         self,
         request: Request,
         make_report: Callable[[list[ProbeResult]], str],
+        filter_tags: frozenset[str] | None = None,
     ) -> AsyncGenerator[str, None]:
         """Async generator that yields SSE (Server-Sent Events) events while the client is connected."""
         task = asyncio.current_task()
@@ -684,6 +1014,8 @@ class HealthRegistry:
         try:
             while not self._shutting_down:
                 results = await self._get_results()
+                if filter_tags:
+                    results = [r for r in results if filter_tags & set(r.tags)]
                 yield f"data: {make_report(results)}\n\n"
                 if self._poll_interval_ms is None:
                     return
@@ -780,12 +1112,15 @@ class HealthRegistry:
             description="Returns 200 if all critical probes pass, 503 otherwise.",
             dependencies=auth_deps,
         )
-        async def readiness() -> Response:
+        async def readiness(tag: str | None = Query(default=None)) -> Response:
             if registry._in_maintenance():
                 return JSONResponse({"status": "maintenance"}, status_code=200)
             if registry._in_grace_period():
                 return JSONResponse({"status": "starting"}, status_code=503)
             results = await registry._get_results()
+            _filter = _parse_tag_filter(tag)
+            if _filter:
+                results = [r for r in results if _filter & set(r.tags)]
             report = HealthReport.from_results(
                 results,
                 checked_at=registry._last_checked_at,
@@ -807,8 +1142,11 @@ class HealthRegistry:
             description="Returns full probe results. 200 when all healthy, 207 when any probe fails.",
             dependencies=auth_deps,
         )
-        async def health_status() -> Response:
+        async def health_status(tag: str | None = Query(default=None)) -> Response:
             results = await registry._get_results()
+            _filter = _parse_tag_filter(tag)
+            if _filter:
+                results = [r for r in results if _filter & set(r.tags)]
             report = HealthReport.from_results(
                 results,
                 checked_at=registry._last_checked_at,
@@ -880,9 +1218,9 @@ class HealthRegistry:
             description="SSE (Server-Sent Events) stream of readiness. Poll loop stops when last client disconnects.",
             dependencies=auth_deps,
         )
-        async def readiness_stream(request: Request) -> StreamingResponse:
+        async def readiness_stream(request: Request, tag: str | None = Query(default=None)) -> StreamingResponse:
             return StreamingResponse(
-                registry._event_stream(request, _make_sse_report),
+                registry._event_stream(request, _make_sse_report, filter_tags=_parse_tag_filter(tag)),
                 media_type="text/event-stream",
                 headers=sse_headers,
             )
@@ -894,9 +1232,9 @@ class HealthRegistry:
             description="SSE (Server-Sent Events) stream of full probe results. Poll loop stops when last client disconnects.",
             dependencies=auth_deps,
         )
-        async def status_stream(request: Request) -> StreamingResponse:
+        async def status_stream(request: Request, tag: str | None = Query(default=None)) -> StreamingResponse:
             return StreamingResponse(
-                registry._event_stream(request, _make_sse_report),
+                registry._event_stream(request, _make_sse_report, filter_tags=_parse_tag_filter(tag)),
                 media_type="text/event-stream",
                 headers=sse_headers,
             )

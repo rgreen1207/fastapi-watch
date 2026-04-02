@@ -4,7 +4,7 @@ from .base import PassiveProbe
 class MongoProbe(PassiveProbe):
     """Health probe that passively observes outgoing MongoDB calls via the :meth:`watch` decorator.
 
-    Instruments the functions in your code that query MongoDB, recording
+    Monitors the functions in your code that query MongoDB, recording
     latency and errors from real traffic rather than issuing a synthetic
     ``serverStatus`` command on a poll timer.
 

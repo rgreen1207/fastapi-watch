@@ -5,7 +5,7 @@ class HttpProbe(PassiveProbe):
     """Health probe that passively observes outgoing HTTP calls via the :meth:`watch` decorator.
 
     Rather than making its own synthetic requests (which would burn API credits
-    or trip rate limits), ``HttpProbe`` instruments the functions in your code
+    or trip rate limits), ``HttpProbe`` monitors the functions in your code
     that call external services. Every call is silently timed and any exception
     is counted as an error.
 

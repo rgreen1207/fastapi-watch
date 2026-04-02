@@ -1,5 +1,44 @@
 # Release Notes
 
+## v1.5.10
+
+**Route auto-discovery, probe descriptions, tag-based filtering, and dashboard improvements.**
+
+### New Features
+
+#### Route auto-discovery
+- **`registry.discover_routes()`** — monitors every registered FastAPI route with one call. No decorators required. Accepts `exclude_paths`, `include_paths`, `include_methods`, `tags`, `ws_probe_kwargs`, `name_fn`, `refresh`, and any `FastAPIRouteProbe` keyword argument
+- **`registry.watch_router(router, ...)`** — scopes auto-discovery to a single `APIRouter` with its own tags, thresholds, and criticality. Call after `app.include_router`. Accepts all the same options as `discover_routes`
+- **Monitoring priority system** — `@probe.watch` (highest) > `watch_router` > `discover_routes` (lowest). All three are safe to mix; each checks the current state of a route and skips or replaces accordingly. No double-counting, no conflicts
+- **WebSocket auto-discovery** — both methods automatically detect `APIWebSocketRoute` and create a `FastAPIWebSocketProbe`. Pass `ws_probe_kwargs={...}` to forward WebSocket-specific options
+- **`name_fn`** — optional callable `(route) -> str` to customise probe names. Defaults to `route.name` (the handler function name)
+- **`include_paths`** — whitelist complement to `exclude_paths`; supports fnmatch glob patterns (e.g. `["/api/*"]`). `exclude_paths` takes precedence when both are set
+- **Glob patterns in `exclude_paths`** — supports fnmatch patterns such as `["/internal/*", "/admin/*"]` in both methods
+- **`discover_routes(refresh=True)`** — re-monitors previously auto-discovered routes with updated options, without touching `@probe.watch` or `watch_router` routes
+- **`watch_router(group=True)`** — collects all probes for the router into a `ProbeGroup` before registering, so group-level tags propagate to every member probe automatically
+
+#### Tags and filtering
+- **Probe tags** — all probe types accept `tags=[...]`. Tags appear in results and enable filtered endpoints
+- **FastAPI route tags auto-merged** — `discover_routes` and `watch_router` pull each route's OpenAPI tags into probe tags automatically; user-supplied tags are appended on top
+- **`ProbeGroup` tags** — `ProbeGroup(tags=["db"])` propagates tags to all member probes when included in the registry
+- **Comma-separated OR filtering** — `?tag=payments,orders` returns probes matching either tag. Both `/health/ready` and `/health/status` support this
+- **SSE stream tag filtering** — `/health/ready/stream?tag=payments` and `/health/status/stream?tag=payments` filter the live stream
+- **Empty `?tag=` treated as no filter** — previously an empty tag param would return zero probes; now correctly ignored
+
+#### Probe descriptions
+- **Probe descriptions** — all probes accept `description`. Auto-discovered probes use `GET /items/{id}` / `WS /ws/chat` style descriptions automatically
+
+#### Dashboard
+- **Tag filter bar** — clickable tag buttons above the probe grid for instant client-side filtering; a Clear button resets all active filters
+- **Tag badges** — probe cards show tag chips below the probe name
+- **Probe search** — text input filters probe cards by name in real time; works alongside the tag filter (both must match)
+
+### Bug Fixes
+- Fixed `discover_routes`/`watch_router` crashing on non-`APIRoute` objects (e.g. `Mount`) in `app.routes`
+- Fixed `FastAPIWebSocketProbe.watch` not counting messages when WebSocket is passed as a positional argument
+
+---
+
 ## v1.5.9
 
 **Automatic cache hit/miss tracking for `@lru_cache` and `@alru_cache`.**
@@ -85,7 +124,7 @@
 
 **Passive probes, multi-target alerters, ProbeGroup, and alert webhooks.**
 
-- `PassiveProbe` base class — instruments your own functions via `@probe.watch` instead of making synthetic requests
+- `PassiveProbe` base class — monitors your own functions via `@probe.watch` instead of making synthetic requests
 - `HttpProbe`, `SMTPProbe`, `PostgreSQLProbe`, `MySQLProbe`, `RedisProbe`, `MongoProbe`, `SQLAlchemyProbe` refactored as passive observers
 - `ProbeGroup` — aggregate multiple probes under a single name
 - Multi-target alert webhook system — send alerts to multiple endpoints simultaneously
@@ -127,7 +166,7 @@
 - HTTP basic auth on the health endpoints
 - `StartupProbe` — reports unhealthy until explicitly marked ready
 - `WebSocketProbe` — checks WebSocket endpoint connectivity
-- `RouteProbe` (later renamed `FastAPIRouteProbe`) — instruments FastAPI route handlers
+- `RouteProbe` (later renamed `FastAPIRouteProbe`) — monitors FastAPI route handlers
 - `ProbeRouter` — mounts all health routes under a configurable prefix
 - HTML health dashboard at `/health/dashboard`
 
