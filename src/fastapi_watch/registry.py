@@ -39,6 +39,17 @@ def _route_description(route, APIWebSocketRoute) -> str:
     return f"{' '.join(meaningful)} {route.path}"
 
 
+def _parse_tag_filter(tag: str | None) -> frozenset[str] | None:
+    """Parse a comma-separated tag query param into a frozenset, or None for no filter.
+
+    Treats empty strings, whitespace-only values, and None identically — all mean no filter.
+    """
+    if not tag:
+        return None
+    tags = frozenset(t.strip() for t in tag.split(",") if t.strip())
+    return tags or None
+
+
 def _normalize_interval(ms: int | None) -> int | None:
     """Validate and normalize a poll interval.
 
@@ -317,6 +328,7 @@ class HealthRegistry:
         tags: list[str] | None = None,
         ws_probe_kwargs: dict | None = None,
         refresh: bool = False,
+        name_fn: "Callable | None" = None,
         **probe_kwargs,
     ) -> "HealthRegistry":
         """Automatically instrument all registered FastAPI routes.
@@ -347,6 +359,9 @@ class HealthRegistry:
                 Useful when routes are added dynamically or when options change.
                 ``@probe.watch`` and ``watch_router`` instrumentation is never
                 overridden even with ``refresh=True``.
+            name_fn: Optional callable ``(route) -> str`` to customise probe names.
+                Receives the FastAPI route object and returns the desired probe name.
+                Defaults to ``route.name`` (the handler function name).
             **probe_kwargs: Extra keyword arguments forwarded to each
                 :class:`~fastapi_watch.probes.route.FastAPIRouteProbe`
                 (e.g. ``max_error_rate=0.05``).
@@ -400,16 +415,17 @@ class HealthRegistry:
             probe_tags = list(dict.fromkeys(route_tags + _tags))
             description = _route_description(route, APIWebSocketRoute)
 
+            probe_name = name_fn(route) if name_fn else (route.name or route.path)
             if isinstance(route, APIRoute):
                 probe = FastAPIRouteProbe(
-                    name=route.name or route.path,
+                    name=probe_name,
                     description=description,
                     tags=probe_tags,
                     **probe_kwargs,
                 )
             else:
                 probe = FastAPIWebSocketProbe(
-                    name=route.name or route.path,
+                    name=probe_name,
                     description=description,
                     tags=probe_tags,
                     **_ws_kwargs,
@@ -435,6 +451,7 @@ class HealthRegistry:
         exclude_paths: list[str] | None = None,
         include_methods: list[str] | None = None,
         ws_probe_kwargs: dict | None = None,
+        name_fn: "Callable | None" = None,
         **probe_kwargs,
     ) -> "HealthRegistry":
         """Instrument all routes belonging to a specific ``APIRouter``.
@@ -465,6 +482,9 @@ class HealthRegistry:
                 list.  WebSocket routes are always included.
             ws_probe_kwargs: Extra keyword arguments forwarded to each
                 :class:`~fastapi_watch.probes.websocket.FastAPIWebSocketProbe`.
+            name_fn: Optional callable ``(route) -> str`` to customise probe names.
+                Receives the FastAPI route object and returns the desired probe name.
+                Defaults to ``route.name`` (the handler function name).
             **probe_kwargs: Forwarded to each
                 :class:`~fastapi_watch.probes.route.FastAPIRouteProbe`.
 
@@ -524,16 +544,17 @@ class HealthRegistry:
             probe_tags = list(dict.fromkeys(route_tags + _tags))
             description = _route_description(route, APIWebSocketRoute)
 
+            probe_name = name_fn(route) if name_fn else (route.name or route.path)
             if isinstance(route, APIRoute):
                 probe = FastAPIRouteProbe(
-                    name=route.name or route.path,
+                    name=probe_name,
                     description=description,
                     tags=probe_tags,
                     **probe_kwargs,
                 )
             else:
                 probe = FastAPIWebSocketProbe(
-                    name=route.name or route.path,
+                    name=probe_name,
                     description=description,
                     tags=probe_tags,
                     **_ws_kwargs,
@@ -948,6 +969,7 @@ class HealthRegistry:
         self,
         request: Request,
         make_report: Callable[[list[ProbeResult]], str],
+        filter_tags: frozenset[str] | None = None,
     ) -> AsyncGenerator[str, None]:
         """Async generator that yields SSE (Server-Sent Events) events while the client is connected."""
         task = asyncio.current_task()
@@ -957,6 +979,8 @@ class HealthRegistry:
         try:
             while not self._shutting_down:
                 results = await self._get_results()
+                if filter_tags:
+                    results = [r for r in results if filter_tags & set(r.tags)]
                 yield f"data: {make_report(results)}\n\n"
                 if self._poll_interval_ms is None:
                     return
@@ -1059,9 +1083,9 @@ class HealthRegistry:
             if registry._in_grace_period():
                 return JSONResponse({"status": "starting"}, status_code=503)
             results = await registry._get_results()
-            if tag is not None:
-                filter_tags = {t.strip() for t in tag.split(",") if t.strip()}
-                results = [r for r in results if filter_tags & set(r.tags)]
+            _filter = _parse_tag_filter(tag)
+            if _filter:
+                results = [r for r in results if _filter & set(r.tags)]
             report = HealthReport.from_results(
                 results,
                 checked_at=registry._last_checked_at,
@@ -1085,9 +1109,9 @@ class HealthRegistry:
         )
         async def health_status(tag: str | None = Query(default=None)) -> Response:
             results = await registry._get_results()
-            if tag is not None:
-                filter_tags = {t.strip() for t in tag.split(",") if t.strip()}
-                results = [r for r in results if filter_tags & set(r.tags)]
+            _filter = _parse_tag_filter(tag)
+            if _filter:
+                results = [r for r in results if _filter & set(r.tags)]
             report = HealthReport.from_results(
                 results,
                 checked_at=registry._last_checked_at,
@@ -1159,9 +1183,9 @@ class HealthRegistry:
             description="SSE (Server-Sent Events) stream of readiness. Poll loop stops when last client disconnects.",
             dependencies=auth_deps,
         )
-        async def readiness_stream(request: Request) -> StreamingResponse:
+        async def readiness_stream(request: Request, tag: str | None = Query(default=None)) -> StreamingResponse:
             return StreamingResponse(
-                registry._event_stream(request, _make_sse_report),
+                registry._event_stream(request, _make_sse_report, filter_tags=_parse_tag_filter(tag)),
                 media_type="text/event-stream",
                 headers=sse_headers,
             )
@@ -1173,9 +1197,9 @@ class HealthRegistry:
             description="SSE (Server-Sent Events) stream of full probe results. Poll loop stops when last client disconnects.",
             dependencies=auth_deps,
         )
-        async def status_stream(request: Request) -> StreamingResponse:
+        async def status_stream(request: Request, tag: str | None = Query(default=None)) -> StreamingResponse:
             return StreamingResponse(
-                registry._event_stream(request, _make_sse_report),
+                registry._event_stream(request, _make_sse_report, filter_tags=_parse_tag_filter(tag)),
                 media_type="text/event-stream",
                 headers=sse_headers,
             )

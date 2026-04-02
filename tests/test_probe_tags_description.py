@@ -499,3 +499,64 @@ def test_dashboard_tag_filter_bar_lists_all_unique_tags():
     assert 'data-tag="v2"' in html
     # "api" should appear only once as a filter button
     assert html.count('data-tag="api"') == 1
+
+
+# ---------------------------------------------------------------------------
+# Empty tag param — no filter
+# ---------------------------------------------------------------------------
+
+def test_ready_empty_tag_returns_all_probes():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.add(NoOpProbe(name="db"))
+    registry.add(FastAPIRouteProbe(name="api", tags=["http"]))
+
+    client = TestClient(app)
+    # Empty string should behave like no tag filter
+    resp = client.get("/health/ready?tag=")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "healthy"
+
+
+def test_status_empty_tag_returns_all_probes():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.add(NoOpProbe(name="db"))
+    registry.add(FastAPIRouteProbe(name="api", tags=["http"]))
+
+    client = TestClient(app)
+    resp = client.get("/health/status?tag=")
+    names = {p["name"] for p in resp.json()["probes"]}
+    assert "db" in names
+    assert "api" in names
+
+
+def test_status_whitespace_only_tag_returns_all_probes():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.add(NoOpProbe(name="db"))
+
+    client = TestClient(app)
+    resp = client.get("/health/status?tag=   ")
+    names = {p["name"] for p in resp.json()["probes"]}
+    assert "db" in names
+
+
+# ---------------------------------------------------------------------------
+# Dashboard — Clear button
+# ---------------------------------------------------------------------------
+
+def test_dashboard_clear_button_present_when_tags_exist():
+    report = _make_report([
+        ProbeResult(name="api", status=ProbeStatus.HEALTHY, tags=["store"])
+    ])
+    html = render_dashboard(report, stream_url="/health/status/stream")
+    assert 'id="tag-filter-clear"' in html
+
+
+def test_dashboard_clear_button_absent_when_no_tags():
+    report = _make_report([
+        ProbeResult(name="api", status=ProbeStatus.HEALTHY)
+    ])
+    html = render_dashboard(report, stream_url="/health/status/stream")
+    assert 'id="tag-filter-clear"' not in html
