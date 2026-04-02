@@ -27,6 +27,16 @@ from .probes.base import BaseProbe
 from .storage import InMemoryProbeStorage, ProbeStorage
 
 _MIN_POLL_INTERVAL_MS = 1000
+_AUTO_HTTP_METHODS = frozenset({"HEAD", "OPTIONS"})
+
+
+def _route_description(route, APIWebSocketRoute) -> str:
+    """Return a human-readable route label: ``'GET /items/{id}'`` or ``'WS /ws/chat'``."""
+    if APIWebSocketRoute is not None and isinstance(route, APIWebSocketRoute):
+        return f"WS {route.path}"
+    all_methods = set(getattr(route, "methods", None) or set())
+    meaningful = sorted(all_methods - _AUTO_HTTP_METHODS) or sorted(all_methods)
+    return f"{' '.join(meaningful)} {route.path}"
 
 
 def _normalize_interval(ms: int | None) -> int | None:
@@ -295,9 +305,11 @@ class HealthRegistry:
         self,
         *,
         exclude_paths: list[str] | None = None,
+        include_methods: list[str] | None = None,
         critical: bool = True,
         tags: list[str] | None = None,
         ws_probe_kwargs: dict | None = None,
+        refresh: bool = False,
         **probe_kwargs,
     ) -> "HealthRegistry":
         """Automatically instrument all registered FastAPI routes.
@@ -309,22 +321,32 @@ class HealthRegistry:
         module or inside a lifespan startup hook).
 
         Health endpoints under this registry's *prefix* are always excluded.
+        FastAPI route tags (used for OpenAPI docs) are automatically merged into
+        probe tags; *tags* adds extra labels on top of those.
 
         Args:
-            exclude_paths: Additional route paths to skip (e.g. ``["/internal/ping"]``).
+            exclude_paths: Route paths to skip; supports fnmatch glob patterns
+                (e.g. ``["/internal/*", "/admin/*"]``).
+            include_methods: Only instrument routes whose HTTP method is in this
+                list (e.g. ``["GET", "POST"]``).  WebSocket routes are always
+                included.  Defaults to all methods.
             critical: Whether the auto-created probes are critical (default ``True``).
-            tags: Tags attached to every auto-created probe; used to filter
-                ``/health/ready?tag=...`` and ``/health/status?tag=...``.
+            tags: Extra tags attached to every auto-created probe, in addition to
+                any FastAPI route tags already on each route.
             ws_probe_kwargs: Extra keyword arguments forwarded to each
                 :class:`~fastapi_watch.probes.websocket.FastAPIWebSocketProbe`
-                (e.g. ``{"min_active_connections": 1}``).  Separate from
-                *probe_kwargs* because WebSocket probes have different options.
+                (e.g. ``{"min_active_connections": 1}``).
+            refresh: Re-instrument routes that were previously auto-discovered.
+                Useful when routes are added dynamically or when options change.
+                ``@probe.watch`` and ``watch_router`` instrumentation is never
+                overridden even with ``refresh=True``.
             **probe_kwargs: Extra keyword arguments forwarded to each
                 :class:`~fastapi_watch.probes.route.FastAPIRouteProbe`
                 (e.g. ``max_error_rate=0.05``).
 
         Returns ``self`` for chaining.
         """
+        import fnmatch
         from fastapi.routing import APIRoute
         from .probes.route import FastAPIRouteProbe
         from .probes.websocket import FastAPIWebSocketProbe
@@ -334,45 +356,59 @@ class HealthRegistry:
         except ImportError:
             APIWebSocketRoute = None
 
-        excluded = set(exclude_paths or [])
+        excluded = list(exclude_paths or [])
+        _include_methods = {m.upper() for m in include_methods} if include_methods else None
         _tags = list(tags) if tags else []
         _ws_kwargs = ws_probe_kwargs or {}
 
         for route in self.app.routes:
             if route.path.startswith(self.prefix):
                 continue
-            if route.path in excluded:
+            if any(fnmatch.fnmatch(route.path, p) for p in excluded):
                 continue
             if not isinstance(route, APIRoute) and not (
                 APIWebSocketRoute is not None and isinstance(route, APIWebSocketRoute)
             ):
                 continue
+            if _include_methods is not None and isinstance(route, APIRoute):
+                route_methods = set(getattr(route, "methods", None) or set())
+                if not route_methods & _include_methods:
+                    continue
 
-            # Priority: manual (@probe.watch) > watch_router > discover_routes.
-            # Any prior instrumentation blocks discover_routes.
             current = getattr(route.dependant, "call", None)
-            if getattr(current, "_fastapi_watch", None) is not None:
-                continue
+            fw = getattr(current, "_fastapi_watch", None)
+
+            if refresh:
+                if fw in ("manual", "router"):
+                    continue
+                if fw == "discover":
+                    old = getattr(current, "_fastapi_watch_probe", None)
+                    if old is not None:
+                        self._probes = [(p, c) for p, c in self._probes if p is not old]
+            else:
+                if fw is not None:
+                    continue
+
+            route_tags = list(getattr(route, "tags", None) or [])
+            probe_tags = list(dict.fromkeys(route_tags + _tags))
+            description = _route_description(route, APIWebSocketRoute)
 
             if isinstance(route, APIRoute):
                 probe = FastAPIRouteProbe(
                     name=route.name or route.path,
-                    description=route.path,
-                    tags=_tags,
+                    description=description,
+                    tags=probe_tags,
                     **probe_kwargs,
                 )
-                wrapped = probe.watch(route.endpoint)
-            elif APIWebSocketRoute is not None and isinstance(route, APIWebSocketRoute):
+            else:
                 probe = FastAPIWebSocketProbe(
                     name=route.name or route.path,
-                    description=route.path,
-                    tags=_tags,
+                    description=description,
+                    tags=probe_tags,
                     **_ws_kwargs,
                 )
-                wrapped = probe.watch(route.endpoint)
-            else:
-                continue
 
+            wrapped = probe.watch(route.endpoint)
             try:
                 wrapped._fastapi_watch = "discover"
                 wrapped._fastapi_watch_probe = probe
@@ -390,6 +426,7 @@ class HealthRegistry:
         tags: list[str] | None = None,
         critical: bool = True,
         exclude_paths: list[str] | None = None,
+        include_methods: list[str] | None = None,
         ws_probe_kwargs: dict | None = None,
         **probe_kwargs,
     ) -> "HealthRegistry":
@@ -401,6 +438,9 @@ class HealthRegistry:
         already baked the routes (with their final paths) into ``app.routes``.
         Both HTTP and WebSocket routes are instrumented automatically.
 
+        FastAPI route tags are merged into probe tags; *tags* adds extra labels
+        on top of those.
+
         Priority: ``@probe.watch`` (highest) > ``watch_router`` > ``discover_routes``.
         Routes already instrumented by ``@probe.watch`` or a previous
         ``watch_router`` call are silently skipped.  Routes previously
@@ -409,12 +449,15 @@ class HealthRegistry:
 
         Args:
             router: The ``APIRouter`` whose routes should be instrumented.
-            tags: Tags attached to every probe created for this router.
+            tags: Extra tags attached to every probe, in addition to any FastAPI
+                route tags already on each route.
             critical: Whether the auto-created probes are critical (default ``True``).
-            exclude_paths: Route paths to skip.
+            exclude_paths: Route paths to skip; supports fnmatch glob patterns
+                (e.g. ``["/admin/*"]``).
+            include_methods: Only instrument routes whose HTTP method is in this
+                list.  WebSocket routes are always included.
             ws_probe_kwargs: Extra keyword arguments forwarded to each
-                :class:`~fastapi_watch.probes.websocket.FastAPIWebSocketProbe`
-                (e.g. ``{"min_active_connections": 1}``).
+                :class:`~fastapi_watch.probes.websocket.FastAPIWebSocketProbe`.
             **probe_kwargs: Forwarded to each
                 :class:`~fastapi_watch.probes.route.FastAPIRouteProbe`.
 
@@ -428,6 +471,7 @@ class HealthRegistry:
             registry.watch_router(users_router, tags=["users"], max_error_rate=0.05)
             registry.watch_router(orders_router, tags=["orders"], critical=False)
         """
+        import fnmatch
         from fastapi.routing import APIRoute
         from .probes.route import FastAPIRouteProbe
         from .probes.websocket import FastAPIWebSocketProbe
@@ -437,7 +481,8 @@ class HealthRegistry:
         except ImportError:
             APIWebSocketRoute = None
 
-        excluded = set(exclude_paths or [])
+        excluded = list(exclude_paths or [])
+        _include_methods = {m.upper() for m in include_methods} if include_methods else None
         _tags = list(tags) if tags else []
         _ws_kwargs = ws_probe_kwargs or {}
 
@@ -451,41 +496,43 @@ class HealthRegistry:
                 continue
             if getattr(route, "endpoint", None) not in router_endpoints:
                 continue
-            if route.path in excluded:
+            if any(fnmatch.fnmatch(route.path, p) for p in excluded):
                 continue
+            if _include_methods is not None and isinstance(route, APIRoute):
+                route_methods = set(getattr(route, "methods", None) or set())
+                if not route_methods & _include_methods:
+                    continue
 
-            # Priority: manual > watch_router > discover_routes.
             current = getattr(route.dependant, "call", None)
             fw = getattr(current, "_fastapi_watch", None)
             if fw in ("manual", "router"):
-                continue  # manual or watch_router already in place — don't touch it
+                continue
 
-            # If discover_routes previously instrumented this route, evict its probe
-            # before replacing it so it doesn't linger as a ghost in the registry.
             if fw == "discover":
-                old_probe = getattr(current, "_fastapi_watch_probe", None)
-                if old_probe is not None:
-                    self._probes = [(p, c) for p, c in self._probes if p is not old_probe]
+                old = getattr(current, "_fastapi_watch_probe", None)
+                if old is not None:
+                    self._probes = [(p, c) for p, c in self._probes if p is not old]
+
+            route_tags = list(getattr(route, "tags", None) or [])
+            probe_tags = list(dict.fromkeys(route_tags + _tags))
+            description = _route_description(route, APIWebSocketRoute)
 
             if isinstance(route, APIRoute):
                 probe = FastAPIRouteProbe(
                     name=route.name or route.path,
-                    description=route.path,
-                    tags=_tags,
+                    description=description,
+                    tags=probe_tags,
                     **probe_kwargs,
                 )
-                wrapped = probe.watch(route.endpoint)
-            elif APIWebSocketRoute is not None and isinstance(route, APIWebSocketRoute):
+            else:
                 probe = FastAPIWebSocketProbe(
                     name=route.name or route.path,
-                    description=route.path,
-                    tags=_tags,
+                    description=description,
+                    tags=probe_tags,
                     **_ws_kwargs,
                 )
-                wrapped = probe.watch(route.endpoint)
-            else:
-                continue
 
+            wrapped = probe.watch(route.endpoint)
             try:
                 wrapped._fastapi_watch = "router"
                 wrapped._fastapi_watch_probe = probe
