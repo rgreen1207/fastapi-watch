@@ -600,3 +600,394 @@ def test_watch_router_returns_registry_for_chaining():
     app.include_router(router)
     result = registry.watch_router(router)
     assert result is registry
+
+
+# ---------------------------------------------------------------------------
+# Feature: HTTP method in description
+# ---------------------------------------------------------------------------
+
+def test_discover_routes_description_includes_method():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+
+    @app.get("/items")
+    async def list_items():
+        return {}
+
+    registry.discover_routes()
+
+    probe = next(p for p, _ in registry._probes if p.name == "list_items")
+    assert probe.description == "GET /items"
+
+
+def test_discover_routes_description_excludes_head():
+    """HEAD is auto-added by FastAPI for GET routes and must not appear in the description."""
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+
+    @app.get("/items")
+    async def list_items():
+        return {}
+
+    registry.discover_routes()
+
+    probe = next(p for p, _ in registry._probes if p.name == "list_items")
+    assert "HEAD" not in probe.description
+
+
+def test_discover_routes_description_ws_prefix():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+
+    @app.websocket("/ws/chat")
+    async def chat(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.close()
+
+    registry.discover_routes()
+
+    probe = next(p for p, _ in registry._probes if p.name == "chat")
+    assert probe.description == "WS /ws/chat"
+
+
+def test_watch_router_description_includes_method():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    router = APIRouter()
+
+    @router.post("/orders")
+    async def create_order():
+        return {}
+
+    app.include_router(router)
+    registry.watch_router(router)
+
+    probe = next(p for p, _ in registry._probes if p.name == "create_order")
+    assert probe.description == "POST /orders"
+
+
+# ---------------------------------------------------------------------------
+# Feature: FastAPI route tags → probe tags
+# ---------------------------------------------------------------------------
+
+def test_discover_routes_merges_fastapi_route_tags():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+
+    @app.get("/items", tags=["store", "v2"])
+    async def list_items():
+        return {}
+
+    registry.discover_routes()
+
+    probe = next(p for p, _ in registry._probes if p.name == "list_items")
+    assert "store" in probe.tags
+    assert "v2" in probe.tags
+
+
+def test_discover_routes_user_tags_appended_after_route_tags():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+
+    @app.get("/items", tags=["store"])
+    async def list_items():
+        return {}
+
+    registry.discover_routes(tags=["monitored"])
+
+    probe = next(p for p, _ in registry._probes if p.name == "list_items")
+    assert "store" in probe.tags
+    assert "monitored" in probe.tags
+
+
+def test_discover_routes_tags_deduplicated():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+
+    @app.get("/items", tags=["api"])
+    async def list_items():
+        return {}
+
+    registry.discover_routes(tags=["api"])  # "api" appears in both route and user tags
+
+    probe = next(p for p, _ in registry._probes if p.name == "list_items")
+    assert probe.tags.count("api") == 1
+
+
+def test_watch_router_merges_fastapi_route_tags():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    router = APIRouter()
+
+    @router.get("/products", tags=["catalog"])
+    async def list_products():
+        return {}
+
+    app.include_router(router)
+    registry.watch_router(router, tags=["store"])
+
+    probe = next(p for p, _ in registry._probes if p.name == "list_products")
+    assert "catalog" in probe.tags
+    assert "store" in probe.tags
+
+
+# ---------------------------------------------------------------------------
+# Feature: include_methods
+# ---------------------------------------------------------------------------
+
+def test_discover_routes_include_methods_filters_routes():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+
+    @app.get("/items")
+    async def list_items():
+        return {}
+
+    @app.post("/items")
+    async def create_item():
+        return {}
+
+    @app.delete("/items/{id}")
+    async def delete_item(id: int):
+        return {}
+
+    registry.discover_routes(include_methods=["GET"])
+
+    names = {p.name for p, _ in registry._probes}
+    assert "list_items" in names
+    assert "create_item" not in names
+    assert "delete_item" not in names
+
+
+def test_discover_routes_include_methods_case_insensitive():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+
+    @app.get("/items")
+    async def list_items():
+        return {}
+
+    registry.discover_routes(include_methods=["get"])
+
+    names = {p.name for p, _ in registry._probes}
+    assert "list_items" in names
+
+
+def test_discover_routes_include_methods_websocket_always_included():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+
+    @app.get("/items")
+    async def list_items():
+        return {}
+
+    @app.websocket("/ws/chat")
+    async def chat(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.close()
+
+    registry.discover_routes(include_methods=["POST"])  # GET excluded, but WS should pass
+
+    names = {p.name for p, _ in registry._probes}
+    assert "list_items" not in names
+    assert "chat" in names
+
+
+def test_watch_router_include_methods_filters_routes():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    router = APIRouter()
+
+    @router.get("/products")
+    async def list_products():
+        return {}
+
+    @router.post("/products")
+    async def create_product():
+        return {}
+
+    app.include_router(router)
+    registry.watch_router(router, include_methods=["POST"])
+
+    names = {p.name for p, _ in registry._probes}
+    assert "create_product" in names
+    assert "list_products" not in names
+
+
+# ---------------------------------------------------------------------------
+# Feature: glob-pattern exclude_paths
+# ---------------------------------------------------------------------------
+
+def test_discover_routes_exclude_glob_prefix():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+
+    @app.get("/internal/ping")
+    async def ping():
+        return {}
+
+    @app.get("/internal/metrics")
+    async def metrics():
+        return {}
+
+    @app.get("/api/items")
+    async def list_items():
+        return {}
+
+    registry.discover_routes(exclude_paths=["/internal/*"])
+
+    names = {p.name for p, _ in registry._probes}
+    assert "list_items" in names
+    assert "ping" not in names
+    assert "metrics" not in names
+
+
+def test_discover_routes_exclude_glob_question_mark():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+
+    @app.get("/v1/items")
+    async def v1_items():
+        return {}
+
+    @app.get("/v2/items")
+    async def v2_items():
+        return {}
+
+    @app.get("/api/items")
+    async def api_items():
+        return {}
+
+    registry.discover_routes(exclude_paths=["/v?/items"])
+
+    names = {p.name for p, _ in registry._probes}
+    assert "api_items" in names
+    assert "v1_items" not in names
+    assert "v2_items" not in names
+
+
+def test_watch_router_exclude_glob_pattern():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    router = APIRouter()
+
+    @router.get("/admin/users")
+    async def admin_users():
+        return {}
+
+    @router.get("/admin/settings")
+    async def admin_settings():
+        return {}
+
+    @router.get("/api/status")
+    async def api_status():
+        return {}
+
+    app.include_router(router)
+    registry.watch_router(router, exclude_paths=["/admin/*"])
+
+    names = {p.name for p, _ in registry._probes}
+    assert "api_status" in names
+    assert "admin_users" not in names
+    assert "admin_settings" not in names
+
+
+# ---------------------------------------------------------------------------
+# Feature: refresh=True
+# ---------------------------------------------------------------------------
+
+def test_discover_routes_refresh_picks_up_new_routes():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+
+    @app.get("/items")
+    async def list_items():
+        return {}
+
+    registry.discover_routes()
+    names_before = {p.name for p, _ in registry._probes}
+    assert "list_items" in names_before
+
+    # Add a new route after the first discover call
+    @app.get("/users")
+    async def list_users():
+        return {}
+
+    registry.discover_routes(refresh=True)
+
+    names_after = {p.name for p, _ in registry._probes}
+    assert "list_users" in names_after
+
+
+def test_discover_routes_refresh_reinstruments_discover_probes():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+
+    @app.get("/items")
+    async def list_items():
+        return {}
+
+    registry.discover_routes(tags=["v1"])
+    probe_before = next(p for p, _ in registry._probes if p.name == "list_items")
+    assert "v1" in probe_before.tags
+
+    registry.discover_routes(tags=["v2"], refresh=True)
+
+    probes_after = {p.name: p for p, _ in registry._probes}
+    assert "v2" in probes_after["list_items"].tags
+    assert "v1" not in probes_after["list_items"].tags
+
+
+def test_discover_routes_refresh_does_not_override_manual():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    manual_probe = FastAPIRouteProbe(name="manual-checkout")
+
+    @app.post("/checkout")
+    @manual_probe.watch
+    async def checkout():
+        return {}
+
+    registry.add(manual_probe)
+    registry.discover_routes(refresh=True)
+
+    # Manual probe should still be the one in the registry
+    names = [p.name for p, _ in registry._probes]
+    assert names.count("manual-checkout") == 1
+    assert "checkout" not in names
+
+
+def test_discover_routes_refresh_does_not_override_watch_router():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    router = APIRouter()
+
+    @router.get("/items")
+    async def list_items():
+        return {}
+
+    app.include_router(router)
+    registry.watch_router(router, tags=["router"])
+    registry.discover_routes(tags=["discover"], refresh=True)
+
+    probe = next(p for p, _ in registry._probes if p.name == "list_items")
+    assert "router" in probe.tags
+    assert "discover" not in probe.tags
+
+
+def test_discover_routes_refresh_evicts_old_probe():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+
+    @app.get("/items")
+    async def list_items():
+        return {}
+
+    registry.discover_routes()
+    count_before = len(registry._probes)
+
+    registry.discover_routes(refresh=True)
+    count_after = len(registry._probes)
+
+    # Same count — old probe evicted, new one added
+    assert count_after == count_before
