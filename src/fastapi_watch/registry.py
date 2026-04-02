@@ -282,6 +282,10 @@ class HealthRegistry:
         self._sse_tasks: set[asyncio.Task] = set()
         self._signal_handler_installed: bool = False
 
+        # Bounded alert queue — avoids unbounded create_task() per state-change
+        self._alert_queue: asyncio.Queue[AlertRecord] = asyncio.Queue(maxsize=256)
+        self._alert_worker: asyncio.Task | None = None
+
         self._register_routes(tags or ["health"], dashboard=dashboard)
         self.app.router.on_shutdown.append(self._shutdown)
         for group in groups or []:
@@ -929,6 +933,8 @@ class HealthRegistry:
                     for task in list(self._sse_tasks):
                         task.cancel()
                     self._cancel_poll_task()
+                    if self._alert_worker is not None and not self._alert_worker.done():
+                        self._alert_worker.cancel()
                     # Delegate to uvicorn's handler so it still shuts down.
                     if callable(existing):
                         existing(signum, frame)
@@ -957,6 +963,13 @@ class HealthRegistry:
             except (asyncio.CancelledError, Exception):
                 pass
             self._poll_task = None
+        if self._alert_worker is not None and not self._alert_worker.done():
+            self._alert_worker.cancel()
+            try:
+                await self._alert_worker
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._alert_worker = None
 
     async def _poll_loop(self) -> None:
         """Background loop: run each probe when its interval elapses (1 s granularity)."""
@@ -1050,9 +1063,40 @@ class HealthRegistry:
                     if asyncio.iscoroutine(ret):
                         await ret
                 if self._alerters and not in_maintenance:
-                    asyncio.create_task(
-                        self._dispatch_alert(alert_record)
-                    )
+                    self._ensure_alert_worker()
+                    try:
+                        self._alert_queue.put_nowait(alert_record)
+                    except asyncio.QueueFull:
+                        if self._logger:
+                            self._logger.warning(
+                                "Alert queue full, dropping alert for probe %r",
+                                alert_record.probe,
+                            )
+
+    def _ensure_alert_worker(self) -> None:
+        """Start the alert worker task if not already running."""
+        if self._alert_worker is None or self._alert_worker.done():
+            try:
+                self._alert_worker = asyncio.get_running_loop().create_task(
+                    self._alert_loop(), name="fastapi-watch-alert-worker"
+                )
+            except RuntimeError:
+                pass  # no running loop yet
+
+    async def _alert_loop(self) -> None:
+        """Drain the alert queue, dispatching each alert to all registered alerters."""
+        while True:
+            try:
+                alert = await asyncio.wait_for(self._alert_queue.get(), timeout=1.0)
+                await self._dispatch_alert(alert)
+                self._alert_queue.task_done()
+            except asyncio.TimeoutError:
+                if self._shutting_down:
+                    return
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                pass
 
     async def _dispatch_alert(self, alert: AlertRecord) -> None:
         """Call each registered alerter for a probe state change.
