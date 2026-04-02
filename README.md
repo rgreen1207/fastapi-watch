@@ -49,20 +49,24 @@ from fastapi import FastAPI
 from fastapi_watch import HealthRegistry
 from fastapi_watch.probes import PostgreSQLProbe, RedisProbe
 
+app = FastAPI()
+registry = HealthRegistry(app)
+
+# Infrastructure probes
+registry.add(PostgreSQLProbe(url="postgresql://user:pass@localhost/mydb"))
+registry.add(RedisProbe(url="redis://localhost:6379"), critical=False)
+
 @asynccontextmanager
 async def lifespan(app):
-    registry.discover_routes()   # instrument every route automatically
+    # Automatically instrument every route — no decorators needed
+    registry.discover_routes(tags=["api"], max_error_rate=0.05)
     registry.set_started()
     yield
 
 app = FastAPI(lifespan=lifespan)
-registry = HealthRegistry(app)
-
-registry.add(PostgreSQLProbe(url="postgresql://user:pass@localhost/mydb"))
-registry.add(RedisProbe(url="redis://localhost:6379"), critical=False)
 ```
 
-That's it. Every route is now monitored with zero decorators, plus your infrastructure probes.
+Every route is now monitored with real-traffic data. Health endpoints are live at `/health/*`.
 
 ---
 
