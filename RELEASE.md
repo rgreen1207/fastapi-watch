@@ -11,6 +11,9 @@
 - **`cache_reporting=False`** — opt out of automatic cache tracking per-probe
 - **`cache_maxsize` / `cache_currsize`** — LRU cache capacity and current fill level included in probe details, useful for monitoring cache saturation
 
+### Bug Fixes
+- **Dashboard tooltip positioning** — clicking "Error Count" on a scrolled dashboard now correctly shows the error tooltip. Previously, `window.scrollY` was incorrectly added to the fixed-position tooltip's `top` coordinate, pushing it off-screen whenever the page was scrolled
+
 ### Breaking Changes
 - `record_cache_hit()` and `record_cache_miss()` are still available for manual tracking (e.g. Redis or custom caches), but the `track_cache()` method has been removed — apply `@probe.watch` directly to the cached function instead
 
