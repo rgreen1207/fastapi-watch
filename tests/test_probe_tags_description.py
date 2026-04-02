@@ -274,3 +274,228 @@ def test_dashboard_probe_name_group_present_with_description():
     ])
     html = render_dashboard(report, stream_url="/health/status/stream")
     assert "probe-name-group" in html
+
+
+# ---------------------------------------------------------------------------
+# ProbeGroup tags
+# ---------------------------------------------------------------------------
+
+def test_probe_group_accepts_tags():
+    from fastapi_watch import ProbeGroup
+    group = ProbeGroup(tags=["infra", "db"])
+    assert group.tags == ["infra", "db"]
+
+
+def test_probe_group_tags_default_empty():
+    from fastapi_watch import ProbeGroup
+    group = ProbeGroup()
+    assert group.tags == []
+
+
+def test_probe_group_tags_propagate_to_probes_on_include():
+    from fastapi_watch import ProbeGroup
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+
+    group = ProbeGroup(tags=["db"])
+    probe = NoOpProbe(name="pg")
+    group.add(probe)
+    registry.include(group)
+
+    assert "db" in probe.tags
+
+
+def test_probe_group_tags_merged_with_probe_tags():
+    from fastapi_watch import ProbeGroup
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+
+    probe = FastAPIRouteProbe(name="api", tags=["http"])
+    group = ProbeGroup(tags=["infra"])
+    group.add(probe)
+    registry.include(group)
+
+    assert "http" in probe.tags
+    assert "infra" in probe.tags
+
+
+def test_probe_group_tags_deduplicated_on_merge():
+    from fastapi_watch import ProbeGroup
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+
+    probe = NoOpProbe(name="svc")
+    probe.tags = ["shared"]
+    group = ProbeGroup(tags=["shared"])
+    group.add(probe)
+    registry.include(group)
+
+    assert probe.tags.count("shared") == 1
+
+
+def test_probe_group_tags_filter_health_status():
+    from fastapi_watch import ProbeGroup
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+
+    group = ProbeGroup(tags=["db"])
+    group.add(NoOpProbe(name="pg"))
+    registry.include(group)
+    registry.add(NoOpProbe(name="cache"))
+
+    client = TestClient(app)
+    resp = client.get("/health/status?tag=db")
+    names = {p["name"] for p in resp.json()["probes"]}
+    assert "pg" in names
+    assert "cache" not in names
+
+
+def test_probe_group_tags_via_groups_param():
+    from fastapi_watch import ProbeGroup
+    group = ProbeGroup(tags=["infra"])
+    probe = NoOpProbe(name="redis")
+    group.add(probe)
+
+    app = FastAPI()
+    registry = HealthRegistry(app, groups=[group], poll_interval_ms=None)
+
+    assert "infra" in probe.tags
+
+
+# ---------------------------------------------------------------------------
+# Multi-tag filtering — comma-separated OR logic
+# ---------------------------------------------------------------------------
+
+def test_ready_comma_tag_or_logic():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.add(FastAPIRouteProbe(name="users", tags=["users"]))
+    registry.add(FastAPIRouteProbe(name="orders", tags=["orders"]))
+    registry.add(NoOpProbe(name="infra"))
+
+    client = TestClient(app)
+    resp = client.get("/health/ready?tag=users,orders")
+    assert resp.status_code == 200
+    data = resp.json()
+    # Both tagged probes should be included (no infra)
+    assert data["status"] == "healthy"
+
+
+def test_status_comma_tag_or_logic():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.add(FastAPIRouteProbe(name="users", tags=["users"]))
+    registry.add(FastAPIRouteProbe(name="orders", tags=["orders"]))
+    registry.add(NoOpProbe(name="infra"))
+
+    client = TestClient(app)
+    resp = client.get("/health/status?tag=users,orders")
+    names = {p["name"] for p in resp.json()["probes"]}
+    assert "users" in names
+    assert "orders" in names
+    assert "infra" not in names
+
+
+def test_status_comma_tag_spaces_trimmed():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.add(FastAPIRouteProbe(name="api", tags=["api"]))
+
+    client = TestClient(app)
+    resp = client.get("/health/status?tag=api, other")
+    names = {p["name"] for p in resp.json()["probes"]}
+    assert "api" in names
+
+
+def test_status_single_tag_still_works():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.add(FastAPIRouteProbe(name="api", tags=["api"]))
+    registry.add(NoOpProbe(name="infra"))
+
+    client = TestClient(app)
+    resp = client.get("/health/status?tag=api")
+    names = {p["name"] for p in resp.json()["probes"]}
+    assert "api" in names
+    assert "infra" not in names
+
+
+# ---------------------------------------------------------------------------
+# Dashboard — tag badges
+# ---------------------------------------------------------------------------
+
+def test_dashboard_renders_tag_badges():
+    report = _make_report([
+        ProbeResult(name="api", status=ProbeStatus.HEALTHY, tags=["store", "v2"])
+    ])
+    html = render_dashboard(report, stream_url="/health/status/stream")
+    assert "store" in html
+    assert "v2" in html
+    assert 'class="probe-tag"' in html
+
+
+def test_dashboard_no_tags_no_badge_div():
+    report = _make_report([
+        ProbeResult(name="api", status=ProbeStatus.HEALTHY)
+    ])
+    html = render_dashboard(report, stream_url="/health/status/stream")
+    assert 'class="probe-tags"' not in html
+
+
+def test_dashboard_tag_badges_escaped():
+    report = _make_report([
+        ProbeResult(name="api", status=ProbeStatus.HEALTHY, tags=["<b>tag</b>"])
+    ])
+    html = render_dashboard(report, stream_url="/health/status/stream")
+    assert "<b>tag</b>" not in html
+    assert "&lt;b&gt;" in html
+
+
+def test_dashboard_data_tags_attribute_set():
+    report = _make_report([
+        ProbeResult(name="api", status=ProbeStatus.HEALTHY, tags=["store", "v2"])
+    ])
+    html = render_dashboard(report, stream_url="/health/status/stream")
+    assert 'data-tags="store,v2"' in html
+
+
+def test_dashboard_data_tags_empty_when_no_tags():
+    report = _make_report([
+        ProbeResult(name="api", status=ProbeStatus.HEALTHY)
+    ])
+    html = render_dashboard(report, stream_url="/health/status/stream")
+    assert 'data-tags=""' in html
+
+
+# ---------------------------------------------------------------------------
+# Dashboard — tag filter bar
+# ---------------------------------------------------------------------------
+
+def test_dashboard_renders_tag_filter_bar_when_tags_present():
+    report = _make_report([
+        ProbeResult(name="api", status=ProbeStatus.HEALTHY, tags=["store"])
+    ])
+    html = render_dashboard(report, stream_url="/health/status/stream")
+    assert 'id="tag-filter"' in html
+    assert 'class="tag-filter-btn"' in html
+
+
+def test_dashboard_no_tag_filter_bar_when_no_tags():
+    report = _make_report([
+        ProbeResult(name="api", status=ProbeStatus.HEALTHY)
+    ])
+    html = render_dashboard(report, stream_url="/health/status/stream")
+    assert 'id="tag-filter"' not in html
+
+
+def test_dashboard_tag_filter_bar_lists_all_unique_tags():
+    report = _make_report([
+        ProbeResult(name="a", status=ProbeStatus.HEALTHY, tags=["store", "api"]),
+        ProbeResult(name="b", status=ProbeStatus.HEALTHY, tags=["api", "v2"]),
+    ])
+    html = render_dashboard(report, stream_url="/health/status/stream")
+    assert 'data-tag="store"' in html
+    assert 'data-tag="api"' in html
+    assert 'data-tag="v2"' in html
+    # "api" should appear only once as a filter button
+    assert html.count('data-tag="api"') == 1

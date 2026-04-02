@@ -281,8 +281,15 @@ class HealthRegistry:
     # ------------------------------------------------------------------
 
     def include(self, group: ProbeGroup) -> "HealthRegistry":
-        """Include all probes from a :class:`~fastapi_watch.ProbeGroup`. Returns ``self``."""
+        """Include all probes from a :class:`~fastapi_watch.ProbeGroup`. Returns ``self``.
+
+        Group-level tags are merged into each probe's own tags (probe tags first,
+        group tags appended, duplicates removed).
+        """
         for probe, critical in group._probes:
+            if group.tags and hasattr(probe, "tags"):
+                existing = list(probe.tags or [])
+                probe.tags = list(dict.fromkeys(existing + group.tags))
             self.add(probe, critical=critical)
         return self
 
@@ -1053,7 +1060,8 @@ class HealthRegistry:
                 return JSONResponse({"status": "starting"}, status_code=503)
             results = await registry._get_results()
             if tag is not None:
-                results = [r for r in results if tag in r.tags]
+                filter_tags = {t.strip() for t in tag.split(",") if t.strip()}
+                results = [r for r in results if filter_tags & set(r.tags)]
             report = HealthReport.from_results(
                 results,
                 checked_at=registry._last_checked_at,
@@ -1078,7 +1086,8 @@ class HealthRegistry:
         async def health_status(tag: str | None = Query(default=None)) -> Response:
             results = await registry._get_results()
             if tag is not None:
-                results = [r for r in results if tag in r.tags]
+                filter_tags = {t.strip() for t in tag.split(",") if t.strip()}
+                results = [r for r in results if filter_tags & set(r.tags)]
             report = HealthReport.from_results(
                 results,
                 checked_at=registry._last_checked_at,
