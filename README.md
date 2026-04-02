@@ -120,25 +120,66 @@ registry.add(PostgreSQLProbe(url="postgresql://user:pass@localhost/mydb"))
 registry.add(TCPProbe(host="redis.internal", port=6379, timeout=2.0))
 ```
 
-### Passive probe — instruments real traffic via `@probe.watch`
+### Passive route probes — instruments real traffic, no synthetic requests
 
-Passive probes observe calls your code already makes — no synthetic requests, no rate limit risk.
+There are three ways to instrument FastAPI routes, with a clear priority order. When multiple approaches target the same route, the highest-priority one always wins — they are safe to mix.
+
+#### 1. `@probe.watch` — highest priority
+
+Apply directly to a route handler when that route needs its own name, thresholds, description, or tags. The most expressive option. `discover_routes` and `watch_router` will never override a route already decorated with `@probe.watch`.
 
 ```python
 from fastapi_watch import FastAPIRouteProbe
+
+checkout_probe = FastAPIRouteProbe(
+    name="checkout",
+    description="Payment processing",
+    tags=["payments"],
+    max_error_rate=0.01,
+    slow_call_threshold_ms=200,
+)
+
+@app.post("/checkout")
+@checkout_probe.watch
+async def checkout():
+    ...
+
+registry.add(checkout_probe)
+```
+
+#### 2. `watch_router` — mid priority
+
+Instruments every route on a specific `APIRouter` with shared settings. Use this when a router represents a logical group — all payment routes, all admin routes — that should share tags, criticality, or thresholds. Overrides any `discover_routes` instrumentation on the same routes, but never overrides `@probe.watch`. Call it after `app.include_router`.
+
+```python
+app.include_router(users_router, prefix="/users")
+app.include_router(orders_router, prefix="/orders")
+
+registry.watch_router(users_router, tags=["users"], max_error_rate=0.05)
+registry.watch_router(orders_router, tags=["orders"], critical=False)
+```
+
+#### 3. `discover_routes` — lowest priority
+
+Scans all registered routes and instruments anything not already covered by `@probe.watch` or `watch_router`. Works as a catch-all — run it last and it fills in every route you haven't handled explicitly.
+
+```python
+@asynccontextmanager
+async def lifespan(app):
+    registry.discover_routes(tags=["api"])  # skips routes already covered above
+    registry.set_started()
+    yield
+```
+
+The three approaches are designed to layer cleanly. A typical setup: `@probe.watch` on your most critical or unusual routes, `watch_router` to group routers that share settings, and `discover_routes` as the net that catches everything else — all without conflicts.
+
+#### Other passive probes
+
+`@probe.watch` also works on any non-route function — instrument outgoing calls to databases, caches, or external APIs with no synthetic traffic.
+
+```python
 from fastapi_watch.probes import RedisProbe
 
-# Instrument a FastAPI route handler
-users_probe = FastAPIRouteProbe(name="users-api", max_error_rate=0.05, max_avg_rtt_ms=300)
-
-@app.get("/users")
-@users_probe.watch
-async def list_users():
-    return {"users": [...]}
-
-registry.add(users_probe)
-
-# Instrument outgoing Redis calls
 redis_probe = RedisProbe(name="cache", max_error_rate=0.05)
 
 @redis_probe.watch

@@ -70,6 +70,8 @@ class FastAPIRouteProbe(BaseProbe):
         self,
         name: str = "route",
         *,
+        description: str | None = None,
+        tags: list[str] | None = None,
         max_error_rate: float = 0.1,
         max_avg_rtt_ms: float | None = None,
         window_size: int = 100,
@@ -84,6 +86,8 @@ class FastAPIRouteProbe(BaseProbe):
         cache_time_window_s: float = 120.0,
     ) -> None:
         self.name = name
+        self.description = description
+        self.tags = list(tags) if tags else []
         self.timeout = timeout
         self.poll_interval_ms = poll_interval_ms
         self.max_error_rate = max_error_rate
@@ -307,6 +311,8 @@ class FastAPIRouteProbe(BaseProbe):
                         pass
                     raise
 
+            async_wrapper._fastapi_watch = "manual"
+            async_wrapper._fastapi_watch_probe = self
             return async_wrapper
         else:
             @functools.wraps(func)
@@ -344,6 +350,8 @@ class FastAPIRouteProbe(BaseProbe):
                         pass
                     raise
 
+            sync_wrapper._fastapi_watch = "manual"
+            sync_wrapper._fastapi_watch_probe = self
             return sync_wrapper
 
     # ------------------------------------------------------------------

@@ -22,6 +22,7 @@ This file contains the complete reference for fastapi-watch. For the condensed o
 - [Alert history](#alert-history)
 - [Response format](#response-format)
 - [Writing a custom probe](#writing-a-custom-probe)
+- [Route auto-discovery](#route-auto-discovery)
 - [Built-in probes](#built-in-probes)
   - [App-wide request metrics](#app-wide-request-metrics)
   - [FastAPI route probe](#fastapi-route-probe)
@@ -675,6 +676,149 @@ async def test_unhealthy_on_exception(monkeypatch):
 
 ---
 
+## Route auto-discovery
+
+fastapi-watch provides three ways to instrument FastAPI routes. They have a fixed priority order and are safe to combine — when multiple approaches target the same route, the highest-priority one wins and the others skip it silently.
+
+### Instrumentation priority
+
+| Priority | Method | When to use |
+|----------|--------|-------------|
+| 1 — highest | `@probe.watch` | One specific route needs its own name, thresholds, description, or tags |
+| 2 | `watch_router` | A whole router represents a logical group with shared settings |
+| 3 — lowest | `discover_routes` | Catch-all for everything not handled explicitly |
+
+**Why this order?** `@probe.watch` represents the most deliberate choice — the developer explicitly created a probe with custom configuration for a specific route. That intent should never be silently overwritten by a bulk operation. `watch_router` is more intentional than `discover_routes` because it targets a specific router; it overrides any defaults that `discover_routes` may have applied but respects manual probes. `discover_routes` is the broadest sweep and therefore has the lowest priority.
+
+### `@probe.watch` — highest priority
+
+Apply directly to a route handler for full per-route control. No other method will override it.
+
+```python
+from fastapi_watch import FastAPIRouteProbe
+
+checkout_probe = FastAPIRouteProbe(
+    name="checkout",
+    description="Payment processing",
+    tags=["payments"],
+    max_error_rate=0.01,
+    slow_call_threshold_ms=200,
+)
+
+@app.post("/checkout")
+@checkout_probe.watch
+async def checkout():
+    ...
+
+registry.add(checkout_probe)
+```
+
+### `watch_router` — mid priority
+
+Instruments every route on a specific `APIRouter` with shared settings. Call it after `app.include_router` — FastAPI must have already baked the routes into `app.routes` before `watch_router` can find them. Skips routes already decorated with `@probe.watch`. Overrides any `discover_routes` instrumentation on the same routes.
+
+```python
+app.include_router(users_router, prefix="/users")
+app.include_router(orders_router, prefix="/orders")
+app.include_router(internal_router, prefix="/internal")
+
+registry.watch_router(users_router, tags=["users"], max_error_rate=0.05)
+registry.watch_router(orders_router, tags=["orders"], max_avg_rtt_ms=500)
+registry.watch_router(internal_router, tags=["internal"], critical=False)
+```
+
+`/health/ready?tag=users` then checks only the user routes, `/health/ready?tag=orders` checks only orders, and so on.
+
+**Args:**
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `router` | required | The `APIRouter` to instrument |
+| `tags` | `None` | Tags attached to every probe created for this router |
+| `critical` | `True` | Whether auto-created probes are critical |
+| `exclude_paths` | `None` | Route paths to skip |
+| `ws_probe_kwargs` | `None` | Extra kwargs forwarded to each `FastAPIWebSocketProbe` |
+| `**probe_kwargs` | — | Forwarded to each `FastAPIRouteProbe` |
+
+### `discover_routes` — lowest priority
+
+Scans all registered routes and instruments any that haven't already been covered. Call it from a lifespan startup handler so all `include_router` calls have already run. Routes under the health prefix are always excluded automatically.
+
+```python
+@asynccontextmanager
+async def lifespan(app):
+    registry.discover_routes(tags=["api"])
+    registry.set_started()
+    yield
+```
+
+**Args:**
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `exclude_paths` | `None` | Route paths to skip (e.g. `["/internal/ping"]`) |
+| `critical` | `True` | Whether auto-created probes are critical |
+| `tags` | `None` | Tags attached to every auto-created probe |
+| `ws_probe_kwargs` | `None` | Extra kwargs forwarded to each `FastAPIWebSocketProbe` (e.g. `{"min_active_connections": 1}`) |
+| `**probe_kwargs` | — | Forwarded to each `FastAPIRouteProbe` (e.g. `max_error_rate=0.05`) |
+
+**Probe naming:** each probe is named after the handler function (`route.name`), which FastAPI sets from the function name by default — so probes have readable names like `list_users` and `create_order` without any configuration.
+
+**Probe description:** each probe's description is set to the route path (e.g. `/users/{user_id}`), which appears as a subtitle under the probe name on the dashboard.
+
+**WebSocket routes:** both `discover_routes` and `watch_router` automatically detect WebSocket routes and create a `FastAPIWebSocketProbe` for each. Use `ws_probe_kwargs` to pass WebSocket-specific options:
+
+```python
+registry.discover_routes(
+    tags=["api"],
+    max_error_rate=0.05,                          # HTTP routes
+    ws_probe_kwargs={"min_active_connections": 1}, # WebSocket routes
+)
+```
+
+**Tag-based filtering:**
+
+```bash
+curl http://localhost:8000/health/ready?tag=api           # only route probes
+curl http://localhost:8000/health/status?tag=infrastructure  # only infra probes
+```
+
+### Combining all three
+
+The three approaches layer cleanly. A typical production setup:
+
+```python
+# 1. @probe.watch on routes that need tight, custom thresholds
+checkout_probe = FastAPIRouteProbe(
+    name="checkout",
+    description="Payment processing",
+    tags=["payments"],
+    max_error_rate=0.01,
+    slow_call_threshold_ms=200,
+)
+
+@app.post("/checkout")
+@checkout_probe.watch
+async def checkout(): ...
+
+registry.add(checkout_probe)
+
+# 2. watch_router for routers that share a logical group and settings
+app.include_router(admin_router, prefix="/admin")
+registry.watch_router(admin_router, tags=["admin"], critical=False)
+
+# 3. discover_routes as the catch-all for everything else
+@asynccontextmanager
+async def lifespan(app):
+    registry.discover_routes(tags=["api"], max_error_rate=0.05)
+    registry.set_started()
+    yield
+```
+
+`/checkout` is covered by `@probe.watch`, all `/admin/*` routes by `watch_router`, and everything else by `discover_routes` — with no conflicts.
+
+---
+
 ## Built-in probes
 
 ### App-wide request metrics
@@ -719,12 +863,20 @@ registry.add(probe)
 
 ### FastAPI route probe
 
-`FastAPIRouteProbe` instruments a route handler via `@probe.watch` and collects real-traffic metrics — no synthetic requests.
+`FastAPIRouteProbe` collects real-traffic metrics from a FastAPI route — no synthetic requests.
+
+For most apps, [route auto-discovery](#route-auto-discovery) is the easiest way to instrument all routes at once. Use `FastAPIRouteProbe` directly when a specific route needs its own thresholds, description, or tags.
 
 ```python
 from fastapi_watch import FastAPIRouteProbe
 
-users_probe = FastAPIRouteProbe(name="users-api", max_error_rate=0.05, max_avg_rtt_ms=300)
+users_probe = FastAPIRouteProbe(
+    name="users-api",
+    description="User listing endpoint",
+    tags=["users"],
+    max_error_rate=0.05,
+    max_avg_rtt_ms=300,
+)
 
 @app.get("/users")
 @users_probe.watch
@@ -774,6 +926,8 @@ Before the first request, `check()` returns `HEALTHY` with `"no requests observe
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `name` | `"route"` | Probe label |
+| `description` | `None` | Human-readable subtitle shown in the dashboard card header |
+| `tags` | `[]` | Tags for filtering `/health/ready?tag=...` and `/health/status?tag=...` |
 | `max_error_rate` | `0.1` | Error-rate threshold |
 | `max_avg_rtt_ms` | `None` | RTT threshold |
 | `window_size` | `100` | Window for RTT percentiles, throughput, slow-call counts, and outcome tracking |
