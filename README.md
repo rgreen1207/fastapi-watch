@@ -104,9 +104,10 @@ One call after all routers are included. Every route gets a passive probe with n
 @asynccontextmanager
 async def lifespan(app):
     registry.discover_routes(
-        tags=["api"],           # tag all probes for filtering
-        max_error_rate=0.05,    # alert if error rate exceeds 5%
-        exclude_paths=["/internal/*"],
+        tags=["api"],              # tag all probes for filtering
+        max_error_rate=0.05,       # alert if error rate exceeds 5%
+        include_paths=["/api/*"],  # whitelist — only monitor these routes
+        exclude_paths=["/api/admin"],  # exclude even if include_paths matches
     )
     registry.set_started()
     yield

@@ -1,5 +1,17 @@
 # Release Notes
 
+## v1.5.11
+
+**`include_paths` whitelist, `watch_router(group=True)`, and dashboard probe search.**
+
+### New Features
+
+- **`include_paths`** — whitelist complement to `exclude_paths` on both `discover_routes` and `watch_router`. When provided, only routes matching at least one glob pattern are monitored. `exclude_paths` takes precedence when both are set (e.g. `discover_routes(include_paths=["/api/*"], exclude_paths=["/api/admin"])`)
+- **`watch_router(group=True)`** — collects all probes created for a router into a `ProbeGroup` before registering them, so group-level tags propagate to every member probe automatically
+- **Dashboard probe search** — a text search input above the probe grid filters cards by probe name in real time. Works alongside the tag filter; both must match for a card to be visible
+
+---
+
 ## v1.5.10
 
 **Route auto-discovery, probe descriptions, tag-based filtering, and dashboard tag UI.**

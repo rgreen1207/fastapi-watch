@@ -400,6 +400,24 @@ body {
   color: #475569;
 }
 
+.probe-search {
+  width: 100%;
+  max-width: 320px;
+  padding: 6px 12px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  font-size: 13px;
+  color: #1e293b;
+  background: #f8fafc;
+  margin-bottom: 10px;
+  outline: none;
+  box-sizing: border-box;
+}
+.probe-search:focus {
+  border-color: #94a3b8;
+  background: #fff;
+}
+
 .badge {
   font-size: 10px;
   font-weight: 700;
@@ -755,18 +773,26 @@ _JS = r"""
     (report.probes || []).forEach(updateCard);
   }
 
+  // Combined filter: tags + search text
+  var activeTags = new Set();
+  var searchQuery = '';
+
+  function applyFilters() {
+    var cards = document.querySelectorAll('.probe-card');
+    cards.forEach(function(card) {
+      var tagOk = activeTags.size === 0 || (function() {
+        var cardTags = (card.getAttribute('data-tags') || '').split(',').filter(Boolean);
+        return cardTags.some(function(t) { return activeTags.has(t); });
+      })();
+      var searchOk = searchQuery === '' ||
+        (card.getAttribute('data-name') || '').toLowerCase().indexOf(searchQuery) !== -1;
+      card.style.display = (tagOk && searchOk) ? '' : 'none';
+    });
+  }
+
   // Tag filter
   var tagFilterEl = document.getElementById('tag-filter');
   if (tagFilterEl) {
-    var activeTags = new Set();
-    function applyTagFilter() {
-      var cards = document.querySelectorAll('.probe-card');
-      cards.forEach(function(card) {
-        if (activeTags.size === 0) { card.style.display = ''; return; }
-        var cardTags = (card.getAttribute('data-tags') || '').split(',').filter(Boolean);
-        card.style.display = cardTags.some(function(t) { return activeTags.has(t); }) ? '' : 'none';
-      });
-    }
     var clearBtn = document.getElementById('tag-filter-clear');
     function syncClearBtn() {
       if (clearBtn) clearBtn.className = activeTags.size ? 'tag-filter-clear visible' : 'tag-filter-clear';
@@ -777,17 +803,26 @@ _JS = r"""
       var tag = btn.getAttribute('data-tag');
       if (activeTags.has(tag)) { activeTags.delete(tag); btn.classList.remove('active'); }
       else { activeTags.add(tag); btn.classList.add('active'); }
-      applyTagFilter();
+      applyFilters();
       syncClearBtn();
     });
     if (clearBtn) {
       clearBtn.addEventListener('click', function() {
         activeTags.clear();
         tagFilterEl.querySelectorAll('.tag-filter-btn').forEach(function(b) { b.classList.remove('active'); });
-        applyTagFilter();
+        applyFilters();
         syncClearBtn();
       });
     }
+  }
+
+  // Search box
+  var searchEl = document.getElementById('probe-search');
+  if (searchEl) {
+    searchEl.addEventListener('input', function() {
+      searchQuery = searchEl.value.trim().toLowerCase();
+      applyFilters();
+    });
   }
 
   // Error tooltip popup
@@ -925,7 +960,7 @@ def _probe_card(probe: ProbeResult) -> str:
     tags_attr = _e(",".join(probe.tags)) if probe.tags else ""
 
     return (
-        f'<div class="probe-card {status_cls}" data-probe="{_e(probe.name)}" data-tags="{tags_attr}">'
+        f'<div class="probe-card {status_cls}" data-probe="{_e(probe.name)}" data-name="{_e(probe.name)}" data-tags="{tags_attr}">'
         f'  <div class="probe-card-header">'
         f'    <div class="probe-indicator"></div>'
         f'    <div class="probe-name-group">'
@@ -1048,6 +1083,7 @@ def render_dashboard(
 
   <div class="content">
     {_glossary_html()}
+    <input id="probe-search" class="probe-search" type="search" placeholder="Search probes…" autocomplete="off" />
     {tag_filter_html}
     <div class="section-title">{summary}</div>
     <div class="probe-grid">

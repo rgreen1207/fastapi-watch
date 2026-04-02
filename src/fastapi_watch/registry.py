@@ -323,6 +323,7 @@ class HealthRegistry:
         self,
         *,
         exclude_paths: list[str] | None = None,
+        include_paths: list[str] | None = None,
         include_methods: list[str] | None = None,
         critical: bool = True,
         tags: list[str] | None = None,
@@ -346,6 +347,10 @@ class HealthRegistry:
         Args:
             exclude_paths: Route paths to skip; supports fnmatch glob patterns
                 (e.g. ``["/internal/*", "/admin/*"]``).
+            include_paths: Whitelist of route paths to monitor; supports fnmatch
+                glob patterns (e.g. ``["/api/*"]``).  When provided, only routes
+                matching at least one pattern are monitored.  ``exclude_paths``
+                is applied after and takes precedence.
             include_methods: Only monitor routes whose HTTP method is in this
                 list (e.g. ``["GET", "POST"]``).  WebSocket routes are always
                 included.  Defaults to all methods.
@@ -379,12 +384,15 @@ class HealthRegistry:
             APIWebSocketRoute = None
 
         excluded = list(exclude_paths or [])
+        included = list(include_paths or [])
         _include_methods = {m.upper() for m in include_methods} if include_methods else None
         _tags = list(tags) if tags else []
         _ws_kwargs = ws_probe_kwargs or {}
 
         for route in self.app.routes:
             if route.path.startswith(self.prefix):
+                continue
+            if included and not any(fnmatch.fnmatch(route.path, p) for p in included):
                 continue
             if any(fnmatch.fnmatch(route.path, p) for p in excluded):
                 continue
@@ -449,9 +457,11 @@ class HealthRegistry:
         tags: list[str] | None = None,
         critical: bool = True,
         exclude_paths: list[str] | None = None,
+        include_paths: list[str] | None = None,
         include_methods: list[str] | None = None,
         ws_probe_kwargs: dict | None = None,
         name_fn: "Callable | None" = None,
+        group: bool = False,
         **probe_kwargs,
     ) -> "HealthRegistry":
         """Monitor all routes belonging to a specific ``APIRouter``.
@@ -478,6 +488,10 @@ class HealthRegistry:
             critical: Whether the auto-created probes are critical (default ``True``).
             exclude_paths: Route paths to skip; supports fnmatch glob patterns
                 (e.g. ``["/admin/*"]``).
+            include_paths: Whitelist of route paths to monitor; supports fnmatch
+                glob patterns (e.g. ``["/users/*/profile"]``).  When provided,
+                only matching routes are monitored.  ``exclude_paths`` takes
+                precedence when both are set.
             include_methods: Only monitor routes whose HTTP method is in this
                 list.  WebSocket routes are always included.
             ws_probe_kwargs: Extra keyword arguments forwarded to each
@@ -485,6 +499,10 @@ class HealthRegistry:
             name_fn: Optional callable ``(route) -> str`` to customise probe names.
                 Receives the FastAPI route object and returns the desired probe name.
                 Defaults to ``route.name`` (the handler function name).
+            group: When ``True``, all probes created for this router are collected
+                into a :class:`~fastapi_watch.ProbeGroup` before being registered,
+                so group-level tags propagate to every member probe.
+                Defaults to ``False``.
             **probe_kwargs: Forwarded to each
                 :class:`~fastapi_watch.probes.route.FastAPIRouteProbe`.
 
@@ -497,6 +515,9 @@ class HealthRegistry:
 
             registry.watch_router(users_router, tags=["users"], max_error_rate=0.05)
             registry.watch_router(orders_router, tags=["orders"], critical=False)
+
+            # Monitor only write endpoints for the orders router
+            registry.watch_router(orders_router, include_methods=["POST", "PUT", "DELETE"])
         """
         import fnmatch
         from fastapi.routing import APIRoute
@@ -509,6 +530,7 @@ class HealthRegistry:
             APIWebSocketRoute = None
 
         excluded = list(exclude_paths or [])
+        included = list(include_paths or [])
         _include_methods = {m.upper() for m in include_methods} if include_methods else None
         _tags = list(tags) if tags else []
         _ws_kwargs = ws_probe_kwargs or {}
@@ -516,12 +538,18 @@ class HealthRegistry:
         router_routes = getattr(router, "routes", [])
         router_endpoints = {r.endpoint for r in router_routes}
 
+        probe_group: ProbeGroup | None = None
+        if group:
+            probe_group = ProbeGroup(tags=_tags or None)
+
         for route in self.app.routes:
             if not isinstance(route, APIRoute) and not (
                 APIWebSocketRoute is not None and isinstance(route, APIWebSocketRoute)
             ):
                 continue
             if getattr(route, "endpoint", None) not in router_endpoints:
+                continue
+            if included and not any(fnmatch.fnmatch(route.path, p) for p in included):
                 continue
             if any(fnmatch.fnmatch(route.path, p) for p in excluded):
                 continue
@@ -567,7 +595,14 @@ class HealthRegistry:
                 route.dependant.call = wrapped
             except AttributeError:
                 continue
-            self.add(probe, critical=critical)
+
+            if probe_group is not None:
+                probe_group.add(probe, critical=critical)
+            else:
+                self.add(probe, critical=critical)
+
+        if probe_group is not None:
+            self.include(probe_group)
 
         return self
 

@@ -1057,3 +1057,208 @@ def test_discover_routes_name_fn_none_uses_route_name():
 
     names = {p.name for p, _ in registry._probes}
     assert "list_items" in names
+
+
+# ---------------------------------------------------------------------------
+# include_paths — discover_routes whitelist
+# ---------------------------------------------------------------------------
+
+def test_discover_routes_include_paths_only_monitors_matching():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+
+    @app.get("/api/items")
+    async def api_items(): return {}
+
+    @app.get("/internal/secret")
+    async def internal_secret(): return {}
+
+    registry.discover_routes(include_paths=["/api/*"])
+
+    names = {p.name for p, _ in registry._probes}
+    assert "api_items" in names
+    assert "internal_secret" not in names
+
+
+def test_discover_routes_include_paths_empty_list_monitors_all():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+
+    @app.get("/a")
+    async def route_a(): return {}
+
+    @app.get("/b")
+    async def route_b(): return {}
+
+    registry.discover_routes(include_paths=[])
+
+    names = {p.name for p, _ in registry._probes}
+    assert "route_a" in names
+    assert "route_b" in names
+
+
+def test_discover_routes_exclude_takes_precedence_over_include():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+
+    @app.get("/api/items")
+    async def api_items(): return {}
+
+    @app.get("/api/admin")
+    async def api_admin(): return {}
+
+    registry.discover_routes(include_paths=["/api/*"], exclude_paths=["/api/admin"])
+
+    names = {p.name for p, _ in registry._probes}
+    assert "api_items" in names
+    assert "api_admin" not in names
+
+
+def test_discover_routes_include_paths_glob_pattern():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+
+    @app.get("/v1/users")
+    async def v1_users(): return {}
+
+    @app.get("/v2/users")
+    async def v2_users(): return {}
+
+    @app.get("/health-check")
+    async def health_check(): return {}
+
+    registry.discover_routes(include_paths=["/v1/*", "/v2/*"])
+
+    names = {p.name for p, _ in registry._probes}
+    assert "v1_users" in names
+    assert "v2_users" in names
+    assert "health_check" not in names
+
+
+# ---------------------------------------------------------------------------
+# include_paths — watch_router whitelist
+# ---------------------------------------------------------------------------
+
+def test_watch_router_include_paths_only_monitors_matching():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    router = APIRouter()
+
+    @router.get("/users/profile")
+    async def user_profile(): return {}
+
+    @router.get("/users/settings")
+    async def user_settings(): return {}
+
+    app.include_router(router)
+    registry.watch_router(router, include_paths=["/users/profile"])
+
+    names = {p.name for p, _ in registry._probes}
+    assert "user_profile" in names
+    assert "user_settings" not in names
+
+
+def test_watch_router_exclude_takes_precedence_over_include():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    router = APIRouter()
+
+    @router.get("/api/items")
+    async def api_items(): return {}
+
+    @router.get("/api/admin")
+    async def api_admin(): return {}
+
+    app.include_router(router)
+    registry.watch_router(router, include_paths=["/api/*"], exclude_paths=["/api/admin"])
+
+    names = {p.name for p, _ in registry._probes}
+    assert "api_items" in names
+    assert "api_admin" not in names
+
+
+# ---------------------------------------------------------------------------
+# watch_router group=True
+# ---------------------------------------------------------------------------
+
+def test_watch_router_group_true_registers_probes():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    router = APIRouter()
+
+    @router.get("/orders")
+    async def list_orders(): return {}
+
+    @router.get("/orders/{id}")
+    async def get_order(): return {}
+
+    app.include_router(router)
+    registry.watch_router(router, group=True)
+
+    names = {p.name for p, _ in registry._probes}
+    assert "list_orders" in names
+    assert "get_order" in names
+
+
+def test_watch_router_group_true_propagates_tags():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    router = APIRouter()
+
+    @router.get("/products")
+    async def list_products(): return {}
+
+    app.include_router(router)
+    registry.watch_router(router, tags=["store"], group=True)
+
+    probes = {p.name: p for p, _ in registry._probes}
+    assert "store" in probes["list_products"].tags
+
+
+def test_watch_router_group_false_default_registers_normally():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    router = APIRouter()
+
+    @router.get("/things")
+    async def list_things(): return {}
+
+    app.include_router(router)
+    registry.watch_router(router, group=False, tags=["things"])
+
+    probes = {p.name: p for p, _ in registry._probes}
+    assert "list_things" in probes
+    assert "things" in probes["list_things"].tags
+
+
+# ---------------------------------------------------------------------------
+# Dashboard search box
+# ---------------------------------------------------------------------------
+
+def test_dashboard_contains_search_input():
+    from fastapi_watch.dashboard import render_dashboard
+    from fastapi_watch.models import HealthReport, ProbeResult
+
+    report = HealthReport(
+        status="healthy",
+        probes=[
+            ProbeResult(name="my-probe", status="healthy", latency_ms=1.0),
+        ],
+    )
+    html = render_dashboard(report, stream_url="/health/status/stream", maintenance_banner=False)
+    assert 'id="probe-search"' in html
+    assert 'class="probe-search"' in html
+
+
+def test_dashboard_search_uses_data_name_attribute():
+    from fastapi_watch.dashboard import render_dashboard
+    from fastapi_watch.models import HealthReport, ProbeResult
+
+    report = HealthReport(
+        status="healthy",
+        probes=[
+            ProbeResult(name="payments-api", status="healthy", latency_ms=1.0),
+        ],
+    )
+    html = render_dashboard(report, stream_url="/health/status/stream", maintenance_banner=False)
+    assert 'data-name="payments-api"' in html
