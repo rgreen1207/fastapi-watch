@@ -58,7 +58,7 @@ registry.add(RedisProbe(url="redis://localhost:6379"), critical=False)
 
 @asynccontextmanager
 async def lifespan(app):
-    # Automatically instrument every route — no decorators needed
+    # Automatically monitor every route — no decorators needed
     registry.discover_routes(tags=["api"], max_error_rate=0.05)
     registry.set_started()
     yield
@@ -94,9 +94,9 @@ The prefix defaults to `/health` and is configurable: `HealthRegistry(app, prefi
 
 ## Route monitoring
 
-The fastest way to monitor your API is auto-discovery. fastapi-watch instruments real traffic — no synthetic polling, no wasted requests.
+The fastest way to monitor your API is auto-discovery. fastapi-watch monitors real traffic — no synthetic polling, no wasted requests.
 
-### `discover_routes` — instrument everything at once
+### `discover_routes` — monitor everything at once
 
 One call after all routers are included. Every route gets a passive probe with no decorators required.
 
@@ -114,7 +114,7 @@ async def lifespan(app):
 
 Auto-discovered probes use `GET /items/{id}` style descriptions so they're immediately recognizable in the dashboard.
 
-### `watch_router` — instrument a specific router
+### `watch_router` — monitor a specific router
 
 Scope monitoring to one router with its own tags, thresholds, and criticality. Call it after `app.include_router`.
 
@@ -153,7 +153,7 @@ registry.add(checkout_probe)
 
 ### Priority system
 
-When all three approaches are used together, each route is instrumented exactly once — the highest-priority wins:
+When all three approaches are used together, each route is monitored exactly once — the highest-priority wins:
 
 | Priority | Method | When to use |
 |----------|--------|-------------|

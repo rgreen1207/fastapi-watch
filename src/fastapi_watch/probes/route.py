@@ -11,7 +11,7 @@ from .base import BaseProbe, _calc_percentiles, _update_ema
 
 
 class FastAPIRouteProbe(BaseProbe):
-    """Health probe that instruments a FastAPI route handler via the :meth:`watch` decorator.
+    """Health probe that monitors a FastAPI route handler via the :meth:`watch` decorator.
 
     Collects per-route traffic stats from real requests and reports them as a
     :class:`~fastapi_watch.models.ProbeResult`.  The probe is passive — it observes
@@ -236,7 +236,7 @@ class FastAPIRouteProbe(BaseProbe):
     # ------------------------------------------------------------------
 
     def watch(self, func_or_label: Callable | str | None = None) -> Callable:
-        """Decorator that instruments a route handler.
+        """Decorator that monitors a route handler.
 
         Can be used with or without an optional string label:
 

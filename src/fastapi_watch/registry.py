@@ -331,7 +331,7 @@ class HealthRegistry:
         name_fn: "Callable | None" = None,
         **probe_kwargs,
     ) -> "HealthRegistry":
-        """Automatically instrument all registered FastAPI routes.
+        """Automatically monitor all registered FastAPI routes.
 
         Scans the app's route table and wraps each route handler with a
         :class:`~fastapi_watch.probes.route.FastAPIRouteProbe` (HTTP) or
@@ -346,7 +346,7 @@ class HealthRegistry:
         Args:
             exclude_paths: Route paths to skip; supports fnmatch glob patterns
                 (e.g. ``["/internal/*", "/admin/*"]``).
-            include_methods: Only instrument routes whose HTTP method is in this
+            include_methods: Only monitor routes whose HTTP method is in this
                 list (e.g. ``["GET", "POST"]``).  WebSocket routes are always
                 included.  Defaults to all methods.
             critical: Whether the auto-created probes are critical (default ``True``).
@@ -355,9 +355,9 @@ class HealthRegistry:
             ws_probe_kwargs: Extra keyword arguments forwarded to each
                 :class:`~fastapi_watch.probes.websocket.FastAPIWebSocketProbe`
                 (e.g. ``{"min_active_connections": 1}``).
-            refresh: Re-instrument routes that were previously auto-discovered.
+            refresh: Re-monitor routes that were previously auto-discovered.
                 Useful when routes are added dynamically or when options change.
-                ``@probe.watch`` and ``watch_router`` instrumentation is never
+                ``@probe.watch`` and ``watch_router`` monitoring is never
                 overridden even with ``refresh=True``.
             name_fn: Optional callable ``(route) -> str`` to customise probe names.
                 Receives the FastAPI route object and returns the desired probe name.
@@ -454,31 +454,31 @@ class HealthRegistry:
         name_fn: "Callable | None" = None,
         **probe_kwargs,
     ) -> "HealthRegistry":
-        """Instrument all routes belonging to a specific ``APIRouter``.
+        """Monitor all routes belonging to a specific ``APIRouter``.
 
         Like :meth:`discover_routes` but scoped to a single router — useful
         when you want different tags, thresholds, or criticality per router.
         Call it after ``app.include_router(router)`` so that FastAPI has
         already baked the routes (with their final paths) into ``app.routes``.
-        Both HTTP and WebSocket routes are instrumented automatically.
+        Both HTTP and WebSocket routes are monitored automatically.
 
         FastAPI route tags are merged into probe tags; *tags* adds extra labels
         on top of those.
 
         Priority: ``@probe.watch`` (highest) > ``watch_router`` > ``discover_routes``.
-        Routes already instrumented by ``@probe.watch`` or a previous
+        Routes already monitored by ``@probe.watch`` or a previous
         ``watch_router`` call are silently skipped.  Routes previously
-        instrumented by ``discover_routes`` are replaced and the old probe
+        monitored by ``discover_routes`` are replaced and the old probe
         removed from the registry.
 
         Args:
-            router: The ``APIRouter`` whose routes should be instrumented.
+            router: The ``APIRouter`` whose routes should be monitored.
             tags: Extra tags attached to every probe, in addition to any FastAPI
                 route tags already on each route.
             critical: Whether the auto-created probes are critical (default ``True``).
             exclude_paths: Route paths to skip; supports fnmatch glob patterns
                 (e.g. ``["/admin/*"]``).
-            include_methods: Only instrument routes whose HTTP method is in this
+            include_methods: Only monitor routes whose HTTP method is in this
                 list.  WebSocket routes are always included.
             ws_probe_kwargs: Extra keyword arguments forwarded to each
                 :class:`~fastapi_watch.probes.websocket.FastAPIWebSocketProbe`.
