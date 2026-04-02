@@ -752,8 +752,11 @@ registry.watch_router(internal_router, tags=["internal"], critical=False)
 | `tags` | `None` | Extra tags appended to every probe (FastAPI route tags are also merged in automatically) |
 | `critical` | `True` | Whether auto-created probes are critical |
 | `exclude_paths` | `None` | Route paths to skip; supports fnmatch glob patterns (e.g. `["/admin/*"]`) |
+| `include_paths` | `None` | Whitelist of route paths to monitor; supports fnmatch glob patterns (e.g. `["/users/*/profile"]`). `exclude_paths` takes precedence when both are set |
 | `include_methods` | `None` | Only monitor routes whose HTTP method matches (e.g. `["GET", "POST"]`); WebSocket routes are always included |
 | `ws_probe_kwargs` | `None` | Extra kwargs forwarded to each `FastAPIWebSocketProbe` |
+| `name_fn` | `None` | Callable `(route) -> str` for custom probe names; defaults to the handler function name |
+| `group` | `False` | When `True`, collects all probes into a `ProbeGroup` before registering so group-level tags propagate to every member |
 | `**probe_kwargs` | — | Forwarded to each `FastAPIRouteProbe` |
 
 ### `discover_routes` — lowest priority
@@ -773,11 +776,13 @@ async def lifespan(app):
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `exclude_paths` | `None` | Route paths to skip; supports fnmatch glob patterns (e.g. `["/internal/*", "/admin/*"]`) |
+| `include_paths` | `None` | Whitelist of route paths to monitor; supports fnmatch glob patterns (e.g. `["/api/*"]`). Only routes matching at least one pattern are monitored. `exclude_paths` takes precedence when both are set |
 | `include_methods` | `None` | Only monitor routes whose HTTP method matches (e.g. `["GET", "POST"]`); WebSocket routes always pass |
 | `critical` | `True` | Whether auto-created probes are critical |
 | `tags` | `None` | Extra tags appended to every probe (FastAPI route tags are also merged in automatically) |
 | `ws_probe_kwargs` | `None` | Extra kwargs forwarded to each `FastAPIWebSocketProbe` (e.g. `{"min_active_connections": 1}`) |
 | `refresh` | `False` | Re-monitor previously auto-discovered routes with updated options. `@probe.watch` and `watch_router` routes are never overridden even with `refresh=True` |
+| `name_fn` | `None` | Callable `(route) -> str` for custom probe names; defaults to the handler function name |
 | `**probe_kwargs` | — | Forwarded to each `FastAPIRouteProbe` (e.g. `max_error_rate=0.05`) |
 
 **Probe naming:** each probe is named after the handler function (`route.name`), which FastAPI sets from the function name by default — so probes have readable names like `list_users` and `create_order` without any configuration.
