@@ -6,7 +6,7 @@ class SMTPProbe(PassiveProbe):
 
     Rather than repeatedly authenticating against a third-party mail service on
     a timer (which risks rate limits and security alerts), ``SMTPProbe``
-    instruments the functions in your code that actually send mail. Every call
+    monitors the functions in your code that actually send mail. Every call
     is silently timed and any exception is counted as an error.
 
     Works with any SMTP library and both ``async def`` and ``def`` functions.

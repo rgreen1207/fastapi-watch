@@ -4,7 +4,7 @@ from .base import PassiveProbe
 class SqlAlchemyProbe(PassiveProbe):
     """Health probe that passively observes outgoing SQLAlchemy calls via the :meth:`watch` decorator.
 
-    Instruments the functions in your code that use a SQLAlchemy async engine,
+    Monitors the functions in your code that use a SQLAlchemy async engine,
     recording latency and errors from real traffic rather than running a
     synthetic ``SELECT 1`` on a poll timer.
 

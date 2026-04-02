@@ -26,7 +26,7 @@ _FIELD_GLOSSARY: list[tuple[str, str]] = [
     ("description",          "Label identifying the route or operation this probe covers."),
     # Request / call counts
     ("request_count",        "Total requests observed by this probe since startup."),
-    ("call_count",           "Total calls instrumented by this probe since startup (passive probes)."),
+    ("call_count",           "Total calls monitored by this probe since startup (passive probes)."),
     ("error_count",          "Requests or calls that returned a status code at or above the error threshold (default: 500). Click to reveal the last recorded error."),
     ("error_rate",           "Fraction of requests counted as errors (error_count ÷ request_count)."),
     ("consecutive_errors",   "Unbroken run of error responses since the last success; resets to 0 on any success."),
@@ -312,11 +312,110 @@ body {
 .probe-card.degraded  .probe-indicator { background: #d97706; }
 .probe-card.unhealthy .probe-indicator { background: #dc2626; }
 
+.probe-name-group {
+  flex: 1;
+  min-width: 0;
+}
+
 .probe-name {
   font-weight: 600;
   font-size: 15px;
-  flex: 1;
   color: #0f172a;
+}
+
+.probe-description {
+  font-size: 11px;
+  color: #64748b;
+  margin-top: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.probe-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-top: 4px;
+}
+.probe-tag {
+  font-size: 10px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  background: #e2e8f0;
+  color: #475569;
+  font-weight: 500;
+}
+
+.tag-filter {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+.tag-filter-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: #94a3b8;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  margin-right: 2px;
+}
+.tag-filter-btn {
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 12px;
+  border: 1px solid #cbd5e1;
+  background: #f8fafc;
+  color: #475569;
+  cursor: pointer;
+  font-weight: 500;
+  transition: background .12s, border-color .12s, color .12s;
+}
+.tag-filter-btn:hover {
+  background: #e2e8f0;
+  border-color: #94a3b8;
+}
+.tag-filter-btn.active {
+  background: #1e40af;
+  border-color: #1e40af;
+  color: #fff;
+}
+.tag-filter-clear {
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 12px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: #94a3b8;
+  cursor: pointer;
+  font-weight: 500;
+  display: none;
+}
+.tag-filter-clear.visible {
+  display: inline-block;
+}
+.tag-filter-clear:hover {
+  color: #475569;
+}
+
+.probe-search {
+  width: 100%;
+  max-width: 320px;
+  padding: 6px 12px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  font-size: 13px;
+  color: #1e293b;
+  background: #f8fafc;
+  margin-bottom: 10px;
+  outline: none;
+  box-sizing: border-box;
+}
+.probe-search:focus {
+  border-color: #94a3b8;
+  background: #fff;
 }
 
 .badge {
@@ -674,6 +773,58 @@ _JS = r"""
     (report.probes || []).forEach(updateCard);
   }
 
+  // Combined filter: tags + search text
+  var activeTags = new Set();
+  var searchQuery = '';
+
+  function applyFilters() {
+    var cards = document.querySelectorAll('.probe-card');
+    cards.forEach(function(card) {
+      var tagOk = activeTags.size === 0 || (function() {
+        var cardTags = (card.getAttribute('data-tags') || '').split(',').filter(Boolean);
+        return cardTags.some(function(t) { return activeTags.has(t); });
+      })();
+      var searchOk = searchQuery === '' ||
+        (card.getAttribute('data-name') || '').toLowerCase().indexOf(searchQuery) !== -1;
+      card.style.display = (tagOk && searchOk) ? '' : 'none';
+    });
+  }
+
+  // Tag filter
+  var tagFilterEl = document.getElementById('tag-filter');
+  if (tagFilterEl) {
+    var clearBtn = document.getElementById('tag-filter-clear');
+    function syncClearBtn() {
+      if (clearBtn) clearBtn.className = activeTags.size ? 'tag-filter-clear visible' : 'tag-filter-clear';
+    }
+    tagFilterEl.addEventListener('click', function(e) {
+      var btn = e.target.closest('.tag-filter-btn');
+      if (!btn) return;
+      var tag = btn.getAttribute('data-tag');
+      if (activeTags.has(tag)) { activeTags.delete(tag); btn.classList.remove('active'); }
+      else { activeTags.add(tag); btn.classList.add('active'); }
+      applyFilters();
+      syncClearBtn();
+    });
+    if (clearBtn) {
+      clearBtn.addEventListener('click', function() {
+        activeTags.clear();
+        tagFilterEl.querySelectorAll('.tag-filter-btn').forEach(function(b) { b.classList.remove('active'); });
+        applyFilters();
+        syncClearBtn();
+      });
+    }
+  }
+
+  // Search box
+  var searchEl = document.getElementById('probe-search');
+  if (searchEl) {
+    searchEl.addEventListener('input', function() {
+      searchQuery = searchEl.value.trim().toLowerCase();
+      applyFilters();
+    });
+  }
+
   // Error tooltip popup
   var tooltipEl = document.createElement('div');
   tooltipEl.id = 'error-tooltip';
@@ -798,11 +949,25 @@ def _probe_card(probe: ProbeResult) -> str:
         if rows:
             details_html = f'<table class="details-table"><tbody>{rows}</tbody></table>'
 
+    description_html = (
+        f'<div class="probe-description">{_e(probe.description)}</div>'
+        if probe.description else ""
+    )
+    tags_html = ""
+    if probe.tags:
+        chips = "".join(f'<span class="probe-tag">{_e(t)}</span>' for t in probe.tags)
+        tags_html = f'<div class="probe-tags">{chips}</div>'
+    tags_attr = _e(",".join(probe.tags)) if probe.tags else ""
+
     return (
-        f'<div class="probe-card {status_cls}" data-probe="{_e(probe.name)}">'
+        f'<div class="probe-card {status_cls}" data-probe="{_e(probe.name)}" data-name="{_e(probe.name)}" data-tags="{tags_attr}">'
         f'  <div class="probe-card-header">'
         f'    <div class="probe-indicator"></div>'
-        f'    <div class="probe-name">{_e(probe.name)}</div>'
+        f'    <div class="probe-name-group">'
+        f'      <div class="probe-name">{_e(probe.name)}</div>'
+        f'      {description_html}'
+        f'      {tags_html}'
+        f'    </div>'
         f'    {optional_badge}'
         f'    <span class="probe-latency">{latency}</span>'
         f'    {status_badge}'
@@ -863,6 +1028,21 @@ def render_dashboard(
 
     probe_cards = "\n".join(_probe_card(p) for p in report.probes)
 
+    all_tags = sorted({t for p in report.probes for t in p.tags})
+    if all_tags:
+        btns = "".join(
+            f'<button class="tag-filter-btn" data-tag="{_e(t)}">{_e(t)}</button>'
+            for t in all_tags
+        )
+        tag_filter_html = (
+            f'<div id="tag-filter" class="tag-filter">'
+            f'<span class="tag-filter-label">Filter</span>{btns}'
+            f'<button id="tag-filter-clear" class="tag-filter-clear">Clear</button>'
+            f'</div>'
+        )
+    else:
+        tag_filter_html = ""
+
     maint_html = (
         '<div class="maintenance-banner">&#128679; Scheduled maintenance in progress — '
         'probe failures are suppressed.</div>'
@@ -903,6 +1083,8 @@ def render_dashboard(
 
   <div class="content">
     {_glossary_html()}
+    <input id="probe-search" class="probe-search" type="search" placeholder="Search probes…" autocomplete="off" />
+    {tag_filter_html}
     <div class="section-title">{summary}</div>
     <div class="probe-grid">
 {probe_cards}

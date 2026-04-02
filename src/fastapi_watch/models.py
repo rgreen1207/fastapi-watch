@@ -17,6 +17,8 @@ class ProbeResult(BaseModel):
     critical: bool = True
     latency_ms: float = 0.0
     error: str | None = None
+    description: str | None = None
+    tags: list[str] = Field(default_factory=list)
     details: dict[str, Any] | None = None
 
     @property

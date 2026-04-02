@@ -4,7 +4,7 @@ from .base import PassiveProbe
 class PostgreSQLProbe(PassiveProbe):
     """Health probe that passively observes outgoing PostgreSQL calls via the :meth:`watch` decorator.
 
-    Instruments the functions in your code that query PostgreSQL, recording
+    Monitors the functions in your code that query PostgreSQL, recording
     latency and errors from real traffic rather than opening a synthetic
     connection and running queries on a poll timer.
 
