@@ -1,31 +1,21 @@
 # Release Notes
 
-## v1.5.11
-
-**`include_paths` whitelist, `watch_router(group=True)`, and dashboard probe search.**
-
-### New Features
-
-- **`include_paths`** — whitelist complement to `exclude_paths` on both `discover_routes` and `watch_router`. When provided, only routes matching at least one glob pattern are monitored. `exclude_paths` takes precedence when both are set (e.g. `discover_routes(include_paths=["/api/*"], exclude_paths=["/api/admin"])`)
-- **`watch_router(group=True)`** — collects all probes created for a router into a `ProbeGroup` before registering them, so group-level tags propagate to every member probe automatically
-- **Dashboard probe search** — a text search input above the probe grid filters cards by probe name in real time. Works alongside the tag filter; both must match for a card to be visible
-
----
-
 ## v1.5.10
 
-**Route auto-discovery, probe descriptions, tag-based filtering, and dashboard tag UI.**
+**Route auto-discovery, probe descriptions, tag-based filtering, and dashboard improvements.**
 
 ### New Features
 
 #### Route auto-discovery
-- **`registry.discover_routes()`** — monitors every registered FastAPI route with one call. No decorators required. Accepts `exclude_paths` (glob patterns), `include_methods`, `tags`, `ws_probe_kwargs`, `name_fn`, `refresh`, and any `FastAPIRouteProbe` keyword argument
+- **`registry.discover_routes()`** — monitors every registered FastAPI route with one call. No decorators required. Accepts `exclude_paths`, `include_paths`, `include_methods`, `tags`, `ws_probe_kwargs`, `name_fn`, `refresh`, and any `FastAPIRouteProbe` keyword argument
 - **`registry.watch_router(router, ...)`** — scopes auto-discovery to a single `APIRouter` with its own tags, thresholds, and criticality. Call after `app.include_router`. Accepts all the same options as `discover_routes`
 - **Monitoring priority system** — `@probe.watch` (highest) > `watch_router` > `discover_routes` (lowest). All three are safe to mix; each checks the current state of a route and skips or replaces accordingly. No double-counting, no conflicts
 - **WebSocket auto-discovery** — both methods automatically detect `APIWebSocketRoute` and create a `FastAPIWebSocketProbe`. Pass `ws_probe_kwargs={...}` to forward WebSocket-specific options
-- **`name_fn`** — optional callable `(route) -> str` to customise probe names on `discover_routes` and `watch_router`. Defaults to `route.name` (the handler function name)
-- **`discover_routes(refresh=True)`** — re-monitors previously auto-discovered routes with updated options, without touching `@probe.watch` or `watch_router` routes
+- **`name_fn`** — optional callable `(route) -> str` to customise probe names. Defaults to `route.name` (the handler function name)
+- **`include_paths`** — whitelist complement to `exclude_paths`; supports fnmatch glob patterns (e.g. `["/api/*"]`). `exclude_paths` takes precedence when both are set
 - **Glob patterns in `exclude_paths`** — supports fnmatch patterns such as `["/internal/*", "/admin/*"]` in both methods
+- **`discover_routes(refresh=True)`** — re-monitors previously auto-discovered routes with updated options, without touching `@probe.watch` or `watch_router` routes
+- **`watch_router(group=True)`** — collects all probes for the router into a `ProbeGroup` before registering, so group-level tags propagate to every member probe automatically
 
 #### Tags and filtering
 - **Probe tags** — all probe types accept `tags=[...]`. Tags appear in results and enable filtered endpoints
@@ -37,8 +27,11 @@
 
 #### Probe descriptions
 - **Probe descriptions** — all probes accept `description`. Auto-discovered probes use `GET /items/{id}` / `WS /ws/chat` style descriptions automatically
-- **Dashboard tag badges** — probe cards show tag chips below the probe name
-- **Dashboard tag filter bar** — clickable tag buttons above the probe grid for instant client-side filtering; a Clear button resets all active filters
+
+#### Dashboard
+- **Tag filter bar** — clickable tag buttons above the probe grid for instant client-side filtering; a Clear button resets all active filters
+- **Tag badges** — probe cards show tag chips below the probe name
+- **Probe search** — text input filters probe cards by name in real time; works alongside the tag filter (both must match)
 
 ### Bug Fixes
 - Fixed `discover_routes`/`watch_router` crashing on non-`APIRoute` objects (e.g. `Mount`) in `app.routes`
