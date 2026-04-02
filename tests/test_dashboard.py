@@ -368,3 +368,21 @@ def test_render_last_success_at_shown_in_timestamps_div():
     )]
     html = render_dashboard(_make_report(probes), stream_url="/health/status/stream")
     assert "last success: 2026-03-31 12:00:00 UTC" in html
+
+
+def test_render_error_count_btn_when_last_error_present():
+    probes = [ProbeResult(
+        name="api",
+        status=ProbeStatus.UNHEALTHY,
+        error="failing",
+        details={"error_count": 3, "last_error": "HTTP 500"},
+    )]
+    html = render_dashboard(_make_report(probes), stream_url="/health/status/stream")
+    assert 'class="error-count-btn"' in html
+    assert 'data-error="HTTP 500"' in html
+
+
+
+def test_render_tooltip_uses_no_scroll_offset():
+    html = render_dashboard(_make_report(), stream_url="/health/status/stream")
+    assert "window.scrollY" not in html
