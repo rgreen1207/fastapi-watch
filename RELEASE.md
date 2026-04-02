@@ -5,12 +5,15 @@
 **Route auto-discovery, probe descriptions, and tag-based filtering.**
 
 ### New Features
-- **`registry.discover_routes()`** — automatically instruments every registered FastAPI route with a `FastAPIRouteProbe`. Call it once after all routers are included and every route gets passive real-traffic monitoring with no decorators required. Accepts `exclude_paths`, `critical`, `tags`, and any `FastAPIRouteProbe` keyword argument
-- **Probe descriptions** — all probes accept a `description` parameter. The description appears as a subtitle under the probe name in the dashboard header, making it easy to tell probes apart at a glance
-- **Probe tags** — all probes accept a `tags` list. Tags are included in probe results and enable filtered health checks: `GET /health/ready?tag=database` and `GET /health/status?tag=database` return only probes carrying that tag
-- **`discover_routes` tag support** — pass `tags=[...]` to `discover_routes` to label all auto-created probes, then filter `/health/ready` and `/health/status` by tag to isolate route health from infrastructure health
+- **`registry.discover_routes()`** — automatically instruments every registered FastAPI route with a `FastAPIRouteProbe`. Call it once after all routers are included and every route gets passive real-traffic monitoring with no decorators required
 - **`registry.watch_router(router, ...)`** — scope auto-discovery to a single `APIRouter` with its own tags, thresholds, and criticality. Call after `app.include_router`. Multiple routers can each have different settings, making tag-based filtering work naturally per router
-- **WebSocket auto-discovery** — `discover_routes` and `watch_router` now automatically detect WebSocket routes (`APIWebSocketRoute`) and create a `FastAPIWebSocketProbe` for each. Pass `ws_probe_kwargs={...}` to forward WebSocket-specific options such as `min_active_connections`
+- **Probe descriptions** — all probes accept a `description` parameter. Auto-discovered probes use the method and path (e.g. `GET /items/{id}`) as their description, making them easy to identify in the dashboard at a glance
+- **Probe tags** — all probes accept a `tags` list. Tags are included in probe results and enable filtered health checks: `GET /health/ready?tag=database` and `GET /health/status?tag=database` return only probes carrying that tag
+- **FastAPI route tags auto-merged** — `discover_routes` and `watch_router` automatically pull in each route's FastAPI/OpenAPI tags (e.g. `@app.get("/items", tags=["store"])`) as probe tags, with no extra config required. User-supplied `tags=[...]` are appended on top
+- **`include_methods` filter** — pass `include_methods=["GET", "POST"]` to `discover_routes` or `watch_router` to skip routes with non-matching HTTP methods. WebSocket routes are always included. Useful for ignoring write endpoints or limiting monitoring scope
+- **Glob patterns in `exclude_paths`** — `exclude_paths` now supports fnmatch glob patterns such as `["/internal/*", "/admin/*"]` in addition to exact path matches
+- **`discover_routes(refresh=True)`** — re-instruments routes previously auto-discovered, picking up new routes or applying updated options. Routes instrumented by `@probe.watch` or `watch_router` are never overridden even with `refresh=True`
+- **WebSocket auto-discovery** — `discover_routes` and `watch_router` automatically detect WebSocket routes (`APIWebSocketRoute`) and create a `FastAPIWebSocketProbe` for each. Pass `ws_probe_kwargs={...}` to forward WebSocket-specific options such as `min_active_connections`
 - **Instrumentation priority system** — `@probe.watch` (highest) > `watch_router` > `discover_routes` (lowest). Mixing all three is safe: each method checks the current instrumentation state of a route and skips or replaces accordingly. `@probe.watch` is never overridden. `watch_router` replaces `discover_routes` instrumentation and evicts the old probe from the registry. `discover_routes` skips any route already instrumented by either of the other two
 
 ---
