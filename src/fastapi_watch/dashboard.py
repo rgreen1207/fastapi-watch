@@ -332,6 +332,57 @@ body {
   text-overflow: ellipsis;
 }
 
+.probe-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-top: 4px;
+}
+.probe-tag {
+  font-size: 10px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  background: #e2e8f0;
+  color: #475569;
+  font-weight: 500;
+}
+
+.tag-filter {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+.tag-filter-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: #94a3b8;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  margin-right: 2px;
+}
+.tag-filter-btn {
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 12px;
+  border: 1px solid #cbd5e1;
+  background: #f8fafc;
+  color: #475569;
+  cursor: pointer;
+  font-weight: 500;
+  transition: background .12s, border-color .12s, color .12s;
+}
+.tag-filter-btn:hover {
+  background: #e2e8f0;
+  border-color: #94a3b8;
+}
+.tag-filter-btn.active {
+  background: #1e40af;
+  border-color: #1e40af;
+  color: #fff;
+}
+
 .badge {
   font-size: 10px;
   font-weight: 700;
@@ -687,6 +738,28 @@ _JS = r"""
     (report.probes || []).forEach(updateCard);
   }
 
+  // Tag filter
+  var tagFilterEl = document.getElementById('tag-filter');
+  if (tagFilterEl) {
+    var activeTags = new Set();
+    function applyTagFilter() {
+      var cards = document.querySelectorAll('.probe-card');
+      cards.forEach(function(card) {
+        if (activeTags.size === 0) { card.style.display = ''; return; }
+        var cardTags = (card.getAttribute('data-tags') || '').split(',').filter(Boolean);
+        card.style.display = cardTags.some(function(t) { return activeTags.has(t); }) ? '' : 'none';
+      });
+    }
+    tagFilterEl.addEventListener('click', function(e) {
+      var btn = e.target.closest('.tag-filter-btn');
+      if (!btn) return;
+      var tag = btn.getAttribute('data-tag');
+      if (activeTags.has(tag)) { activeTags.delete(tag); btn.classList.remove('active'); }
+      else { activeTags.add(tag); btn.classList.add('active'); }
+      applyTagFilter();
+    });
+  }
+
   // Error tooltip popup
   var tooltipEl = document.createElement('div');
   tooltipEl.id = 'error-tooltip';
@@ -815,14 +888,20 @@ def _probe_card(probe: ProbeResult) -> str:
         f'<div class="probe-description">{_e(probe.description)}</div>'
         if probe.description else ""
     )
+    tags_html = ""
+    if probe.tags:
+        chips = "".join(f'<span class="probe-tag">{_e(t)}</span>' for t in probe.tags)
+        tags_html = f'<div class="probe-tags">{chips}</div>'
+    tags_attr = _e(",".join(probe.tags)) if probe.tags else ""
 
     return (
-        f'<div class="probe-card {status_cls}" data-probe="{_e(probe.name)}">'
+        f'<div class="probe-card {status_cls}" data-probe="{_e(probe.name)}" data-tags="{tags_attr}">'
         f'  <div class="probe-card-header">'
         f'    <div class="probe-indicator"></div>'
         f'    <div class="probe-name-group">'
         f'      <div class="probe-name">{_e(probe.name)}</div>'
         f'      {description_html}'
+        f'      {tags_html}'
         f'    </div>'
         f'    {optional_badge}'
         f'    <span class="probe-latency">{latency}</span>'
@@ -884,6 +963,20 @@ def render_dashboard(
 
     probe_cards = "\n".join(_probe_card(p) for p in report.probes)
 
+    all_tags = sorted({t for p in report.probes for t in p.tags})
+    if all_tags:
+        btns = "".join(
+            f'<button class="tag-filter-btn" data-tag="{_e(t)}">{_e(t)}</button>'
+            for t in all_tags
+        )
+        tag_filter_html = (
+            f'<div id="tag-filter" class="tag-filter">'
+            f'<span class="tag-filter-label">Filter</span>{btns}'
+            f'</div>'
+        )
+    else:
+        tag_filter_html = ""
+
     maint_html = (
         '<div class="maintenance-banner">&#128679; Scheduled maintenance in progress — '
         'probe failures are suppressed.</div>'
@@ -924,6 +1017,7 @@ def render_dashboard(
 
   <div class="content">
     {_glossary_html()}
+    {tag_filter_html}
     <div class="section-title">{summary}</div>
     <div class="probe-grid">
 {probe_cards}

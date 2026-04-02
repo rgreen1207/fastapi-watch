@@ -41,8 +41,9 @@ class ProbeGroup:
         all_probes.include(user_probes)
     """
 
-    def __init__(self) -> None:
+    def __init__(self, tags: list[str] | None = None) -> None:
         self._probes: list[tuple[BaseProbe, bool]] = []
+        self.tags: list[str] = list(tags) if tags else []
 
     def add(self, probe: BaseProbe, critical: bool = True) -> "ProbeGroup":
         """Add a single probe. Returns ``self`` for chaining.

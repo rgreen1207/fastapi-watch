@@ -345,13 +345,28 @@ router.include(db_router)
 router.include(payments_router)
 ```
 
+**Group-level tags** — tags declared on a `ProbeGroup` are automatically merged into each probe's own tags when the group is added to the registry. This lets you tag an entire module's probes without touching each probe individually:
+
+```python
+db_probes = ProbeGroup(tags=["database"])
+db_probes.add(PostgreSQLProbe(url="postgresql://..."))
+db_probes.add(RedisProbe(url="redis://..."), critical=False)
+
+# Both probes now carry the "database" tag
+registry = HealthRegistry(app, groups=[db_probes])
+
+# Filter health checks to only database probes
+# GET /health/ready?tag=database
+```
+
 `ProbeGroup` API — all methods return `self`:
 
 ```python
-router.add(probe)                    # single probe, critical by default
-router.add(probe, critical=False)
-router.add_probes([a, b])
-router.include(another_group)
+group = ProbeGroup(tags=["infra"])   # optional group-level tags
+group.add(probe)                     # single probe, critical by default
+group.add(probe, critical=False)
+group.add_probes([a, b])
+group.include(another_group)
 ```
 
 ---
@@ -734,9 +749,10 @@ registry.watch_router(internal_router, tags=["internal"], critical=False)
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `router` | required | The `APIRouter` to instrument |
-| `tags` | `None` | Tags attached to every probe created for this router |
+| `tags` | `None` | Extra tags appended to every probe (FastAPI route tags are also merged in automatically) |
 | `critical` | `True` | Whether auto-created probes are critical |
-| `exclude_paths` | `None` | Route paths to skip |
+| `exclude_paths` | `None` | Route paths to skip; supports fnmatch glob patterns (e.g. `["/admin/*"]`) |
+| `include_methods` | `None` | Only instrument routes whose HTTP method matches (e.g. `["GET", "POST"]`); WebSocket routes are always included |
 | `ws_probe_kwargs` | `None` | Extra kwargs forwarded to each `FastAPIWebSocketProbe` |
 | `**probe_kwargs` | — | Forwarded to each `FastAPIRouteProbe` |
 
@@ -756,15 +772,19 @@ async def lifespan(app):
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `exclude_paths` | `None` | Route paths to skip (e.g. `["/internal/ping"]`) |
+| `exclude_paths` | `None` | Route paths to skip; supports fnmatch glob patterns (e.g. `["/internal/*", "/admin/*"]`) |
+| `include_methods` | `None` | Only instrument routes whose HTTP method matches (e.g. `["GET", "POST"]`); WebSocket routes always pass |
 | `critical` | `True` | Whether auto-created probes are critical |
-| `tags` | `None` | Tags attached to every auto-created probe |
+| `tags` | `None` | Extra tags appended to every probe (FastAPI route tags are also merged in automatically) |
 | `ws_probe_kwargs` | `None` | Extra kwargs forwarded to each `FastAPIWebSocketProbe` (e.g. `{"min_active_connections": 1}`) |
+| `refresh` | `False` | Re-instrument previously auto-discovered routes with updated options. `@probe.watch` and `watch_router` routes are never overridden even with `refresh=True` |
 | `**probe_kwargs` | — | Forwarded to each `FastAPIRouteProbe` (e.g. `max_error_rate=0.05`) |
 
 **Probe naming:** each probe is named after the handler function (`route.name`), which FastAPI sets from the function name by default — so probes have readable names like `list_users` and `create_order` without any configuration.
 
-**Probe description:** each probe's description is set to the route path (e.g. `/users/{user_id}`), which appears as a subtitle under the probe name on the dashboard.
+**Probe description:** each probe's description is automatically set to the HTTP method and path (e.g. `GET /users/{user_id}` or `WS /ws/chat`), which appears as a subtitle under the probe name on the dashboard.
+
+**FastAPI route tags:** `discover_routes` and `watch_router` automatically merge each route's existing FastAPI/OpenAPI tags (e.g. `@app.get("/items", tags=["store"])`) into the probe's tags. User-supplied `tags=[...]` are appended on top. This means routes already organized by OpenAPI tags get probe tags for free.
 
 **WebSocket routes:** both `discover_routes` and `watch_router` automatically detect WebSocket routes and create a `FastAPIWebSocketProbe` for each. Use `ws_probe_kwargs` to pass WebSocket-specific options:
 
@@ -776,11 +796,29 @@ registry.discover_routes(
 )
 ```
 
-**Tag-based filtering:**
+**Glob exclusions and method filtering:**
+
+```python
+# Skip all internal and admin routes; only monitor read and write endpoints
+registry.discover_routes(
+    exclude_paths=["/internal/*", "/admin/*"],
+    include_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+)
+```
+
+**Tag-based filtering** — comma-separated tags use OR logic (probes matching any of the tags are returned):
 
 ```bash
-curl http://localhost:8000/health/ready?tag=api           # only route probes
+curl http://localhost:8000/health/ready?tag=api            # only route probes
+curl http://localhost:8000/health/status?tag=api,payments  # api OR payments probes
 curl http://localhost:8000/health/status?tag=infrastructure  # only infra probes
+```
+
+**Dynamic route refresh:**
+
+```python
+# Re-run discover_routes after routes are added dynamically
+registry.discover_routes(refresh=True)
 ```
 
 ### Combining all three
