@@ -1,5 +1,50 @@
 # Release Notes
 
+## v1.5.11
+
+**Security hardening.**
+
+### Security Fixes
+
+#### SSRF protection on webhook alerters
+- `WebhookAlerter`, `SlackAlerter`, and `TeamsAlerter` now validate the webhook URL at construction time via `_validate_webhook_url()`. URLs targeting private/loopback/link-local IP ranges (`10.x`, `172.16–31.x`, `192.168.x`, `127.x`, `169.254.x`, `100.64.x`, `::1`, `fc00::/7`, `fe80::/10`) and `localhost` are rejected with a `ValueError`. Misconfiguration now fails at startup rather than silently at send time.
+
+#### Generic probe error responses
+- Exceptions that escape a probe's `check()` method now return `error: "probe check failed"` to HTTP clients. Full exception details (including connection strings and passwords that may appear in third-party library error messages) are forwarded only to the configured logger. Affects all built-in probes: Kafka, Celery, Memcached, RabbitMQ, and TCP previously exposed `str(exc)` directly.
+
+#### Strict auth callable check
+- The `auth` callable return value is now checked with `result is not True` instead of truthiness. Previously, returning `None`, `0`, or `""` would incorrectly grant access. These values now correctly deny with `403`.
+
+#### Secret redaction in alerter repr
+- `__repr__` on all alerters (`WebhookAlerter`, `SlackAlerter`, `TeamsAlerter`, `PagerDutyAlerter`) no longer exposes webhook URLs, auth headers, or routing keys. All sensitive fields are replaced with `<redacted>`.
+
+#### Dashboard XSS prevention
+- `ProbeResult.details` keys are now HTML-escaped before insertion into the dashboard (both server-side rendering and the client-side JavaScript live update path). Previously, a probe returning a key like `<script>alert(1)</script>` in its details dict would execute JavaScript in any browser viewing the dashboard.
+- Client-side `fmtDetailVal` now escapes all string values and nested dict keys via `escAttr()` before inserting via `innerHTML`.
+
+#### Probe name validation
+- `registry.add()` now rejects probe names containing characters outside `[A-Za-z0-9_\-.:]+` with a `ValueError`. This prevents newlines and quotes from reaching Prometheus metric label output and other rendering surfaces.
+
+#### Prometheus label injection
+- Probe names are now escaped in Prometheus metric output via `_escape_label()`, which backslash-escapes `\`, `"`, and `\n` per the Prometheus text format spec.
+
+#### Custom dashboard `.py` file execution removed
+- `HealthRegistry(dashboard=<path>)` no longer accepts `.py` files. Previously, `.py` files were loaded via `importlib` and their `render_dashboard` function called — arbitrary code execution from a file path. The `dashboard` parameter now accepts `True` (built-in), `False` (disabled), a `Callable`, or a `.html`/`.htm` file path.
+
+#### Path traversal guard on dashboard file
+- The dashboard file path is now resolved with `Path.resolve()` before use.
+
+#### Maintenance endpoint DoS fix
+- `POST /health/maintenance` with `{"minutes": 1e308}` or `{"minutes": -1}` previously caused an unhandled `OverflowError` or validation failure resulting in a 500. The `minutes` field is now validated as `0 < minutes ≤ 525600` (one year) at the Pydantic model level, returning `422` for out-of-range values.
+
+#### Tag filter memory bound
+- `_parse_tag_filter` now caps the tag list at 50 entries. Previously, a `?tag=a,b,c,...` query string with thousands of values would create an arbitrarily large `frozenset`.
+
+#### auth=None warning
+- `HealthRegistry` now logs a warning at startup when `auth=None` (the default), making it explicit that health endpoints are publicly accessible.
+
+---
+
 ## v1.5.10
 
 **Route auto-discovery, probe descriptions, tag-based filtering, and dashboard improvements.**

@@ -43,6 +43,7 @@ This file contains the complete reference for fastapi-watch. For the condensed o
   - [SQLAlchemy](#sqlalchemy)
   - [All built-in probes (summary table)](#all-built-in-probes-summary-table)
 - [Configuration reference](#configuration-reference)
+- [Security](#security)
 - [Kubernetes integration](#kubernetes-integration)
 
 ---
@@ -1386,12 +1387,12 @@ registry.add(db_probe)
 | `storage` | `ProbeStorage \| None` | `None` | Custom storage backend |
 | `timezone` | `str` | `"UTC"` | IANA timezone for `checked_at` timestamps |
 | `groups` | `list[ProbeGroup] \| None` | `None` | ProbeGroups to include at startup |
-| `dashboard` | `bool \| Callable` | `True` | `True` = built-in dashboard; `False` = disabled; Callable = custom renderer |
+| `dashboard` | `bool \| Callable \| Path` | `True` | `True` = built-in dashboard; `False` = disabled; Callable = custom renderer; `.html`/`.htm` file path = served as-is. `.py` files are rejected. |
 | `circuit_breaker` | `bool` | `True` | Enable/disable circuit breaker |
 | `circuit_breaker_threshold` | `int` | `5` | Consecutive failures before circuit opens |
 | `circuit_breaker_cooldown_ms` | `int` | `600000` | Cooldown before probe is retried (10 min) |
 | `webhook_url` | `str \| None` | `None` | Legacy — wraps into `WebhookAlerter` |
-| `auth` | `dict \| Callable \| None` | `None` | Authentication for all health endpoints |
+| `auth` | `dict \| Callable \| None` | `None` | Authentication for all health endpoints. `None` logs a warning — endpoints are publicly accessible. A callable must return exactly `True` to grant access; `None`, `0`, `""`, or any other truthy value is denied. |
 | `startup_probes` | `list[BaseProbe] \| None` | `None` | Probes required for `/health/startup` to pass |
 | `alerters` | `list[BaseAlerter] \| None` | `None` | Alerters to fire on state changes |
 
@@ -1413,7 +1414,7 @@ registry.add(db_probe)
 
 | Attribute | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `name` | `str` | `"unnamed"` | Label in health reports |
+| `name` | `str` | `"unnamed"` | Label in health reports. Must contain only `[A-Za-z0-9_\-.:]+` — spaces, quotes, and newlines are rejected at `registry.add()` time. |
 | `timeout` | `float \| None` | `None` | Per-probe timeout in seconds |
 | `poll_interval_ms` | `int \| None` | `None` | Per-probe poll interval override |
 | `circuit_breaker_threshold` | `int \| None` | `None` | Per-probe circuit threshold |
@@ -1432,6 +1433,58 @@ registry.add(db_probe)
 | `is_healthy` | `bool` | `status == "healthy"` |
 | `is_degraded` | `bool` | `status == "degraded"` |
 | `is_passing` | `bool` | `status != "unhealthy"` |
+
+---
+
+## Security
+
+### Authentication
+
+Health endpoints are publicly accessible by default (`auth=None`). A warning is logged at startup to make this explicit. In production, always set `auth`:
+
+```python
+# HTTP Basic auth
+registry = HealthRegistry(app, auth={"username": "ops", "password": "secret"})
+
+# Bearer token
+registry = HealthRegistry(app, auth={"token": "my-secret-token"})
+
+# Custom callable — must return exactly True to grant access
+def my_auth(request: Request) -> bool:
+    return request.headers.get("X-Internal-Key") == os.environ["HEALTH_KEY"]
+
+registry = HealthRegistry(app, auth=my_auth)
+```
+
+The auth callable **must return exactly `True`** (the boolean). Returning `None`, `0`, `""`, or any other truthy value is treated as denial and returns `403`. This prevents accidental access grants from callables that return a user object or empty string on failure.
+
+Comparison of static credentials uses `secrets.compare_digest` to prevent timing attacks.
+
+### Webhook alerters and SSRF
+
+`WebhookAlerter`, `SlackAlerter`, and `TeamsAlerter` validate the webhook URL at construction time. URLs targeting private/loopback/link-local IP ranges are rejected with a `ValueError`:
+
+```python
+# Raises ValueError — private IP rejected at startup
+SlackAlerter(webhook_url="https://192.168.1.10/hook")
+
+# Fine — public HTTPS endpoint
+SlackAlerter(webhook_url="https://hooks.slack.com/services/...")
+```
+
+Rejected ranges: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`, `169.254.0.0/16` (AWS metadata), `100.64.0.0/10` (CGNAT), and IPv6 equivalents.
+
+### Probe error messages
+
+Exceptions raised inside a probe's `check()` method return the generic string `"probe check failed"` to HTTP clients. Full exception details (which may contain connection strings, passwords, or internal hostnames from third-party libraries) are forwarded only to the configured logger.
+
+### Probe names
+
+Probe names must match `[A-Za-z0-9_\-.:]+`. Names with spaces, newlines, or HTML-special characters are rejected at `registry.add()` time with a `ValueError`. This prevents injection into Prometheus metric labels and dashboard rendering.
+
+### Custom dashboard
+
+`HealthRegistry(dashboard=...)` accepts `True` (built-in), `False` (disabled), a `Callable`, or a `.html`/`.htm` file path. `.py` files are explicitly rejected to prevent arbitrary code execution from a user-supplied file path.
 
 ---
 

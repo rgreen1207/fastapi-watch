@@ -209,6 +209,20 @@ registry = HealthRegistry(
 )
 ```
 
+Webhook URLs are validated at construction time — private/loopback/link-local IP targets are rejected to prevent SSRF.
+
+---
+
+## Security
+
+Health endpoints are **publicly accessible by default** — set `auth` in production:
+
+```python
+registry = HealthRegistry(app, auth={"username": "ops", "password": "secret"})
+```
+
+See [DOCS.md — Security](DOCS.md#security) for auth callables, SSRF protection on webhook alerters, probe error message handling, and probe name restrictions.
+
 ---
 
 ## License
