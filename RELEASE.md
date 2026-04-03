@@ -4,6 +4,10 @@
 
 **Security hardening.**
 
+### Compatibility
+
+fastapi-watch 1.5.11 has identical dependency constraints to 1.5.10 (`fastapi>=0.100.0`, `pydantic>=2.0`). Upgrading from 1.5.10 will not downgrade or change any other packages in your environment.
+
 ### Security Fixes
 
 #### SSRF protection on webhook alerters
