@@ -386,3 +386,40 @@ def test_render_error_count_btn_when_last_error_present():
 def test_render_tooltip_uses_no_scroll_offset():
     html = render_dashboard(_make_report(), stream_url="/health/status/stream")
     assert "window.scrollY" not in html
+
+
+# ---------------------------------------------------------------------------
+# XSS: detail keys and values are HTML-escaped in server-side rendering
+# ---------------------------------------------------------------------------
+
+def test_detail_key_with_html_is_escaped():
+    probes = [ProbeResult(
+        name="api",
+        status=ProbeStatus.UNHEALTHY,
+        details={"<script>alert(1)</script>": "value"},
+    )]
+    html = render_dashboard(_make_report(probes), stream_url="/health/status/stream")
+    assert "<script>alert(1)</script>" not in html
+    assert "&lt;Script&gt;Alert(1)&lt;/Script&gt;" in html
+
+
+def test_detail_value_with_html_is_escaped():
+    probes = [ProbeResult(
+        name="api",
+        status=ProbeStatus.UNHEALTHY,
+        details={"info": "<img src=x onerror='alert(1)'>"},
+    )]
+    html = render_dashboard(_make_report(probes), stream_url="/health/status/stream")
+    assert "<img src=x" not in html
+    assert "&lt;img" in html
+
+
+def test_detail_key_quotes_are_escaped():
+    probes = [ProbeResult(
+        name="api",
+        status=ProbeStatus.UNHEALTHY,
+        details={'"quoted_key"': "value"},
+    )]
+    html = render_dashboard(_make_report(probes), stream_url="/health/status/stream")
+    assert '"quoted_key"' not in html
+    assert "&quot;" in html

@@ -119,7 +119,7 @@ def _fmt_detail_value(key: str, value: Any) -> str:
 
 
 def _fmt_detail_key(key: str) -> str:
-    return key.replace("_", " ").title()
+    return _e(key.replace("_", " ").title())
 
 
 # ---------------------------------------------------------------------------
@@ -681,10 +681,10 @@ _JS = r"""
       return 'closed' + tripStr;
     }
     if ((key === 'status_distribution' || key === 'error_types') && typeof val === 'object' && val !== null) {
-      return Object.keys(val).sort().map(function(dictKey) { return dictKey + ': ' + val[dictKey]; }).join(', ');
+      return Object.keys(val).sort().map(function(dictKey) { return escAttr(dictKey) + ': ' + escAttr(String(val[dictKey])); }).join(', ');
     }
     if (typeof val === 'object') return '—';
-    return String(val);
+    return escAttr(String(val));
   }
 
   function statusLabel(status) {
@@ -748,7 +748,7 @@ _JS = r"""
         if (key === 'error_count' && typeof val === 'number' && val > 0 && lastErr) {
           label = '<span class="error-count-btn" data-error="' + escAttr(lastErr) + '" tabindex="0">Error Count &#9658;</span>';
         } else {
-          label = key.replace(/_/g, ' ').replace(/\b\w/g, function(char) { return char.toUpperCase(); });
+          label = escAttr(key.replace(/_/g, ' ').replace(/\b\w/g, function(char) { return char.toUpperCase(); }));
         }
         rows += '<tr><td>' + label + '</td><td>' + fmtDetailVal(key, val) + '</td></tr>';
       });
