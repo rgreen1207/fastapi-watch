@@ -42,7 +42,7 @@ async def test_kafka_probe_unhealthy_on_connection_error():
         probe = KafkaProbe(bootstrap_servers="localhost:9092")
         result = await probe.check()
     assert result.status == ProbeStatus.UNHEALTHY
-    assert "broker unavailable" in result.error
+    assert result.error == "probe check failed"
 
 
 @pytest.mark.asyncio
