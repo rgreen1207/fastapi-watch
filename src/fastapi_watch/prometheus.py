@@ -26,9 +26,14 @@ Exposed metrics (all carry ``name`` and ``critical`` labels):
 from .models import ProbeResult, ProbeStatus
 
 
+def _escape_label(value: str) -> str:
+    """Escape a Prometheus label value per the text format spec."""
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
 def _lbl(name: str, critical: bool) -> str:
     crit = "true" if critical else "false"
-    return f'{{name="{name}",critical="{crit}"}}'
+    return f'{{name="{_escape_label(name)}",critical="{crit}"}}'
 
 
 def render_prometheus(

@@ -1,7 +1,7 @@
 import asyncio
 import base64
-import importlib.util
 import logging
+import re
 import secrets
 import signal as _signal
 from datetime import datetime, timedelta
@@ -11,11 +11,11 @@ from zoneinfo import ZoneInfo
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class _MaintenanceRequest(BaseModel):
-    minutes: float | None = None
+    minutes: float | None = Field(None, gt=0, le=525600)  # max 1 year
     until: datetime | None = None
 
 from .alerts import BaseAlerter, WebhookAlerter
@@ -46,7 +46,8 @@ def _parse_tag_filter(tag: str | None) -> frozenset[str] | None:
     """
     if not tag:
         return None
-    tags = frozenset(t.strip() for t in tag.split(",") if t.strip())
+    parts = tag.split(",")[:50]
+    tags = frozenset(t.strip() for t in parts if t.strip())
     return tags or None
 
 
@@ -81,7 +82,7 @@ def _make_auth_checker(auth) -> Callable | None:
             result = auth(request)
             if asyncio.iscoroutine(result):
                 result = await result
-            if not result:
+            if result is not True:
                 raise HTTPException(status_code=403, detail="Forbidden")
         return _custom
 
@@ -158,9 +159,7 @@ class HealthRegistry:
         groups: :class:`~fastapi_watch.ProbeGroup` instances to merge at startup.
         dashboard: ``True`` (default) — built-in HTML dashboard.  ``False`` — omit the
             route.  Callable ``(report: HealthReport) -> str`` — custom renderer.
-            ``str`` or ``Path`` — path to a ``.html`` file (served as-is) or a ``.py``
-            file that exports a ``render_dashboard(report, stream_url, maintenance_banner)``
-            callable.
+            ``str`` or ``Path`` — path to a ``.html`` or ``.htm`` file served as-is.
         circuit_breaker: Enable the circuit breaker (default ``True``).  When a probe
             fails *circuit_breaker_threshold* times consecutively it is suspended for
             *circuit_breaker_cooldown_ms* ms, avoiding repeated calls to a broken
@@ -287,6 +286,12 @@ class HealthRegistry:
         for group in groups or []:
             self.include(group)
 
+        if auth is None and self._logger:
+            self._logger.warning(
+                "fastapi-watch: health endpoints are publicly accessible (auth=None). "
+                "Pass auth= to HealthRegistry to restrict access in production."
+            )
+
     # ------------------------------------------------------------------
     # Public API — probe registration
     # ------------------------------------------------------------------
@@ -309,6 +314,11 @@ class HealthRegistry:
 
         Silently skips the probe if it is already registered (identity check).
         """
+        if not re.match(r'^[A-Za-z0-9_\-\.:]+$', probe.name):
+            raise ValueError(
+                f"Probe name {probe.name!r} contains invalid characters. "
+                "Names must contain only letters, digits, hyphens, underscores, dots, and colons."
+            )
         if not any(p is probe for p, _ in self._probes):
             self._probes.append((probe, critical))
         return self
@@ -775,12 +785,17 @@ class HealthRegistry:
             )
         except Exception as exc:
             if self._logger:
-                self._logger.exception("Probe %r raised an exception", probe.name)
+                self._logger.exception(
+                    "Probe %r raised an unhandled exception: %s: %s",
+                    probe.name,
+                    type(exc).__name__,
+                    exc,
+                )
             result = ProbeResult(
                 name=probe.name,
                 status=ProbeStatus.UNHEALTHY,
                 critical=critical,
-                error=f"{type(exc).__name__}: {exc}",
+                error="probe check failed",
             )
 
         # Update circuit breaker state
@@ -1311,20 +1326,16 @@ class HealthRegistry:
             if callable(dashboard):
                 _renderer: Callable[..., str] = dashboard
             elif isinstance(dashboard, (str, Path)):
-                dashboard_path = Path(dashboard)
+                dashboard_path = Path(dashboard).resolve()
                 if dashboard_path.suffix in (".html", ".htm"):
                     _html_content = dashboard_path.read_text(encoding="utf-8")
 
                     def _renderer(report: HealthReport, maintenance: bool = False) -> str:
                         return _html_content
-                elif dashboard_path.suffix == ".py":
-                    _spec = importlib.util.spec_from_file_location("_custom_dashboard", dashboard_path)
-                    _mod = importlib.util.module_from_spec(_spec)
-                    _spec.loader.exec_module(_mod)
-                    _renderer = _mod.render_dashboard
                 else:
                     raise ValueError(
-                        f"dashboard file must be .html, .htm, or .py — got {dashboard_path.suffix!r}"
+                        f"dashboard path must be an .html or .htm file — got {dashboard_path.suffix!r}. "
+                        "To use a custom renderer, pass a callable instead of a file path."
                     )
             else:
                 _stream_url = f"{prefix}/status/stream"
