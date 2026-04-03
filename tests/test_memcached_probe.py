@@ -42,7 +42,7 @@ async def test_memcached_probe_unhealthy_on_error():
         probe = MemcachedProbe(host="localhost")
         result = await probe.check()
     assert result.status == ProbeStatus.UNHEALTHY
-    assert "connection refused" in result.error
+    assert result.error == "probe check failed"
     mock_client.close.assert_called_once()
 
 
