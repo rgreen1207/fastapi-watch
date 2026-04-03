@@ -81,6 +81,6 @@ class TCPProbe(BaseProbe):
                 name=self.name,
                 status=ProbeStatus.UNHEALTHY,
                 latency_ms=latency,
-                error=f"{type(exc).__name__}: {exc}",
+                error="probe check failed",
                 details={"host": self.host, "port": self.port},
             )

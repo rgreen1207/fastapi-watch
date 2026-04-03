@@ -261,3 +261,81 @@ def test_no_auth_warning_suppressed_when_auth_set():
         str(call) for call in mock_logger.warning.call_args_list
     )
     assert "publicly accessible" not in warning_messages
+
+
+# ---------------------------------------------------------------------------
+# Probe name validation at registry.add() time
+# ---------------------------------------------------------------------------
+
+def test_valid_probe_names_accepted():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    for name in ("mem", "my-probe", "probe_1", "redis.primary", "DB", "tcp:localhost:6379"):
+        registry.add(NoOpProbe(name=name))
+
+
+def test_probe_name_with_newline_rejected():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    with pytest.raises(ValueError, match="invalid characters"):
+        registry.add(NoOpProbe(name="probe\ninjected"))
+
+
+def test_probe_name_with_quote_rejected():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    with pytest.raises(ValueError, match="invalid characters"):
+        registry.add(NoOpProbe(name='probe"name'))
+
+
+def test_probe_name_with_space_rejected():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    with pytest.raises(ValueError, match="invalid characters"):
+        registry.add(NoOpProbe(name="my probe"))
+
+
+# ---------------------------------------------------------------------------
+# Probe error string is generic (probe-level catches, not just registry-level)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_tcp_probe_error_is_generic():
+    from fastapi_watch.probes.tcp import TCPProbe
+    probe = TCPProbe(host="192.0.2.1", port=9999, timeout=0.01)
+    result = await probe.check()
+    from fastapi_watch.models import ProbeStatus
+    assert result.status == ProbeStatus.UNHEALTHY
+    assert result.error == "probe check failed"
+
+
+# ---------------------------------------------------------------------------
+# Prometheus label escaping
+# ---------------------------------------------------------------------------
+
+def test_prometheus_label_escapes_quotes():
+    from fastapi_watch.prometheus import render_prometheus
+    from fastapi_watch.models import ProbeResult, ProbeStatus
+    result = ProbeResult(name='probe"name', status=ProbeStatus.HEALTHY, latency_ms=0.0)
+    output = render_prometheus([result])
+    assert '"probe"name"' not in output
+    assert r'probe\"name' in output
+
+
+def test_prometheus_label_escapes_newlines():
+    from fastapi_watch.prometheus import render_prometheus
+    from fastapi_watch.models import ProbeResult, ProbeStatus
+    result = ProbeResult(name="probe\ninjected", status=ProbeStatus.HEALTHY, latency_ms=0.0)
+    output = render_prometheus([result])
+    # Literal newline inside a label value would break the line-based format;
+    # it must be escaped to the two-character sequence \n instead.
+    assert 'name="probe\ninjected"' not in output  # literal newline must not appear
+    assert r"probe\ninjected" in output             # escaped form must appear
+
+
+def test_prometheus_label_escapes_backslashes():
+    from fastapi_watch.prometheus import render_prometheus
+    from fastapi_watch.models import ProbeResult, ProbeStatus
+    result = ProbeResult(name="probe\\name", status=ProbeStatus.HEALTHY, latency_ms=0.0)
+    output = render_prometheus([result])
+    assert r"probe\\name" in output

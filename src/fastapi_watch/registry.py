@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import logging
+import re
 import secrets
 import signal as _signal
 from datetime import datetime, timedelta
@@ -312,6 +313,11 @@ class HealthRegistry:
 
         Silently skips the probe if it is already registered (identity check).
         """
+        if not re.match(r'^[A-Za-z0-9_\-\.:]+$', probe.name):
+            raise ValueError(
+                f"Probe name {probe.name!r} contains invalid characters. "
+                "Names must contain only letters, digits, hyphens, underscores, dots, and colons."
+            )
         if not any(p is probe for p, _ in self._probes):
             self._probes.append((probe, critical))
         return self

@@ -90,7 +90,7 @@ class KafkaProbe(BaseProbe):
                 name=self.name,
                 status=ProbeStatus.UNHEALTHY,
                 latency_ms=round(latency, 2),
-                error=str(exc),
+                error="probe check failed",
             )
         finally:
             if client is not None:
