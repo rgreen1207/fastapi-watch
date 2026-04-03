@@ -339,3 +339,51 @@ def test_prometheus_label_escapes_backslashes():
     result = ProbeResult(name="probe\\name", status=ProbeStatus.HEALTHY, latency_ms=0.0)
     output = render_prometheus([result])
     assert r"probe\\name" in output
+
+
+# ---------------------------------------------------------------------------
+# Maintenance endpoint: overflow/invalid minutes rejected at validation layer
+# ---------------------------------------------------------------------------
+
+def test_maintenance_huge_minutes_returns_422():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.add(NoOpProbe(name="mem"))
+    client = TestClient(app, raise_server_exceptions=False)
+    resp = client.post("/health/maintenance", json={"minutes": 1e308})
+    assert resp.status_code == 422
+
+
+def test_maintenance_negative_minutes_returns_422():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.add(NoOpProbe(name="mem"))
+    client = TestClient(app, raise_server_exceptions=False)
+    resp = client.post("/health/maintenance", json={"minutes": -1})
+    assert resp.status_code == 422
+
+
+def test_maintenance_valid_minutes_accepted():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.add(NoOpProbe(name="mem"))
+    client = TestClient(app)
+    resp = client.post("/health/maintenance", json={"minutes": 30})
+    assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Tag filter: bounded to 50 entries
+# ---------------------------------------------------------------------------
+
+def test_tag_filter_truncates_at_50():
+    from fastapi_watch.registry import _parse_tag_filter
+    tags = ",".join(f"tag{i}" for i in range(200))
+    result = _parse_tag_filter(tags)
+    assert len(result) <= 50
+
+
+def test_tag_filter_normal_use_unaffected():
+    from fastapi_watch.registry import _parse_tag_filter
+    result = _parse_tag_filter("api,db,cache")
+    assert result == frozenset({"api", "db", "cache"})

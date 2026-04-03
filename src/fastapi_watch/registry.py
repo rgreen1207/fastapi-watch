@@ -11,11 +11,11 @@ from zoneinfo import ZoneInfo
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class _MaintenanceRequest(BaseModel):
-    minutes: float | None = None
+    minutes: float | None = Field(None, gt=0, le=525600)  # max 1 year
     until: datetime | None = None
 
 from .alerts import BaseAlerter, WebhookAlerter
@@ -46,7 +46,8 @@ def _parse_tag_filter(tag: str | None) -> frozenset[str] | None:
     """
     if not tag:
         return None
-    tags = frozenset(t.strip() for t in tag.split(",") if t.strip())
+    parts = tag.split(",")[:50]
+    tags = frozenset(t.strip() for t in parts if t.strip())
     return tags or None
 
 
