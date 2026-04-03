@@ -1005,10 +1005,10 @@ def test_discover_routes_name_fn_customises_probe_name():
     async def list_items():
         return {}
 
-    registry.discover_routes(name_fn=lambda r: r.path)
+    registry.discover_routes(name_fn=lambda r: r.path.lstrip("/"))
 
     names = {p.name for p, _ in registry._probes}
-    assert "/items" in names
+    assert "items" in names
     assert "list_items" not in names
 
 
