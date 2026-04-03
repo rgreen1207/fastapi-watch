@@ -146,7 +146,7 @@ async def test_probe_exception_becomes_unhealthy_result():
     registry.add(BombProbe())
     results = await registry.run_all()
     assert results[0].status == ProbeStatus.UNHEALTHY
-    assert "RuntimeError" in results[0].error
+    assert results[0].error == "probe check failed"
 
 
 # ---------------------------------------------------------------------------
@@ -247,8 +247,13 @@ def test_logger_warns_on_clamped_interval():
     app = FastAPI()
     mock_logger = MagicMock(spec=logging.Logger)
     HealthRegistry(app, poll_interval_ms=200, logger=mock_logger)
-    mock_logger.warning.assert_called_once()
-    args = mock_logger.warning.call_args[0]
+    # One warning for clamped interval, one for missing auth — find the interval one
+    interval_calls = [
+        call for call in mock_logger.warning.call_args_list
+        if 200 in call[0] or 1000 in call[0]
+    ]
+    assert interval_calls, "expected a warning about clamped interval"
+    args = interval_calls[0][0]
     assert 200 in args
     assert 1000 in args
 
@@ -291,7 +296,7 @@ async def test_no_log_on_probe_exception_without_logger():
     registry.add(BombProbe())
     results = await registry.run_all()
     assert results[0].status == ProbeStatus.UNHEALTHY
-    assert "RuntimeError" in results[0].error
+    assert results[0].error == "probe check failed"
 
 
 # ---------------------------------------------------------------------------
@@ -582,7 +587,7 @@ async def test_probe_timeout_becomes_unhealthy():
     registry.add(SlowProbe())
     results = await registry.run_all()
     assert results[0].status == ProbeStatus.UNHEALTHY
-    assert "TimeoutError" in results[0].error
+    assert results[0].error == "probe check failed"
 
 
 @pytest.mark.asyncio
