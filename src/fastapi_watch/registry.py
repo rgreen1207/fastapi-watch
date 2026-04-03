@@ -1,6 +1,5 @@
 import asyncio
 import base64
-import importlib.util
 import logging
 import secrets
 import signal as _signal
@@ -81,7 +80,7 @@ def _make_auth_checker(auth) -> Callable | None:
             result = auth(request)
             if asyncio.iscoroutine(result):
                 result = await result
-            if not result:
+            if result is not True:
                 raise HTTPException(status_code=403, detail="Forbidden")
         return _custom
 
@@ -158,9 +157,7 @@ class HealthRegistry:
         groups: :class:`~fastapi_watch.ProbeGroup` instances to merge at startup.
         dashboard: ``True`` (default) — built-in HTML dashboard.  ``False`` — omit the
             route.  Callable ``(report: HealthReport) -> str`` — custom renderer.
-            ``str`` or ``Path`` — path to a ``.html`` file (served as-is) or a ``.py``
-            file that exports a ``render_dashboard(report, stream_url, maintenance_banner)``
-            callable.
+            ``str`` or ``Path`` — path to a ``.html`` or ``.htm`` file served as-is.
         circuit_breaker: Enable the circuit breaker (default ``True``).  When a probe
             fails *circuit_breaker_threshold* times consecutively it is suspended for
             *circuit_breaker_cooldown_ms* ms, avoiding repeated calls to a broken
@@ -286,6 +283,12 @@ class HealthRegistry:
         self.app.router.on_shutdown.append(self._shutdown)
         for group in groups or []:
             self.include(group)
+
+        if auth is None and self._logger:
+            self._logger.warning(
+                "fastapi-watch: health endpoints are publicly accessible (auth=None). "
+                "Pass auth= to HealthRegistry to restrict access in production."
+            )
 
     # ------------------------------------------------------------------
     # Public API — probe registration
@@ -775,12 +778,17 @@ class HealthRegistry:
             )
         except Exception as exc:
             if self._logger:
-                self._logger.exception("Probe %r raised an exception", probe.name)
+                self._logger.exception(
+                    "Probe %r raised an unhandled exception: %s: %s",
+                    probe.name,
+                    type(exc).__name__,
+                    exc,
+                )
             result = ProbeResult(
                 name=probe.name,
                 status=ProbeStatus.UNHEALTHY,
                 critical=critical,
-                error=f"{type(exc).__name__}: {exc}",
+                error="probe check failed",
             )
 
         # Update circuit breaker state
@@ -1311,20 +1319,16 @@ class HealthRegistry:
             if callable(dashboard):
                 _renderer: Callable[..., str] = dashboard
             elif isinstance(dashboard, (str, Path)):
-                dashboard_path = Path(dashboard)
+                dashboard_path = Path(dashboard).resolve()
                 if dashboard_path.suffix in (".html", ".htm"):
                     _html_content = dashboard_path.read_text(encoding="utf-8")
 
                     def _renderer(report: HealthReport, maintenance: bool = False) -> str:
                         return _html_content
-                elif dashboard_path.suffix == ".py":
-                    _spec = importlib.util.spec_from_file_location("_custom_dashboard", dashboard_path)
-                    _mod = importlib.util.module_from_spec(_spec)
-                    _spec.loader.exec_module(_mod)
-                    _renderer = _mod.render_dashboard
                 else:
                     raise ValueError(
-                        f"dashboard file must be .html, .htm, or .py — got {dashboard_path.suffix!r}"
+                        f"dashboard path must be an .html or .htm file — got {dashboard_path.suffix!r}. "
+                        "To use a custom renderer, pass a callable instead of a file path."
                     )
             else:
                 _stream_url = f"{prefix}/status/stream"

@@ -41,12 +41,71 @@ Custom alerters::
             # send SMS via your provider ...
 """
 import asyncio
+import ipaddress
 import json
+import urllib.parse
 import urllib.request
 from abc import ABC, abstractmethod
 from typing import Any
 
 from .models import AlertRecord, ProbeStatus
+
+# Private IPv4 and IPv6 ranges that must not be reachable via alerter webhooks.
+_PRIVATE_NETS = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),   # link-local / AWS metadata
+    ipaddress.ip_network("100.64.0.0/10"),    # Carrier-grade NAT
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+]
+
+
+def _validate_webhook_url(url: str) -> None:
+    """Raise ``ValueError`` if *url* is not a safe HTTPS webhook URL.
+
+    Rejects:
+    - Non-HTTPS schemes (``http://``, ``file://``, etc.)
+    - Hostnames that resolve to private / loopback / link-local IP ranges
+    - Bare IP literals in private ranges
+
+    This is a best-effort defence-in-depth check against accidental SSRF.
+    It does **not** perform DNS resolution; literal IP addresses are checked
+    directly.  Pass ``allow_http=True`` on the alerter if you need plain HTTP
+    for an internal relay (e.g. a local sidecar).
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception as exc:
+        raise ValueError(f"Invalid webhook URL: {exc}") from exc
+
+    if parsed.scheme not in ("https", "http"):
+        raise ValueError(
+            f"Webhook URL must use https:// or http:// scheme, got {parsed.scheme!r}"
+        )
+
+    hostname = parsed.hostname or ""
+
+    # Reject bare IP literals in private ranges immediately.
+    try:
+        addr = ipaddress.ip_address(hostname)
+        if any(addr in net for net in _PRIVATE_NETS):
+            raise ValueError(
+                f"Webhook URL hostname {hostname!r} resolves to a private/loopback "
+                "address. Use a public HTTPS endpoint."
+            )
+    except ValueError as exc:
+        if "private" in str(exc) or "loopback" in str(exc):
+            raise
+        # Not a valid IP literal — hostname string, fine to pass through.
+
+    if hostname.lower() in ("localhost", ""):
+        raise ValueError(
+            "Webhook URL must not target localhost. Use a public HTTPS endpoint."
+        )
 
 
 class BaseAlerter(ABC):
@@ -120,9 +179,13 @@ class WebhookAlerter(BaseAlerter):
         headers: dict[str, str] | None = None,
         timeout: float = 5.0,
     ) -> None:
+        _validate_webhook_url(url)
         self.url = url
         self.headers = headers or {}
         self.timeout = timeout
+
+    def __repr__(self) -> str:
+        return f"WebhookAlerter(url={self.url!r})"
 
     def _build_payload(self, alert: AlertRecord) -> bytes:
         return json.dumps({
@@ -195,10 +258,14 @@ class SlackAlerter(BaseAlerter):
         username: str = "fastapi-watch",
         timeout: float = 5.0,
     ) -> None:
+        _validate_webhook_url(webhook_url)
         self.webhook_url = webhook_url
         self.channel = channel
         self.username = username
         self.timeout = timeout
+
+    def __repr__(self) -> str:
+        return f"SlackAlerter(url='<redacted>', channel={self.channel!r})"
 
     def _build_payload(self, alert: AlertRecord) -> bytes:
         emoji = self._STATUS_EMOJI.get(alert.new_status, ":white_circle:")
@@ -269,8 +336,12 @@ class TeamsAlerter(BaseAlerter):
     }
 
     def __init__(self, webhook_url: str, *, timeout: float = 5.0) -> None:
+        _validate_webhook_url(webhook_url)
         self.webhook_url = webhook_url
         self.timeout = timeout
+
+    def __repr__(self) -> str:
+        return "TeamsAlerter(url='<redacted>')"
 
     def _build_payload(self, alert: AlertRecord) -> bytes:
         color = self._STATUS_COLOR.get(alert.new_status, "94a3b8")
@@ -353,6 +424,9 @@ class PagerDutyAlerter(BaseAlerter):
         self.routing_key = routing_key
         self.source = source
         self.timeout = timeout
+
+    def __repr__(self) -> str:
+        return f"PagerDutyAlerter(routing_key='<redacted>', source={self.source!r})"
 
     def _build_payload(self, alert: AlertRecord) -> bytes:
         if alert.new_status == ProbeStatus.HEALTHY:
