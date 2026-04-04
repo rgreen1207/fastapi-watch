@@ -160,6 +160,9 @@ class HealthRegistry:
         dashboard: ``True`` (default) — built-in HTML dashboard.  ``False`` — omit the
             route.  Callable ``(report: HealthReport) -> str`` — custom renderer.
             ``str`` or ``Path`` — path to a ``.html`` or ``.htm`` file served as-is.
+        serve_routes: ``True`` (default) — register all health endpoints on the app.
+            ``False`` — skip route registration entirely.  Use :meth:`get_report`
+            to expose health status on your own endpoint with custom auth or path.
         circuit_breaker: Enable the circuit breaker (default ``True``).  When a probe
             fails *circuit_breaker_threshold* times consecutively it is suspended for
             *circuit_breaker_cooldown_ms* ms, avoiding repeated calls to a broken
@@ -212,6 +215,7 @@ class HealthRegistry:
         timezone: str = "UTC",
         groups: list[ProbeGroup] | None = None,
         dashboard: bool | Callable[..., str] | str | Path = True,
+        serve_routes: bool = True,
         circuit_breaker: bool = True,
         circuit_breaker_threshold: int = 5,
         circuit_breaker_cooldown_ms: int = 600_000,
@@ -281,7 +285,8 @@ class HealthRegistry:
         self._sse_tasks: set[asyncio.Task] = set()
         self._signal_handler_installed: bool = False
 
-        self._register_routes(tags or ["health"], dashboard=dashboard)
+        if serve_routes:
+            self._register_routes(tags or ["health"], dashboard=dashboard)
         self.app.router.on_shutdown.append(self._shutdown)
         for group in groups or []:
             self.include(group)
@@ -710,6 +715,26 @@ class HealthRegistry:
     async def run_all(self) -> list[ProbeResult]:
         """Run all probes concurrently and return their results."""
         return await self._execute_probes(self._probes)
+
+    async def get_report(self) -> HealthReport:
+        """Return the current :class:`~fastapi_watch.models.HealthReport`.
+
+        Intended for use with ``serve_routes=False`` — lets you expose health status
+        on your own endpoint with custom auth, path, or response shaping::
+
+            registry = HealthRegistry(app, serve_routes=False)
+
+            @app.get("/internal/health", dependencies=[Depends(my_auth)])
+            async def my_health():
+                report = await registry.get_report()
+                return report.model_dump()
+        """
+        results = await self._get_results()
+        return HealthReport.from_results(
+            results,
+            checked_at=self._last_checked_at,
+            timezone=self._timezone_name,
+        )
 
     async def _execute_probes(self, pairs: list[tuple[BaseProbe, bool]]) -> list[ProbeResult]:
         """Run a subset of probes, update the cache, history, and fire callbacks."""
