@@ -21,7 +21,7 @@
 
 Add `/health/*` endpoints to any FastAPI app in minutes. Probes observe real traffic — no synthetic requests — and stream live results to a built-in dashboard and Prometheus endpoint.
 
-For full documentation see **[DOCS.md](DOCS.md)**.
+For full documentation see **[DOCS.md](https://github.com/rgreen1207/fastapi-watch/blob/main/DOCS.md)**.
 
 ---
 
@@ -232,7 +232,7 @@ async def my_health():
     return report.model_dump()
 ```
 
-See [DOCS.md — Security](DOCS.md#security) for auth callables, SSRF protection on webhook alerters, probe error message handling, and probe name restrictions.
+See [DOCS.md — Security](https://github.com/rgreen1207/fastapi-watch/blob/main/DOCS.md#security) for auth callables, SSRF protection on webhook alerters, probe error message handling, and probe name restrictions.
 
 ---
 
