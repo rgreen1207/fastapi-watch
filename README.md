@@ -221,6 +221,17 @@ Health endpoints are **publicly accessible by default** — set `auth` in produc
 registry = HealthRegistry(app, auth={"username": "ops", "password": "secret"})
 ```
 
+To skip all route registration entirely and expose health status on your own endpoint with custom auth:
+
+```python
+registry = HealthRegistry(app, serve_routes=False)
+
+@app.get("/internal/health", dependencies=[Depends(my_auth)])
+async def my_health():
+    report = await registry.get_report()
+    return report.model_dump()
+```
+
 See [DOCS.md — Security](DOCS.md#security) for auth callables, SSRF protection on webhook alerters, probe error message handling, and probe name restrictions.
 
 ---
