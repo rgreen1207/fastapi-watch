@@ -1388,6 +1388,7 @@ registry.add(db_probe)
 | `timezone` | `str` | `"UTC"` | IANA timezone for `checked_at` timestamps |
 | `groups` | `list[ProbeGroup] \| None` | `None` | ProbeGroups to include at startup |
 | `dashboard` | `bool \| Callable \| Path` | `True` | `True` = built-in dashboard; `False` = disabled; Callable = custom renderer; `.html`/`.htm` file path = served as-is. `.py` files are rejected. |
+| `serve_routes` | `bool` | `True` | `True` = register all health endpoints on the app. `False` = skip route registration entirely — use `get_report()` to expose status on your own endpoint. |
 | `circuit_breaker` | `bool` | `True` | Enable/disable circuit breaker |
 | `circuit_breaker_threshold` | `int` | `5` | Consecutive failures before circuit opens |
 | `circuit_breaker_cooldown_ms` | `int` | `600000` | Cooldown before probe is retried (10 min) |
@@ -1409,6 +1410,7 @@ registry.add(db_probe)
 | `set_maintenance(until=None)` | Activate maintenance mode. Returns `self`. |
 | `clear_maintenance()` | Deactivate maintenance mode. Returns `self`. |
 | `run_all()` | Async — run all probes concurrently, return `list[ProbeResult]`. |
+| `get_report()` | Async — run probes and return a `HealthReport`. Intended for use with `serve_routes=False`. |
 
 ### `BaseProbe` attributes
 
@@ -1481,6 +1483,27 @@ Exceptions raised inside a probe's `check()` method return the generic string `"
 ### Probe names
 
 Probe names must match `[A-Za-z0-9_\-.:]+`. Names with spaces, newlines, or HTML-special characters are rejected at `registry.add()` time with a `ValueError`. This prevents injection into Prometheus metric labels and dashboard rendering.
+
+### Disabling all health routes
+
+If you need full control over authentication, path, or response shape, pass `serve_routes=False` to skip registering any health endpoints. Use `get_report()` to build your own:
+
+```python
+from fastapi import Depends, HTTPException, Header
+
+async def my_auth(x_api_key: str = Header(...)):
+    if x_api_key != os.environ["HEALTH_KEY"]:
+        raise HTTPException(status_code=401)
+
+registry = HealthRegistry(app, serve_routes=False)
+
+@app.get("/internal/health", dependencies=[Depends(my_auth)])
+async def my_health():
+    report = await registry.get_report()
+    return report.model_dump()
+```
+
+`get_report()` respects the same poll interval and cache logic as the built-in endpoints — probes are not re-run on every request when a poll interval is configured.
 
 ### Custom dashboard
 

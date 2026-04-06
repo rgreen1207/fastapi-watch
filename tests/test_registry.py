@@ -1397,3 +1397,68 @@ def test_startup_probes_not_in_status():
     resp = client.get("/health/status")
     names = {p["name"] for p in resp.json()["probes"]}
     assert "db-init" not in names
+
+
+# ---------------------------------------------------------------------------
+# serve_routes=False
+# ---------------------------------------------------------------------------
+
+def test_serve_routes_false_mounts_no_health_endpoints():
+    app = FastAPI()
+    HealthRegistry(app, serve_routes=False)
+    client = TestClient(app)
+    assert client.get("/health/live").status_code == 404
+    assert client.get("/health/ready").status_code == 404
+    assert client.get("/health/status").status_code == 404
+    assert client.get("/health/dashboard").status_code == 404
+
+
+def test_serve_routes_true_still_mounts_endpoints():
+    app = FastAPI()
+    HealthRegistry(app, serve_routes=True)
+    client = TestClient(app)
+    assert client.get("/health/live").status_code == 200
+
+
+def test_serve_routes_false_probes_still_register():
+    app = FastAPI()
+    registry = HealthRegistry(app, serve_routes=False)
+    registry.add(NoOpProbe(name="db"))
+    registry.add(NoOpProbe(name="cache"))
+    assert len(registry._probes) == 2
+
+
+@pytest.mark.asyncio
+async def test_get_report_returns_health_report():
+    from fastapi_watch.models import HealthReport
+    app = FastAPI()
+    registry = HealthRegistry(app, serve_routes=False)
+    registry.add(NoOpProbe(name="db"))
+    report = await registry.get_report()
+    assert isinstance(report, HealthReport)
+    assert len(report.probes) == 1
+    assert report.probes[0].name == "db"
+
+
+@pytest.mark.asyncio
+async def test_get_report_reflects_probe_status():
+    app = FastAPI()
+    registry = HealthRegistry(app, serve_routes=False)
+
+    class FailingProbe(NoOpProbe):
+        async def check(self):
+            return ProbeResult(name=self.name, status=ProbeStatus.UNHEALTHY, error="down")
+
+    registry.add(FailingProbe(name="db"))
+    report = await registry.get_report()
+    assert report.status == ProbeStatus.UNHEALTHY
+
+
+@pytest.mark.asyncio
+async def test_get_report_available_with_routes_enabled():
+    """get_report() works regardless of serve_routes value."""
+    app = FastAPI()
+    registry = HealthRegistry(app, serve_routes=True)
+    registry.add(NoOpProbe(name="svc"))
+    report = await registry.get_report()
+    assert report.status == ProbeStatus.HEALTHY
