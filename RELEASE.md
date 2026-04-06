@@ -1,5 +1,29 @@
 # Release Notes
 
+## v1.6.0
+
+**Custom health endpoints and bounded alert dispatch.**
+
+### New Features
+
+#### `serve_routes=False` and `get_report()` for custom health endpoints
+- `HealthRegistry` now accepts `serve_routes=False` (default `True`). When `False`, no health routes are registered on the FastAPI app — useful when you want to expose probe status on your own endpoint with custom auth, path, or response shaping.
+- New `async def get_report() -> HealthReport` public method returns the current health report without going through HTTP. Intended for use with `serve_routes=False`:
+  ```python
+  registry = HealthRegistry(app, serve_routes=False)
+
+  @app.get("/internal/health", dependencies=[Depends(my_auth)])
+  async def my_health():
+      report = await registry.get_report()
+      return report.model_dump()
+  ```
+
+#### Bounded alert dispatch queue
+- Alert dispatch previously called `asyncio.create_task()` on every probe state change, creating an unbounded number of concurrent tasks under alert storms.
+- A single background worker (`_alert_loop`) now drains an `asyncio.Queue(maxsize=256)` serially. The worker starts lazily on the first alert and is cancelled cleanly on shutdown. When the queue is full, new alerts are dropped with a warning log.
+
+---
+
 ## v1.5.11
 
 **Security hardening.**
