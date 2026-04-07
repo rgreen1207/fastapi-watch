@@ -1,5 +1,22 @@
 # Release Notes
 
+## v1.6.1
+
+**Bug fix: alert worker hang under Python 3.11.**
+
+### Bug Fixes
+
+#### `_alert_loop` deadlock on Python 3.11
+- `_alert_loop` previously used `asyncio.wait_for(queue.get(), timeout=1.0)` to periodically check the `_shutting_down` flag. On Python 3.11, a known race condition in `asyncio.wait_for` (bpo-46607, fixed in 3.12) can cause the method to deadlock when task cancellation arrives at the same moment the 1-second timeout fires. This manifested as tests hanging indefinitely in CI when pytest-asyncio's event loop cleanup tried to cancel uncollected `_alert_worker` tasks.
+- Fixed by replacing `wait_for` with a plain `await queue.get()`. The `_shutting_down` check was redundant — `_shutdown()` and the signal handler both cancel the worker task directly.
+
+#### CI hardening
+- Added `timeout-minutes: 10` to the GitHub Actions test job so a hanging test can no longer block the pipeline for hours.
+- Added `pytest-timeout` to CI dependencies and a 30-second per-test timeout in `pyproject.toml`.
+- Added `asyncio_default_fixture_loop_scope = "function"` to pytest config to silence the pytest-asyncio deprecation warning and ensure per-test event loop isolation.
+
+---
+
 ## v1.6.0
 
 **Custom health endpoints and bounded alert dispatch.**
