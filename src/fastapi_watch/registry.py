@@ -1127,12 +1127,12 @@ class HealthRegistry:
         """Drain the alert queue, dispatching each alert to all registered alerters."""
         while True:
             try:
-                alert = await asyncio.wait_for(self._alert_queue.get(), timeout=1.0)
+                alert = await self._alert_queue.get()
+            except asyncio.CancelledError:
+                return
+            try:
                 await self._dispatch_alert(alert)
                 self._alert_queue.task_done()
-            except asyncio.TimeoutError:
-                if self._shutting_down:
-                    return
             except asyncio.CancelledError:
                 return
             except Exception:
