@@ -1143,6 +1143,88 @@ async def test_circuit_per_probe_threshold_override():
 
 
 # ---------------------------------------------------------------------------
+# reset_circuit
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reset_circuit_clears_open_state():
+    app = FastAPI()
+    registry = HealthRegistry(app, circuit_breaker_threshold=3, circuit_breaker_cooldown_ms=60_000)
+    probe = NoOpProbe(name="db")
+    registry.add(probe)
+
+    import asyncio
+    loop = asyncio.get_running_loop()
+    registry._circuit_open_until["db"] = loop.time() + 600.0
+    registry._circuit_err_count["db"] = 3
+
+    result = registry.reset_circuit("db")
+
+    assert "db" not in registry._circuit_open_until
+    assert "db" not in registry._circuit_err_count
+    assert result is registry
+
+
+@pytest.mark.asyncio
+async def test_reset_circuit_preserves_trips_total():
+    app = FastAPI()
+    registry = HealthRegistry(app, circuit_breaker_threshold=3, circuit_breaker_cooldown_ms=60_000)
+    probe = NoOpProbe(name="db")
+    registry.add(probe)
+
+    import asyncio
+    loop = asyncio.get_running_loop()
+    registry._circuit_open_until["db"] = loop.time() + 600.0
+    registry._circuit_err_count["db"] = 3
+    registry._circuit_trips["db"] = 5
+
+    registry.reset_circuit("db")
+
+    assert registry._circuit_trips.get("db") == 5
+
+
+def test_reset_circuit_no_op_when_probe_not_tripped():
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    result = registry.reset_circuit("nonexistent")
+    assert result is registry
+
+
+@pytest.mark.asyncio
+async def test_reset_circuit_allows_probe_to_run_again():
+    """After reset_circuit, a previously suspended probe executes on next run_all."""
+    run_count = 0
+
+    class CountingProbe(NoOpProbe):
+        async def check(self):
+            nonlocal run_count
+            run_count += 1
+            return await super().check()
+
+    app = FastAPI()
+    registry = HealthRegistry(app, circuit_breaker_threshold=3)
+    probe = CountingProbe(name="db")
+    registry.add(probe)
+
+    # Open the circuit manually
+    loop = asyncio.get_running_loop()
+    registry._circuit_open_until["db"] = loop.time() + 600.0
+    registry._circuit_err_count["db"] = 3
+
+    # Probe is suspended — run_all should not call check()
+    await registry.run_all()
+    assert run_count == 0
+
+    # Reset the circuit
+    registry.reset_circuit("db")
+
+    # Now run_all should actually execute the probe
+    await registry.run_all()
+    assert run_count == 1
+
+
+# ---------------------------------------------------------------------------
 # Webhook on state change
 # ---------------------------------------------------------------------------
 

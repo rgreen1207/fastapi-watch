@@ -51,6 +51,14 @@ def _parse_tag_filter(tag: str | None) -> frozenset[str] | None:
     return tags or None
 
 
+def _parse_probe_filter(probe: str | None) -> frozenset[str] | None:
+    if not probe:
+        return None
+    parts = probe.split(",")[:50]
+    names = frozenset(p.strip() for p in parts if p.strip())
+    return names or None
+
+
 def _normalize_interval(ms: int | None) -> int | None:
     """Validate and normalize a poll interval.
 
@@ -142,6 +150,7 @@ class HealthRegistry:
     - ``GET    /health/maintenance``   — current maintenance mode status
     - ``POST   /health/maintenance``   — enable maintenance mode (optional body: ``minutes`` or ``until``)
     - ``DELETE /health/maintenance``   — disable maintenance mode
+    - ``GET    /health/probes``        — probe introspection; lists registered probes without running them
 
     Args:
         app: FastAPI application.
@@ -336,6 +345,15 @@ class HealthRegistry:
         """Add a list of probes. Returns ``self`` for chaining."""
         for probe in probes:
             self.add(probe, critical=critical)
+        return self
+
+    def reset_circuit(self, probe_name: str) -> "HealthRegistry":
+        """Manually reset the circuit breaker for a probe, clearing its open state and failure count.
+
+        Returns self for chaining.
+        """
+        self._circuit_open_until.pop(probe_name, None)
+        self._circuit_err_count.pop(probe_name, None)
         return self
 
     def discover_routes(
@@ -1058,6 +1076,7 @@ class HealthRegistry:
         request: Request,
         make_report: Callable[[list[ProbeResult]], str],
         filter_tags: frozenset[str] | None = None,
+        filter_probes: frozenset[str] | None = None,
     ) -> AsyncGenerator[str, None]:
         """Async generator that yields SSE (Server-Sent Events) events while the client is connected."""
         task = asyncio.current_task()
@@ -1069,6 +1088,8 @@ class HealthRegistry:
                 results = await self._get_results()
                 if filter_tags:
                     results = [r for r in results if filter_tags & set(r.tags)]
+                if filter_probes:
+                    results = [r for r in results if r.name in filter_probes]
                 yield f"data: {make_report(results)}\n\n"
                 if self._poll_interval_ms is None:
                     return
@@ -1196,7 +1217,10 @@ class HealthRegistry:
             description="Returns 200 if all critical probes pass, 503 otherwise.",
             dependencies=auth_deps,
         )
-        async def readiness(tag: str | None = Query(default=None)) -> Response:
+        async def readiness(
+            tag: str | None = Query(default=None),
+            probe: str | None = Query(default=None),
+        ) -> Response:
             if registry._in_maintenance():
                 return JSONResponse({"status": "maintenance"}, status_code=200)
             if registry._in_grace_period():
@@ -1205,6 +1229,9 @@ class HealthRegistry:
             _filter = _parse_tag_filter(tag)
             if _filter:
                 results = [r for r in results if _filter & set(r.tags)]
+            _probe_filter = _parse_probe_filter(probe)
+            if _probe_filter:
+                results = [r for r in results if r.name in _probe_filter]
             report = HealthReport.from_results(
                 results,
                 checked_at=registry._last_checked_at,
@@ -1226,11 +1253,17 @@ class HealthRegistry:
             description="Returns full probe results. 200 when all healthy, 207 when any probe fails.",
             dependencies=auth_deps,
         )
-        async def health_status(tag: str | None = Query(default=None)) -> Response:
+        async def health_status(
+            tag: str | None = Query(default=None),
+            probe: str | None = Query(default=None),
+        ) -> Response:
             results = await registry._get_results()
             _filter = _parse_tag_filter(tag)
             if _filter:
                 results = [r for r in results if _filter & set(r.tags)]
+            _probe_filter = _parse_probe_filter(probe)
+            if _probe_filter:
+                results = [r for r in results if r.name in _probe_filter]
             report = HealthReport.from_results(
                 results,
                 checked_at=registry._last_checked_at,
@@ -1296,15 +1329,44 @@ class HealthRegistry:
             return JSONResponse({"status": "started"})
 
         @self.app.get(
+            f"{prefix}/probes",
+            tags=tags,
+            summary="Probe introspection",
+            description="Lists all registered probes and their config without running them.",
+            dependencies=auth_deps,
+        )
+        async def probe_list() -> Response:
+            probes = []
+            for p, critical in registry._probes:
+                probes.append({
+                    "name": p.name,
+                    "critical": critical,
+                    "tags": getattr(p, "tags", None) or [],
+                    "description": getattr(p, "description", None),
+                    "poll_interval_ms": p.poll_interval_ms,
+                    "circuit_breaker_enabled": p.circuit_breaker_enabled,
+                })
+            return JSONResponse({"probes": probes})
+
+        @self.app.get(
             f"{prefix}/ready/stream",
             tags=tags,
             summary="Readiness stream",
             description="SSE (Server-Sent Events) stream of readiness. Poll loop stops when last client disconnects.",
             dependencies=auth_deps,
         )
-        async def readiness_stream(request: Request, tag: str | None = Query(default=None)) -> StreamingResponse:
+        async def readiness_stream(
+            request: Request,
+            tag: str | None = Query(default=None),
+            probe: str | None = Query(default=None),
+        ) -> StreamingResponse:
             return StreamingResponse(
-                registry._event_stream(request, _make_sse_report, filter_tags=_parse_tag_filter(tag)),
+                registry._event_stream(
+                    request,
+                    _make_sse_report,
+                    filter_tags=_parse_tag_filter(tag),
+                    filter_probes=_parse_probe_filter(probe),
+                ),
                 media_type="text/event-stream",
                 headers=sse_headers,
             )
@@ -1316,9 +1378,18 @@ class HealthRegistry:
             description="SSE (Server-Sent Events) stream of full probe results. Poll loop stops when last client disconnects.",
             dependencies=auth_deps,
         )
-        async def status_stream(request: Request, tag: str | None = Query(default=None)) -> StreamingResponse:
+        async def status_stream(
+            request: Request,
+            tag: str | None = Query(default=None),
+            probe: str | None = Query(default=None),
+        ) -> StreamingResponse:
             return StreamingResponse(
-                registry._event_stream(request, _make_sse_report, filter_tags=_parse_tag_filter(tag)),
+                registry._event_stream(
+                    request,
+                    _make_sse_report,
+                    filter_tags=_parse_tag_filter(tag),
+                    filter_probes=_parse_probe_filter(probe),
+                ),
                 media_type="text/event-stream",
                 headers=sse_headers,
             )
