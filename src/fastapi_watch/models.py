@@ -53,6 +53,7 @@ class HealthReport(BaseModel):
     checked_at: datetime | None = None
     timezone: str | None = None
     probes: list[ProbeResult] = Field(default_factory=list)
+    failing: list[str] = Field(default_factory=list)
 
     @classmethod
     def from_results(
@@ -68,4 +69,5 @@ class HealthReport(BaseModel):
             overall = ProbeStatus.DEGRADED
         else:
             overall = ProbeStatus.HEALTHY
-        return cls(status=overall, checked_at=checked_at, timezone=timezone, probes=results)
+        failing = [r.name for r in critical if r.status == ProbeStatus.UNHEALTHY]
+        return cls(status=overall, checked_at=checked_at, timezone=timezone, probes=results, failing=failing)
