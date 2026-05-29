@@ -474,3 +474,137 @@ class PagerDutyAlerter(BaseAlerter):
             urllib.request.urlopen(req, timeout=timeout)
 
         await asyncio.get_running_loop().run_in_executor(None, _post)
+
+
+class OpsGenieAlerter(BaseAlerter):
+    """OpsGenie Alerts API v2 alerter.
+
+    Triggers an OpsGenie alert when a probe goes UNHEALTHY (P1) or DEGRADED
+    (P3) and closes it automatically when the probe recovers to HEALTHY.
+
+    A stable alias (``fastapi-watch:<probe-name>``) deduplicates repeated
+    UNHEALTHY transitions and ensures the corresponding HEALTHY transition
+    closes the same alert.
+
+    Args:
+        api_key: Your OpsGenie API key (GenieKey).
+        region: ``"us"`` (default) or ``"eu"`` — selects the correct API endpoint.
+        source: Event source label shown in OpsGenie (default ``"fastapi-watch"``).
+        timeout: Request timeout in seconds (default ``5``).
+
+    Example::
+
+        from fastapi_watch.alerts import OpsGenieAlerter
+
+        alerter = OpsGenieAlerter(api_key="your-api-key-here")
+
+        # EU region
+        alerter = OpsGenieAlerter(api_key="your-api-key-here", region="eu")
+    """
+
+    _BASE_URL = {
+        "us": "https://api.opsgenie.com",
+        "eu": "https://api.eu.opsgenie.com",
+    }
+    _ALLOWED_HOSTS: frozenset[str] = frozenset({"api.opsgenie.com", "api.eu.opsgenie.com"})
+    _PRIORITY = {
+        ProbeStatus.UNHEALTHY: "P1",
+        ProbeStatus.DEGRADED: "P3",
+    }
+
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        region: str = "us",
+        source: str = "fastapi-watch",
+        timeout: float = 5.0,
+    ) -> None:
+        if region not in self._BASE_URL:
+            raise ValueError(f"region must be 'us' or 'eu', got {region!r}")
+        self.api_key = api_key
+        self._base_url = self._BASE_URL[region]
+        # Store only the hostname (no scheme) so comparisons are unambiguous.
+        self._api_host: str = urllib.parse.urlparse(self._base_url).hostname or ""
+        self.source = source
+        self.timeout = timeout
+
+    def __repr__(self) -> str:
+        return f"OpsGenieAlerter(source={self.source!r})"
+
+    def _alias(self, probe_name: str) -> str:
+        return f"fastapi-watch:{probe_name}"
+
+    def _auth_headers(self) -> dict[str, str]:
+        return {"Authorization": f"GenieKey {self.api_key}", "Content-Type": "application/json"}
+
+    def _assert_safe_url(self, url: str) -> None:
+        """Guard: raise if the URL host does not match the configured OpsGenie host."""
+        host = urllib.parse.urlparse(url).hostname or ""
+        if host not in self._ALLOWED_HOSTS:
+            raise ValueError(f"OpsGenie URL host {host!r} not in allowed hosts")
+
+    async def notify(self, alert: AlertRecord) -> None:
+        alias = self._alias(alert.probe)
+        headers = self._auth_headers()
+        api_host = self._api_host
+        base_url = self._base_url
+        timeout = self.timeout
+
+        if alert.new_status == ProbeStatus.HEALTHY:
+            url = f"{base_url}/v2/alerts/{urllib.parse.quote(alias, safe='')}/close?identifierType=alias"
+            payload = json.dumps({}).encode()
+
+            def _close() -> None:
+                host = urllib.parse.urlparse(url).hostname or ""
+                if host != api_host:
+                    raise ValueError(f"OpsGenie URL host {host!r} does not match expected {api_host!r}")
+                req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+                try:
+                    urllib.request.urlopen(req, timeout=timeout)
+                except urllib.error.HTTPError as exc:
+                    raise RuntimeError(
+                        f"OpsGenie close-alert returned HTTP {exc.code} for alias {alias!r}"
+                    ) from exc
+                except urllib.error.URLError as exc:
+                    raise RuntimeError(
+                        f"OpsGenie close-alert network error for alias {alias!r}: {exc.reason}"
+                    ) from exc
+
+            await asyncio.get_running_loop().run_in_executor(None, _close)
+        else:
+            priority = self._PRIORITY.get(alert.new_status, "P1")
+            url = f"{base_url}/v2/alerts"
+            payload = json.dumps({
+                "message": f"{alert.probe}: {alert.old_status.value} → {alert.new_status.value}",
+                "alias": alias,
+                "description": (
+                    f"Probe '{alert.probe}' changed from {alert.old_status.value} "
+                    f"to {alert.new_status.value} at {alert.timestamp.isoformat()}"
+                ),
+                "source": self.source,
+                "priority": priority,
+                "details": {
+                    "probe": alert.probe,
+                    "old_status": alert.old_status.value,
+                    "new_status": alert.new_status.value,
+                },
+            }).encode()
+
+            def _create() -> None:
+                host = urllib.parse.urlparse(url).hostname or ""
+                if host != api_host:
+                    raise ValueError(f"OpsGenie URL host {host!r} does not match expected {api_host!r}")
+                req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+                try:
+                    urllib.request.urlopen(req, timeout=timeout)
+                except urllib.error.HTTPError as exc:
+                    raise RuntimeError(
+                        f"OpsGenie create-alert returned HTTP {exc.code} for probe {alert.probe!r}"
+                    ) from exc
+                except urllib.error.URLError as exc:
+                    raise RuntimeError(
+                        f"OpsGenie create-alert network error for probe {alert.probe!r}: {exc.reason}"
+                    ) from exc
+
+            await asyncio.get_running_loop().run_in_executor(None, _create)
