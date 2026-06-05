@@ -51,6 +51,11 @@ class RabbitMQProbe(BaseProbe):
         parsed = urlparse(url)
         self._mgmt_user = parsed.username or "guest"
         self._mgmt_password = parsed.password or "guest"
+        # Store a redacted URL for repr — never expose credentials
+        self._safe_url = parsed._replace(netloc=parsed.hostname if not parsed.username else f"{parsed.username}:<redacted>@{parsed.hostname}").geturl() if parsed.hostname else "<url>"
+
+    def __repr__(self) -> str:
+        return f"RabbitMQProbe(url={self._safe_url!r}, name={self.name!r})"
 
     async def check(self) -> ProbeResult:
         try:
@@ -161,4 +166,4 @@ class RabbitMQProbe(BaseProbe):
                 details["queues"] = queues
 
         except Exception as exc:
-            details["management_api_error"] = str(exc)
+            details["management_api_error"] = f"management API unavailable ({type(exc).__name__})"

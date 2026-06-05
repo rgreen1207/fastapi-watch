@@ -833,10 +833,9 @@ class HealthRegistry:
         except Exception as exc:
             if self._logger:
                 self._logger.exception(
-                    "Probe %r raised an unhandled exception: %s: %s",
+                    "Probe %r raised an unhandled %s",
                     probe.name,
                     type(exc).__name__,
-                    exc,
                 )
             result = ProbeResult(
                 name=probe.name,

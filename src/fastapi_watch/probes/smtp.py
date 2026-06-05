@@ -26,7 +26,7 @@ class SMTPProbe(PassiveProbe):
         @smtp_probe.watch
         async def send_welcome_email(to: str) -> None:
             async with aiosmtplib.SMTP("smtp.sendgrid.net", port=587) as smtp:
-                await smtp.login("apikey", os.environ["SENDGRID_API_KEY"])
+                await smtp.login("apikey", SENDGRID_API_KEY)
                 await smtp.sendmail(FROM, to, message.as_string())
 
         registry.add(smtp_probe)
