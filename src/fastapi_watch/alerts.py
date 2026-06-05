@@ -65,17 +65,19 @@ _PRIVATE_NETS = [
 
 
 def _validate_webhook_url(url: str) -> None:
-    """Raise ``ValueError`` if *url* is not a safe HTTPS webhook URL.
+    """Raise ``ValueError`` if *url* is not a safe webhook URL.
 
     Rejects:
-    - Non-HTTPS schemes (``http://``, ``file://``, etc.)
-    - Hostnames that resolve to private / loopback / link-local IP ranges
-    - Bare IP literals in private ranges
+    - Non-HTTP(S) schemes (``file://``, ``ftp://``, etc.)
+    - Bare IP literals in private/loopback/link-local ranges
+    - ``localhost`` hostnames
 
-    This is a best-effort defence-in-depth check against accidental SSRF.
-    It does **not** perform DNS resolution; literal IP addresses are checked
-    directly.  Pass ``allow_http=True`` on the alerter if you need plain HTTP
-    for an internal relay (e.g. a local sidecar).
+    Both ``http://`` and ``https://`` are accepted. Use ``https://`` for
+    production endpoints. Plain HTTP is only appropriate for local sidecars
+    on a trusted network.
+
+    This is a best-effort defence-in-depth check. It does **not** perform
+    DNS resolution — a hostname that resolves to a private IP will pass.
     """
     try:
         parsed = urllib.parse.urlparse(url)
@@ -185,7 +187,7 @@ class WebhookAlerter(BaseAlerter):
         self.timeout = timeout
 
     def __repr__(self) -> str:
-        return f"WebhookAlerter(url={self.url!r})"
+        return "WebhookAlerter(url='<redacted>')"
 
     def _build_payload(self, alert: AlertRecord) -> bytes:
         return json.dumps({
@@ -524,8 +526,6 @@ class OpsGenieAlerter(BaseAlerter):
             raise ValueError(f"region must be 'us' or 'eu', got {region!r}")
         self.api_key = api_key
         self._base_url = self._BASE_URL[region]
-        # Store only the hostname (no scheme) so comparisons are unambiguous.
-        self._api_host: str = urllib.parse.urlparse(self._base_url).hostname or ""
         self.source = source
         self.timeout = timeout
 
@@ -539,7 +539,7 @@ class OpsGenieAlerter(BaseAlerter):
         return {"Authorization": f"GenieKey {self.api_key}", "Content-Type": "application/json"}
 
     def _assert_safe_url(self, url: str) -> None:
-        """Guard: raise if the URL host does not match the configured OpsGenie host."""
+        """Guard: raise if the URL host is not in the OpsGenie allowlist."""
         host = urllib.parse.urlparse(url).hostname or ""
         if host not in self._ALLOWED_HOSTS:
             raise ValueError(f"OpsGenie URL host {host!r} not in allowed hosts")
@@ -547,7 +547,7 @@ class OpsGenieAlerter(BaseAlerter):
     async def notify(self, alert: AlertRecord) -> None:
         alias = self._alias(alert.probe)
         headers = self._auth_headers()
-        api_host = self._api_host
+        allowed = self._ALLOWED_HOSTS
         base_url = self._base_url
         timeout = self.timeout
 
@@ -557,8 +557,8 @@ class OpsGenieAlerter(BaseAlerter):
 
             def _close() -> None:
                 host = urllib.parse.urlparse(url).hostname or ""
-                if host != api_host:
-                    raise ValueError(f"OpsGenie URL host {host!r} does not match expected {api_host!r}")
+                if host not in allowed:
+                    raise ValueError(f"OpsGenie URL host {host!r} not in allowed hosts")
                 req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
                 try:
                     urllib.request.urlopen(req, timeout=timeout)
@@ -593,8 +593,8 @@ class OpsGenieAlerter(BaseAlerter):
 
             def _create() -> None:
                 host = urllib.parse.urlparse(url).hostname or ""
-                if host != api_host:
-                    raise ValueError(f"OpsGenie URL host {host!r} does not match expected {api_host!r}")
+                if host not in allowed:
+                    raise ValueError(f"OpsGenie URL host {host!r} not in allowed hosts")
                 req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
                 try:
                     urllib.request.urlopen(req, timeout=timeout)

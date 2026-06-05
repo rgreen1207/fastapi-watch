@@ -387,3 +387,99 @@ def test_tag_filter_normal_use_unaffected():
     from fastapi_watch.registry import _parse_tag_filter
     result = _parse_tag_filter("api,db,cache")
     assert result == frozenset({"api", "db", "cache"})
+
+
+# ---------------------------------------------------------------------------
+# WebhookAlerter repr redacts URL
+# ---------------------------------------------------------------------------
+
+def test_webhook_alerter_repr_redacts_url():
+    a = WebhookAlerter(url="https://hooks.example.com/secret-path/token123")
+    r = repr(a)
+    assert "secret-path" not in r
+    assert "token123" not in r
+    assert "<redacted>" in r
+
+
+# ---------------------------------------------------------------------------
+# RabbitMQProbe repr redacts password
+# ---------------------------------------------------------------------------
+
+def test_rabbitmq_probe_repr_redacts_password():
+    from fastapi_watch.probes.rabbitmq import RabbitMQProbe
+    p = RabbitMQProbe(url="amqp://admin:supersecretpass@rabbitmq.internal/")
+    r = repr(p)
+    assert "supersecretpass" not in r
+    assert "<redacted>" in r
+
+
+def test_rabbitmq_probe_repr_default_credentials_redacted():
+    from fastapi_watch.probes.rabbitmq import RabbitMQProbe
+    p = RabbitMQProbe()
+    r = repr(p)
+    assert "<redacted>" in r
+
+
+# ---------------------------------------------------------------------------
+# RabbitMQ management API error is generic — no raw exception in response
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_rabbitmq_management_api_error_is_generic():
+    """management_api_error detail must not contain raw exception text."""
+    pytest.importorskip("aiohttp")  # skip if aiohttp optional dep not installed
+    from unittest.mock import patch, AsyncMock
+    from fastapi_watch.probes.rabbitmq import RabbitMQProbe
+    import aiohttp
+
+    probe = RabbitMQProbe(
+        url="amqp://admin:hunter2@rabbitmq.internal/",
+        management_url="http://rabbitmq.internal:15672",
+    )
+
+    # Make the aiohttp session raise with a message that includes the password
+    mock_session = MagicMock()
+    mock_session.get.side_effect = RuntimeError(
+        "401 Unauthorized at http://rabbitmq.internal:15672 with password=hunter2"
+    )
+    mock_cm = MagicMock()
+    mock_cm.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+    with patch.object(aiohttp, "ClientSession", return_value=mock_cm):
+        details = {}
+        await probe._enrich_from_management_api(details)
+
+    error_msg = details.get("management_api_error", "")
+    assert "hunter2" not in error_msg
+    assert "password" not in error_msg.lower()
+    assert "RuntimeError" in error_msg
+
+
+# ---------------------------------------------------------------------------
+# Logger format does not embed raw exception string
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_logger_does_not_embed_raw_exception_string():
+    """The format string passed to logger.exception must not include str(exc)."""
+    from fastapi_watch.probes.noop import NoOpProbe
+
+    class SensitiveProbe(NoOpProbe):
+        name = "sensitive"
+        async def check(self):
+            raise RuntimeError("connection_string=postgres://admin:hunter2@db/prod")
+
+    mock_logger = MagicMock(spec=logging.Logger)
+    app = FastAPI()
+    registry = HealthRegistry(app, logger=mock_logger)
+    registry.add(SensitiveProbe(name="sensitive"))
+    await registry.run_all()
+
+    mock_logger.exception.assert_called_once()
+    # The format string args must NOT include the raw exception message
+    call_args = mock_logger.exception.call_args
+    format_args = call_args[0]  # positional args to exception()
+    combined = " ".join(str(a) for a in format_args)
+    assert "hunter2" not in combined
+    assert "connection_string" not in combined
