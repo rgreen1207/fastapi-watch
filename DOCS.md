@@ -42,6 +42,8 @@ This file contains the complete reference for fastapi-watch. For the condensed o
   - [Celery workers](#celery-workers)
   - [SQLAlchemy](#sqlalchemy)
   - [All built-in probes (summary table)](#all-built-in-probes-summary-table)
+- [Alerters](#alerters)
+- [Probe introspection](#probe-introspection)
 - [Configuration reference](#configuration-reference)
 - [Security](#security)
 - [Kubernetes integration](#kubernetes-integration)
@@ -508,6 +510,7 @@ Every response from `/health/ready`, `/health/status`, and the SSE streams share
 | `checked_at` | `string \| null` | UTC ISO 8601 timestamp of the last probe run |
 | `timezone` | `string \| null` | IANA timezone name |
 | `probes` | `array` | Individual probe results |
+| `failing` | `string[]` | Names of critical probes whose status is `"unhealthy"`. Empty array when nothing is failing. Not affected by DEGRADED — only UNHEALTHY probes appear here. |
 
 **Probe result:**
 
@@ -820,6 +823,16 @@ curl http://localhost:8000/health/status?tag=api,payments  # api OR payments pro
 curl http://localhost:8000/health/status?tag=infrastructure  # only infra probes
 ```
 
+**Probe name filtering** — filter by exact probe name with `?probe=` (comma-separated). Both `?tag=` and `?probe=` can be combined (AND logic — a result must match both):
+
+```bash
+curl http://localhost:8000/health/status?probe=postgresql,redis   # only these two probes
+curl http://localhost:8000/health/ready?probe=checkout            # single probe readiness
+curl http://localhost:8000/health/status?tag=payments&probe=checkout  # must match both
+```
+
+Works on `/health/ready`, `/health/status`, `/health/ready/stream`, and `/health/status/stream`.
+
 **Dynamic route refresh:**
 
 ```python
@@ -1082,7 +1095,7 @@ smtp_probe = SMTPProbe(name="sendgrid", max_error_rate=0.05)
 @smtp_probe.watch
 async def send_welcome_email(to: str) -> None:
     async with aiosmtplib.SMTP("smtp.sendgrid.net", port=587) as smtp:
-        await smtp.login("apikey", os.environ["SENDGRID_API_KEY"])
+        await smtp.login("apikey", SENDGRID_API_KEY)
         await smtp.sendmail(FROM, to, message.as_string())
 
 registry.add(smtp_probe)
@@ -1368,6 +1381,127 @@ registry.add(db_probe)
 
 ---
 
+## Alerters
+
+Alerters fire on every probe state change. Register one or more at startup:
+
+```python
+from fastapi_watch.alerts import SlackAlerter, PagerDutyAlerter, OpsGenieAlerter
+
+registry = HealthRegistry(
+    app,
+    alerters=[
+        SlackAlerter(webhook_url="https://hooks.slack.com/services/..."),
+        PagerDutyAlerter(routing_key="your-routing-key"),
+        OpsGenieAlerter(api_key="your-api-key"),
+    ],
+)
+```
+
+Alerters are called concurrently from a background worker queue. A failed alerter never blocks health checks or silences other alerters.
+
+### `SlackAlerter`
+
+Posts a formatted message to a Slack Incoming Webhook.
+
+```python
+SlackAlerter(
+    webhook_url="https://hooks.slack.com/services/...",
+    channel="#ops-alerts",   # optional channel override
+    username="fastapi-watch", # bot display name
+    timeout=5.0,
+)
+```
+
+### `PagerDutyAlerter`
+
+Triggers a PagerDuty incident on UNHEALTHY (severity `error`), warning on DEGRADED (severity `warning`), and resolves on HEALTHY. Uses `dedup_key = fastapi-watch:<probe-name>` to prevent duplicate incidents.
+
+```python
+PagerDutyAlerter(routing_key="your-32-char-routing-key", source="fastapi-watch")
+```
+
+### `OpsGenieAlerter`
+
+Creates an OpsGenie alert on UNHEALTHY (P1) or DEGRADED (P3) and closes it on HEALTHY. Uses `alias = fastapi-watch:<probe-name>` for deduplication. Supports US and EU API regions.
+
+```python
+OpsGenieAlerter(api_key="your-api-key")                  # US region (default)
+OpsGenieAlerter(api_key="your-api-key", region="eu")     # EU region
+```
+
+### `TeamsAlerter`
+
+Posts an Adaptive Card to a Microsoft Teams Incoming Webhook.
+
+```python
+TeamsAlerter(webhook_url="https://outlook.office.com/webhook/...")
+```
+
+### `WebhookAlerter`
+
+POSTs a JSON payload to any HTTP(S) endpoint.
+
+```python
+WebhookAlerter(
+    url="https://my-service.example.com/hooks/health",
+    headers={"Authorization": "Bearer my-secret-token"},
+    timeout=5.0,
+)
+```
+
+Payload: `{"probe", "old_status", "new_status", "timestamp"}`.
+
+### Custom alerters
+
+```python
+from fastapi_watch.alerts import BaseAlerter
+from fastapi_watch.models import AlertRecord
+
+class SMSAlerter(BaseAlerter):
+    async def notify(self, alert: AlertRecord) -> None:
+        message = f"{alert.probe}: {alert.old_status.value} → {alert.new_status.value}"
+        # send via your SMS provider
+```
+
+---
+
+## Probe introspection
+
+`GET /health/probes` lists all registered probes and their configuration **without running any checks**. Useful for verifying what the registry is monitoring and its per-probe settings.
+
+```bash
+curl http://localhost:8000/health/probes
+```
+
+```json
+{
+  "probes": [
+    {
+      "name": "postgresql",
+      "critical": true,
+      "tags": ["database"],
+      "description": "GET /users/{id}",
+      "poll_interval_ms": 30000,
+      "circuit_breaker_enabled": true
+    }
+  ]
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `name` | Probe identifier |
+| `critical` | Whether the probe affects overall readiness status |
+| `tags` | Tags assigned to this probe |
+| `description` | Human-readable subtitle (may be `null`) |
+| `poll_interval_ms` | Per-probe poll override; `null` means the probe inherits the registry default |
+| `circuit_breaker_enabled` | Whether this probe participates in circuit breaker logic |
+
+The endpoint is subject to the same `auth` as all other health endpoints.
+
+---
+
 ## Configuration reference
 
 ### `HealthRegistry`
@@ -1409,6 +1543,7 @@ registry.add(db_probe)
 | `set_started()` | Signal startup complete — unblocks `/health/startup`. |
 | `set_maintenance(until=None)` | Activate maintenance mode. Returns `self`. |
 | `clear_maintenance()` | Deactivate maintenance mode. Returns `self`. |
+| `reset_circuit(probe_name)` | Manually reset a probe's open circuit and failure count. Does not clear the lifetime trips counter. Returns `self`. |
 | `run_all()` | Async — run all probes concurrently, return `list[ProbeResult]`. |
 | `get_report()` | Async — run probes and return a `HealthReport`. Intended for use with `serve_routes=False`. |
 
@@ -1452,8 +1587,10 @@ registry = HealthRegistry(app, auth={"username": "ops", "password": "secret"})
 registry = HealthRegistry(app, auth={"token": "my-secret-token"})
 
 # Custom callable — must return exactly True to grant access
+HEALTH_KEY = "load-from-your-secrets-manager"
+
 def my_auth(request: Request) -> bool:
-    return request.headers.get("X-Internal-Key") == os.environ["HEALTH_KEY"]
+    return request.headers.get("X-Internal-Key") == HEALTH_KEY
 
 registry = HealthRegistry(app, auth=my_auth)
 ```
@@ -1462,9 +1599,15 @@ The auth callable **must return exactly `True`** (the boolean). Returning `None`
 
 Comparison of static credentials uses `secrets.compare_digest` to prevent timing attacks.
 
+### Response fields and information disclosure
+
+Health responses include probe names in `probes[*].name` and, when probes are failing, in the top-level `failing` array. This means an unauthenticated caller of `/health/ready` on a 503 response can read the names of currently-failing critical infrastructure components (e.g., `"postgres-primary"`, `"redis-session"`). This is intentional — the names are also present in the `probes` array — but it makes enumeration more direct.
+
+If your infrastructure naming is sensitive, configure `auth` so health endpoints are not publicly accessible.
+
 ### Webhook alerters and SSRF
 
-`WebhookAlerter`, `SlackAlerter`, and `TeamsAlerter` validate the webhook URL at construction time. URLs targeting private/loopback/link-local IP ranges are rejected with a `ValueError`:
+`WebhookAlerter`, `SlackAlerter`, and `TeamsAlerter` validate the webhook URL at construction time. URLs targeting private/loopback/link-local IP ranges are rejected with a `ValueError`. `PagerDutyAlerter` and `OpsGenieAlerter` use hardcoded API endpoints and are not affected by URL validation.
 
 ```python
 # Raises ValueError — private IP rejected at startup
@@ -1491,8 +1634,10 @@ If you need full control over authentication, path, or response shape, pass `ser
 ```python
 from fastapi import Depends, HTTPException, Header
 
+HEALTH_KEY = "load-from-your-secrets-manager"
+
 async def my_auth(x_api_key: str = Header(...)):
-    if x_api_key != os.environ["HEALTH_KEY"]:
+    if x_api_key != HEALTH_KEY:
         raise HTTPException(status_code=401)
 
 registry = HealthRegistry(app, serve_routes=False)
