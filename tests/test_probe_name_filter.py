@@ -99,3 +99,34 @@ def test_stream_probe_filter_single_fetch():
     payload = json.loads(data_lines[0][len("data:"):].strip())
     names = {p["name"] for p in payload["probes"]}
     assert names == {"svc-a"}
+
+
+def test_ready_stream_probe_filter_single_fetch():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry.add(NoOpProbe(name="svc-a"))
+    registry.add(NoOpProbe(name="svc-b"))
+    client = TestClient(app)
+
+    resp = client.get("/health/ready/stream?probe=svc-a")
+    assert resp.status_code == 200
+    data_lines = [l for l in resp.text.splitlines() if l.startswith("data:")]
+    assert len(data_lines) == 1
+    payload = json.loads(data_lines[0][len("data:"):].strip())
+    names = {p["name"] for p in payload["probes"]}
+    assert names == {"svc-a"}
+    assert "svc-b" not in names
+
+
+def test_probe_filter_excludes_when_tag_does_not_match():
+    """?probe=X&tag=Y with X not having tag Y → empty result (AND logic)."""
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    probe_a = NoOpProbe(name="svc-a")
+    probe_a.tags = ["http"]
+    registry.add(probe_a)
+    client = TestClient(app)
+
+    resp = client.get("/health/status?probe=svc-a&tag=database")
+    assert resp.status_code == 200
+    assert resp.json()["probes"] == []

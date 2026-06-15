@@ -121,3 +121,21 @@ def test_probes_endpoint_circuit_breaker_enabled_field():
     resp = client.get("/health/probes")
     p = resp.json()["probes"][0]
     assert p["circuit_breaker_enabled"] is False
+
+
+def test_probes_endpoint_requires_auth_when_configured():
+    app = FastAPI()
+    HealthRegistry(app, poll_interval_ms=None, auth={"type": "apikey", "key": "secret"})
+    client = TestClient(app)
+
+    # No credentials → 403
+    resp = client.get("/health/probes")
+    assert resp.status_code == 403
+
+    # Wrong credentials → 403
+    resp = client.get("/health/probes", headers={"X-API-Key": "wrong"})
+    assert resp.status_code == 403
+
+    # Correct credentials → 200
+    resp = client.get("/health/probes", headers={"X-API-Key": "secret"})
+    assert resp.status_code == 200

@@ -1191,6 +1191,39 @@ def test_reset_circuit_no_op_when_probe_not_tripped():
     assert result is registry
 
 
+@pytest.mark.asyncio
+async def test_reset_circuit_allows_probe_to_run_again():
+    """After reset_circuit, a previously suspended probe executes on next run_all."""
+    run_count = 0
+
+    class CountingProbe(NoOpProbe):
+        async def check(self):
+            nonlocal run_count
+            run_count += 1
+            return await super().check()
+
+    app = FastAPI()
+    registry = HealthRegistry(app, circuit_breaker_threshold=3)
+    probe = CountingProbe(name="db")
+    registry.add(probe)
+
+    # Open the circuit manually
+    loop = asyncio.get_running_loop()
+    registry._circuit_open_until["db"] = loop.time() + 600.0
+    registry._circuit_err_count["db"] = 3
+
+    # Probe is suspended — run_all should not call check()
+    await registry.run_all()
+    assert run_count == 0
+
+    # Reset the circuit
+    registry.reset_circuit("db")
+
+    # Now run_all should actually execute the probe
+    await registry.run_all()
+    assert run_count == 1
+
+
 # ---------------------------------------------------------------------------
 # Webhook on state change
 # ---------------------------------------------------------------------------

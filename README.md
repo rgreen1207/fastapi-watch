@@ -87,6 +87,7 @@ Every route is now monitored with real-traffic data. Health endpoints are live a
 | `GET /health/maintenance` | Maintenance mode status | `200` |
 | `POST /health/maintenance` | Enable maintenance mode | `200` |
 | `DELETE /health/maintenance` | Disable maintenance mode | `200` |
+| `GET /health/probes` | Registered probe config (no probe runs) | `200` |
 
 The prefix defaults to `/health` and is configurable: `HealthRegistry(app, prefix="/ops/health")`.
 
@@ -176,6 +177,13 @@ GET /health/status?tag=users,orders    # users OR orders probes
 GET /health/status/stream?tag=payments # filtered live stream
 ```
 
+Filter by exact probe name with `?probe=` (comma-separated, AND'd with `?tag=` when both are given):
+
+```bash
+GET /health/status?probe=postgresql,redis   # only these two probes
+GET /health/status?tag=payments&probe=checkout  # must match both
+```
+
 The dashboard shows tag chips on each probe card and a clickable filter bar to isolate groups at a glance.
 
 ---
@@ -219,6 +227,12 @@ Health endpoints are **publicly accessible by default** — set `auth` in produc
 
 ```python
 registry = HealthRegistry(app, auth={"username": "ops", "password": "secret"})
+```
+
+To manually reset a circuit breaker (e.g. after you've fixed the underlying issue and don't want to wait for the cooldown):
+
+```python
+registry.reset_circuit("postgresql")  # clears open state and failure count; returns self
 ```
 
 To skip all route registration entirely and expose health status on your own endpoint with custom auth:
