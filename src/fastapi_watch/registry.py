@@ -573,7 +573,11 @@ class HealthRegistry:
         _ws_kwargs = ws_probe_kwargs or {}
 
         router_routes = getattr(router, "routes", [])
-        router_endpoints = {r.endpoint for r in router_routes}
+        # Use getattr so _IncludedRouter wrappers (which lack .endpoint) are skipped.
+        router_endpoints = {
+            ep for r in router_routes
+            if (ep := getattr(r, "endpoint", None)) is not None
+        }
 
         probe_group: ProbeGroup | None = None
         if group:
@@ -583,6 +587,8 @@ class HealthRegistry:
             if not isinstance(route, APIRoute) and not (
                 APIWebSocketRoute is not None and isinstance(route, APIWebSocketRoute)
             ):
+                continue
+            if not hasattr(route, "path"):
                 continue
             if getattr(route, "endpoint", None) not in router_endpoints:
                 continue
