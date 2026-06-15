@@ -53,8 +53,9 @@ def _iter_app_routes(routes, prefix: str = ""):
                 break
 
         if sub is None:
-            # Try .router.* or .app.* (common Starlette/FastAPI patterns)
-            for container_attr in ("router", "_router", "app", "_app"):
+            # Try known container attributes (covers _IncludedRouter.original_router in
+            # newer FastAPI as well as .router.* and .app.* in other versions).
+            for container_attr in ("original_router", "router", "_router", "app", "_app"):
                 container = getattr(item, container_attr, None)
                 if container is not None:
                     for sub_attr in ("routes", "_routes"):
