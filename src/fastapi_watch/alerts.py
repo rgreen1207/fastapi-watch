@@ -524,6 +524,8 @@ class OpsGenieAlerter(BaseAlerter):
             raise ValueError(f"region must be 'us' or 'eu', got {region!r}")
         self.api_key = api_key
         self._base_url = self._BASE_URL[region]
+        # Store only the hostname (no scheme) so comparisons are unambiguous.
+        self._api_host: str = urllib.parse.urlparse(self._base_url).hostname or ""
         self.source = source
         self.timeout = timeout
 
@@ -537,7 +539,7 @@ class OpsGenieAlerter(BaseAlerter):
         return {"Authorization": f"GenieKey {self.api_key}", "Content-Type": "application/json"}
 
     def _assert_safe_url(self, url: str) -> None:
-        """Guard: raise if the URL host is not in the OpsGenie allowlist."""
+        """Guard: raise if the URL host does not match the configured OpsGenie host."""
         host = urllib.parse.urlparse(url).hostname or ""
         if host not in self._ALLOWED_HOSTS:
             raise ValueError(f"OpsGenie URL host {host!r} not in allowed hosts")
@@ -545,7 +547,7 @@ class OpsGenieAlerter(BaseAlerter):
     async def notify(self, alert: AlertRecord) -> None:
         alias = self._alias(alert.probe)
         headers = self._auth_headers()
-        allowed = self._ALLOWED_HOSTS
+        api_host = self._api_host
         base_url = self._base_url
         timeout = self.timeout
 
@@ -555,8 +557,8 @@ class OpsGenieAlerter(BaseAlerter):
 
             def _close() -> None:
                 host = urllib.parse.urlparse(url).hostname or ""
-                if host not in allowed:
-                    raise ValueError(f"OpsGenie URL host {host!r} not in allowed hosts")
+                if host != api_host:
+                    raise ValueError(f"OpsGenie URL host {host!r} does not match expected {api_host!r}")
                 req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
                 try:
                     urllib.request.urlopen(req, timeout=timeout)
@@ -591,8 +593,8 @@ class OpsGenieAlerter(BaseAlerter):
 
             def _create() -> None:
                 host = urllib.parse.urlparse(url).hostname or ""
-                if host not in allowed:
-                    raise ValueError(f"OpsGenie URL host {host!r} not in allowed hosts")
+                if host != api_host:
+                    raise ValueError(f"OpsGenie URL host {host!r} does not match expected {api_host!r}")
                 req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
                 try:
                     urllib.request.urlopen(req, timeout=timeout)
