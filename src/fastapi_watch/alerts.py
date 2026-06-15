@@ -545,15 +545,18 @@ class OpsGenieAlerter(BaseAlerter):
     async def notify(self, alert: AlertRecord) -> None:
         alias = self._alias(alert.probe)
         headers = self._auth_headers()
+        allowed = self._ALLOWED_HOSTS
         base_url = self._base_url
         timeout = self.timeout
 
         if alert.new_status == ProbeStatus.HEALTHY:
             url = f"{base_url}/v2/alerts/{urllib.parse.quote(alias, safe='')}/close?identifierType=alias"
-            self._assert_safe_url(url)
             payload = json.dumps({}).encode()
 
             def _close() -> None:
+                host = urllib.parse.urlparse(url).hostname or ""
+                if host not in allowed:
+                    raise ValueError(f"OpsGenie URL host {host!r} not in allowed hosts")
                 req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
                 try:
                     urllib.request.urlopen(req, timeout=timeout)
@@ -570,7 +573,6 @@ class OpsGenieAlerter(BaseAlerter):
         else:
             priority = self._PRIORITY.get(alert.new_status, "P1")
             url = f"{base_url}/v2/alerts"
-            self._assert_safe_url(url)
             payload = json.dumps({
                 "message": f"{alert.probe}: {alert.old_status.value} → {alert.new_status.value}",
                 "alias": alias,
@@ -588,6 +590,9 @@ class OpsGenieAlerter(BaseAlerter):
             }).encode()
 
             def _create() -> None:
+                host = urllib.parse.urlparse(url).hostname or ""
+                if host not in allowed:
+                    raise ValueError(f"OpsGenie URL host {host!r} not in allowed hosts")
                 req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
                 try:
                     urllib.request.urlopen(req, timeout=timeout)
