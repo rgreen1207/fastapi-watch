@@ -659,6 +659,10 @@ class HealthRegistry:
                 wrapped._fastapi_watch = "router"
                 wrapped._fastapi_watch_probe = probe
                 route.dependant.call = wrapped
+                # Also patch route.endpoint so that if FastAPI re-derives dependant
+                # from endpoint (as _IncludedRouter wrappers may do in newer versions),
+                # the wrapped function is used instead of the original.
+                route.endpoint = wrapped
             except AttributeError:
                 return False
 
