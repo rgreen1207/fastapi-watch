@@ -605,28 +605,29 @@ class HealthRegistry:
         if group:
             probe_group = ProbeGroup(tags=_tags or None)
 
-        for route in _iter_app_routes(self.app.routes):
+        def _process_route(route: "APIRoute") -> bool:
+            """Wrap one route with a probe. Returns True if a probe was added."""
             if not isinstance(route, APIRoute) and not (
                 APIWebSocketRoute is not None and isinstance(route, APIWebSocketRoute)
             ):
-                continue
+                return False
             if not hasattr(route, "path"):
-                continue
+                return False
             if getattr(route, "endpoint", None) not in router_endpoints:
-                continue
+                return False
             if included and not any(fnmatch.fnmatch(route.path, p) for p in included):
-                continue
+                return False
             if any(fnmatch.fnmatch(route.path, p) for p in excluded):
-                continue
+                return False
             if _include_methods is not None and isinstance(route, APIRoute):
                 route_methods = set(getattr(route, "methods", None) or set())
                 if not route_methods & _include_methods:
-                    continue
+                    return False
 
             current = getattr(route.dependant, "call", None)
             fw = getattr(current, "_fastapi_watch", None)
             if fw in ("manual", "router"):
-                continue
+                return False
 
             if fw == "discover":
                 old = getattr(current, "_fastapi_watch_probe", None)
@@ -659,12 +660,31 @@ class HealthRegistry:
                 wrapped._fastapi_watch_probe = probe
                 route.dependant.call = wrapped
             except AttributeError:
-                continue
+                return False
 
             if probe_group is not None:
                 probe_group.add(probe, critical=critical)
             else:
                 self.add(probe, critical=critical)
+            return True
+
+        # Primary pass: find routes via app.routes (works when FastAPI flattens routes).
+        processed_endpoints: set = set()
+        for route in _iter_app_routes(self.app.routes):
+            ep = getattr(route, "endpoint", None)
+            if ep in router_endpoints and _process_route(route):
+                processed_endpoints.add(ep)
+
+        # Fallback pass: newer FastAPI may store routes in _IncludedRouter wrappers
+        # that _iter_app_routes cannot descend into. In that case, the route objects
+        # inside router.routes are the same objects used for serving (not copies), so
+        # wrapping them directly has the same effect.
+        unprocessed = router_endpoints - processed_endpoints
+        if unprocessed:
+            for route in router_routes:
+                if getattr(route, "endpoint", None) in unprocessed:
+                    if _process_route(route):
+                        unprocessed.discard(route.endpoint)
 
         if probe_group is not None:
             self.include(probe_group)
