@@ -1262,3 +1262,35 @@ def test_dashboard_search_uses_data_name_attribute():
     )
     html = render_dashboard(report, stream_url="/health/status/stream", maintenance_banner=False)
     assert 'data-name="payments-api"' in html
+
+
+def test_zzz_debug_app_routes_structure():
+    """Temporary debug test — will be removed after investigation."""
+    from fastapi import FastAPI, APIRouter
+    router = APIRouter()
+
+    @router.get("/products")
+    def list_products(): return []
+
+    app = FastAPI()
+    app.include_router(router, prefix="/api")
+
+    info = []
+    for item in app.routes:
+        item_info = {
+            "type": type(item).__name__,
+            "mro": [c.__name__ for c in type(item).__mro__],
+            "has_path": hasattr(item, "path"),
+            "has_routes": hasattr(item, "routes"),
+            "has_router": hasattr(item, "router"),
+            "has_app": hasattr(item, "app"),
+            "public_attrs": [a for a in dir(item) if not a.startswith("__")],
+        }
+        if hasattr(item, "routes"):
+            item_info["routes_content"] = [type(r).__name__ for r in item.routes]
+        if hasattr(item, "router"):
+            item_info["router_type"] = type(item.router).__name__
+        info.append(item_info)
+
+    import json
+    raise AssertionError(f"DEBUG app.routes: {json.dumps(info, indent=2, default=str)}")
