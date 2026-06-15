@@ -1,5 +1,34 @@
 # Release Notes
 
+## v1.7.0
+
+**Probe introspection, failing field, OpsGenie alerter, and security hardening.**
+
+### New Features
+
+#### `GET /health/probes` — probe introspection
+- New endpoint lists all registered probes and their configuration without running any checks: `name`, `critical`, `tags`, `description`, `poll_interval_ms`, `circuit_breaker_enabled`. Useful for verifying what the registry is monitoring and its per-probe settings. Subject to the same `auth` as all other health endpoints.
+
+#### `HealthRegistry.reset_circuit(probe_name)` — manual circuit breaker reset
+- New public method clears a probe's open circuit state and consecutive failure count immediately, without waiting for the cooldown to expire. Does not reset the lifetime trips counter (observability). Returns `self` for chaining.
+
+#### `?probe=` name filter on health endpoints
+- `/health/ready`, `/health/status`, `/health/ready/stream`, and `/health/status/stream` now accept `?probe=name1,name2` to filter results by exact probe name. Works alongside `?tag=` with AND logic — a result must match both filters when both are supplied.
+
+#### `failing` field in `HealthReport`
+- Every health report now includes `failing: list[str]` — the names of critical probes whose status is `UNHEALTHY`. Always present (empty list when nothing is failing). Propagates to all endpoints and SSE streams automatically. Makes the failing probe names immediately readable at the top level of a 503 response without parsing the full `probes` array.
+
+#### `OpsGenieAlerter`
+- New alerter for OpsGenie Alerts API v2. Triggers P1 on UNHEALTHY, P3 on DEGRADED, closes on HEALTHY. Uses `fastapi-watch:<probe-name>` as a stable dedup alias. Supports `region="us"` (default) and `region="eu"`. Outbound URLs are validated against an explicit hostname allowlist before each request.
+
+### Security Fixes
+
+- **`WebhookAlerter.__repr__`** now returns `url='<redacted>'`, consistent with `SlackAlerter` and `TeamsAlerter`. Previously the full webhook URL (which may contain tokens) was exposed.
+- **`RabbitMQProbe.__repr__`** now redacts the password from the AMQP URL. Management API exceptions now use `type(exc).__name__` only — raw exception text (which may contain credentials) no longer appears in `/health/status` response bodies.
+- **Registry probe exception logger** no longer embeds `str(exc)` in the log format string. Full exception details are still available via `logger.exception()` traceback, but the format string itself no longer risks surfacing credentials from database driver error messages.
+
+---
+
 ## v1.6.1
 
 **Bug fix: alert worker hang under Python 3.11.**
