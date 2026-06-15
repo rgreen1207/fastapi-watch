@@ -52,7 +52,7 @@ async def test_closes_alert_on_healthy():
         await alerter.notify(_alert(ProbeStatus.UNHEALTHY, ProbeStatus.HEALTHY))
         mock_urlopen.assert_called_once()
         req = mock_urlopen.call_args[0][0]
-        assert "fastapi-watch:redis/close" in req.full_url
+        assert "fastapi-watch%3Aredis/close" in req.full_url
         assert "identifierType=alias" in req.full_url
 
 

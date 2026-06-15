@@ -542,7 +542,7 @@ class OpsGenieAlerter(BaseAlerter):
         timeout = self.timeout
 
         if alert.new_status == ProbeStatus.HEALTHY:
-            url = f"{base_url}/v2/alerts/{alias}/close?identifierType=alias"
+            url = f"{base_url}/v2/alerts/{urllib.parse.quote(alias, safe='')}/close?identifierType=alias"
             payload = json.dumps({}).encode()
 
             def _close() -> None:
