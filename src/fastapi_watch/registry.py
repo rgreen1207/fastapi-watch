@@ -34,20 +34,38 @@ def _iter_app_routes(routes, prefix: str = ""):
     """Yield concrete route objects from app.routes, recursing into router containers.
 
     Newer FastAPI versions may store _IncludedRouter wrapper objects in app.routes
-    rather than flat APIRoute objects. Those wrappers have a .routes sub-list and
-    an optional .prefix. This function descends into them so both old and new FastAPI
-    layouts are handled transparently.
+    rather than flat APIRoute objects. This function descends into them using several
+    heuristics so both the flat layout (old FastAPI) and the nested layout (new FastAPI)
+    are handled transparently.
     """
     for item in routes:
         if hasattr(item, "path"):
             yield item
-        else:
-            item_prefix = prefix + getattr(item, "prefix", "")
-            sub = getattr(item, "routes", None) or getattr(
-                getattr(item, "router", None), "routes", None
-            )
+            continue
+
+        item_prefix = prefix + getattr(item, "prefix", "")
+
+        # Try all known container attributes to find sub-routes.
+        sub = None
+        for attr in ("routes", "_routes"):
+            sub = getattr(item, attr, None)
             if sub:
-                yield from _iter_app_routes(sub, item_prefix)
+                break
+
+        if sub is None:
+            # Try .router.* or .app.* (common Starlette/FastAPI patterns)
+            for container_attr in ("router", "_router", "app", "_app"):
+                container = getattr(item, container_attr, None)
+                if container is not None:
+                    for sub_attr in ("routes", "_routes"):
+                        sub = getattr(container, sub_attr, None)
+                        if sub:
+                            break
+                if sub:
+                    break
+
+        if sub:
+            yield from _iter_app_routes(sub, item_prefix)
 
 
 def _route_description(route, APIWebSocketRoute) -> str:
