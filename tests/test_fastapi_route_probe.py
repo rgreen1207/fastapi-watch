@@ -459,7 +459,7 @@ def test_decorated_route_records_http_exception_status_code():
     client.get("/items/0")  # 404
 
     import asyncio
-    result = asyncio.get_event_loop().run_until_complete(probe.check())
+    result = asyncio.run(probe.check())
     assert result.details["last_status_code"] == 404
     assert result.details["error_count"] == 1
 
