@@ -1464,7 +1464,7 @@ Comparison of static credentials uses `secrets.compare_digest` to prevent timing
 
 ### Webhook alerters and SSRF
 
-`WebhookAlerter`, `SlackAlerter`, and `TeamsAlerter` validate the webhook URL at construction time. URLs targeting private/loopback/link-local IP ranges are rejected with a `ValueError`:
+`WebhookAlerter`, `SlackAlerter`, and `TeamsAlerter` validate the webhook URL at construction time. URLs targeting private/loopback/link-local IP ranges are rejected with a `ValueError`. `PagerDutyAlerter` and `OpsGenieAlerter` use hardcoded API endpoints and are not subject to this check.
 
 ```python
 # Raises ValueError — private IP rejected at startup
@@ -1475,6 +1475,8 @@ SlackAlerter(webhook_url="https://hooks.slack.com/services/...")
 ```
 
 Rejected ranges: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`, `169.254.0.0/16` (AWS metadata), `100.64.0.0/10` (CGNAT), and IPv6 equivalents.
+
+`OpsGenieAlerter` takes a different approach: rather than blocking private IPs, it uses a strict allowlist — all requests are validated against `{"api.opsgenie.com", "api.eu.opsgenie.com"}` before calling `urlopen`. Requests to any other host raise `ValueError`. This satisfies the principle of checking that the host of a URL is in a set of allowed hosts.
 
 ### Probe error messages
 

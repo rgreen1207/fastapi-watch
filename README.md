@@ -210,7 +210,7 @@ registry = HealthRegistry(
 )
 ```
 
-Webhook URLs are validated at construction time — private/loopback/link-local IP targets are rejected to prevent SSRF.
+Webhook-based alerters (`SlackAlerter`, `TeamsAlerter`, `WebhookAlerter`) validate the URL at construction time — private/loopback/link-local IP targets are rejected. `OpsGenieAlerter` and `PagerDutyAlerter` use hardcoded API endpoints; `OpsGenieAlerter` additionally validates every request against an explicit host allowlist.
 
 ---
 
