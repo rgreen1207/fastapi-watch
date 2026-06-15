@@ -1,4 +1,4 @@
-from .alerts import BaseAlerter, WebhookAlerter, SlackAlerter, TeamsAlerter, PagerDutyAlerter
+from .alerts import BaseAlerter, WebhookAlerter, SlackAlerter, TeamsAlerter, PagerDutyAlerter, OpsGenieAlerter
 from .registry import HealthRegistry
 from .probe_group import ProbeGroup
 from .probes.base import BaseProbe, PassiveProbe
@@ -19,6 +19,7 @@ __all__ = [
     "SlackAlerter",
     "TeamsAlerter",
     "PagerDutyAlerter",
+    "OpsGenieAlerter",
     "BaseProbe",
     "PassiveProbe",
     "HealthRegistry",

@@ -198,13 +198,14 @@ Passive probes observe real calls — use `@probe.watch` on any function to trac
 ## Alerting
 
 ```python
-from fastapi_watch.alerts import SlackAlerter, PagerDutyAlerter
+from fastapi_watch.alerts import SlackAlerter, PagerDutyAlerter, OpsGenieAlerter
 
 registry = HealthRegistry(
     app,
     alerters=[
         SlackAlerter(webhook_url="https://hooks.slack.com/..."),
         PagerDutyAlerter(routing_key="your-routing-key"),
+        OpsGenieAlerter(api_key="your-api-key"),
     ],
 )
 ```
