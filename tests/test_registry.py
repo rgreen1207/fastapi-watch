@@ -1143,6 +1143,55 @@ async def test_circuit_per_probe_threshold_override():
 
 
 # ---------------------------------------------------------------------------
+# reset_circuit
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reset_circuit_clears_open_state():
+    app = FastAPI()
+    registry = HealthRegistry(app, circuit_breaker_threshold=3, circuit_breaker_cooldown_ms=60_000)
+    probe = NoOpProbe(name="db")
+    registry.add(probe)
+
+    import asyncio
+    loop = asyncio.get_running_loop()
+    registry._circuit_open_until["db"] = loop.time() + 600.0
+    registry._circuit_err_count["db"] = 3
+
+    result = registry.reset_circuit("db")
+
+    assert "db" not in registry._circuit_open_until
+    assert "db" not in registry._circuit_err_count
+    assert result is registry
+
+
+@pytest.mark.asyncio
+async def test_reset_circuit_preserves_trips_total():
+    app = FastAPI()
+    registry = HealthRegistry(app, circuit_breaker_threshold=3, circuit_breaker_cooldown_ms=60_000)
+    probe = NoOpProbe(name="db")
+    registry.add(probe)
+
+    import asyncio
+    loop = asyncio.get_running_loop()
+    registry._circuit_open_until["db"] = loop.time() + 600.0
+    registry._circuit_err_count["db"] = 3
+    registry._circuit_trips["db"] = 5
+
+    registry.reset_circuit("db")
+
+    assert registry._circuit_trips.get("db") == 5
+
+
+def test_reset_circuit_no_op_when_probe_not_tripped():
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    result = registry.reset_circuit("nonexistent")
+    assert result is registry
+
+
+# ---------------------------------------------------------------------------
 # Webhook on state change
 # ---------------------------------------------------------------------------
 
