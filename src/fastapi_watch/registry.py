@@ -30,6 +30,26 @@ _MIN_POLL_INTERVAL_MS = 1000
 _AUTO_HTTP_METHODS = frozenset({"HEAD", "OPTIONS"})
 
 
+def _iter_app_routes(routes, prefix: str = ""):
+    """Yield concrete route objects from app.routes, recursing into router containers.
+
+    Newer FastAPI versions may store _IncludedRouter wrapper objects in app.routes
+    rather than flat APIRoute objects. Those wrappers have a .routes sub-list and
+    an optional .prefix. This function descends into them so both old and new FastAPI
+    layouts are handled transparently.
+    """
+    for item in routes:
+        if hasattr(item, "path"):
+            yield item
+        else:
+            item_prefix = prefix + getattr(item, "prefix", "")
+            sub = getattr(item, "routes", None) or getattr(
+                getattr(item, "router", None), "routes", None
+            )
+            if sub:
+                yield from _iter_app_routes(sub, item_prefix)
+
+
 def _route_description(route, APIWebSocketRoute) -> str:
     """Return a human-readable route label: ``'GET /items/{id}'`` or ``'WS /ws/chat'``."""
     if APIWebSocketRoute is not None and isinstance(route, APIWebSocketRoute):
@@ -426,7 +446,7 @@ class HealthRegistry:
         _tags = list(tags) if tags else []
         _ws_kwargs = ws_probe_kwargs or {}
 
-        for route in self.app.routes:
+        for route in _iter_app_routes(self.app.routes):
             if not isinstance(route, APIRoute) and not (
                 APIWebSocketRoute is not None and isinstance(route, APIWebSocketRoute)
             ):
@@ -585,7 +605,7 @@ class HealthRegistry:
         if group:
             probe_group = ProbeGroup(tags=_tags or None)
 
-        for route in self.app.routes:
+        for route in _iter_app_routes(self.app.routes):
             if not isinstance(route, APIRoute) and not (
                 APIWebSocketRoute is not None and isinstance(route, APIWebSocketRoute)
             ):
