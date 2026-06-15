@@ -427,15 +427,17 @@ class HealthRegistry:
         _ws_kwargs = ws_probe_kwargs or {}
 
         for route in self.app.routes:
+            if not isinstance(route, APIRoute) and not (
+                APIWebSocketRoute is not None and isinstance(route, APIWebSocketRoute)
+            ):
+                continue
+            if not hasattr(route, "path"):
+                continue
             if route.path.startswith(self.prefix):
                 continue
             if included and not any(fnmatch.fnmatch(route.path, p) for p in included):
                 continue
             if any(fnmatch.fnmatch(route.path, p) for p in excluded):
-                continue
-            if not isinstance(route, APIRoute) and not (
-                APIWebSocketRoute is not None and isinstance(route, APIWebSocketRoute)
-            ):
                 continue
             if _include_methods is not None and isinstance(route, APIRoute):
                 route_methods = set(getattr(route, "methods", None) or set())
