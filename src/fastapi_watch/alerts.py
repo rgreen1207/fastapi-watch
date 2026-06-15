@@ -547,7 +547,16 @@ class OpsGenieAlerter(BaseAlerter):
 
             def _close() -> None:
                 req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-                urllib.request.urlopen(req, timeout=timeout)
+                try:
+                    urllib.request.urlopen(req, timeout=timeout)
+                except urllib.error.HTTPError as exc:
+                    raise RuntimeError(
+                        f"OpsGenie close-alert returned HTTP {exc.code} for alias {alias!r}"
+                    ) from exc
+                except urllib.error.URLError as exc:
+                    raise RuntimeError(
+                        f"OpsGenie close-alert network error for alias {alias!r}: {exc.reason}"
+                    ) from exc
 
             await asyncio.get_running_loop().run_in_executor(None, _close)
         else:
@@ -571,6 +580,15 @@ class OpsGenieAlerter(BaseAlerter):
 
             def _create() -> None:
                 req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-                urllib.request.urlopen(req, timeout=timeout)
+                try:
+                    urllib.request.urlopen(req, timeout=timeout)
+                except urllib.error.HTTPError as exc:
+                    raise RuntimeError(
+                        f"OpsGenie create-alert returned HTTP {exc.code} for probe {alert.probe!r}"
+                    ) from exc
+                except urllib.error.URLError as exc:
+                    raise RuntimeError(
+                        f"OpsGenie create-alert network error for probe {alert.probe!r}: {exc.reason}"
+                    ) from exc
 
             await asyncio.get_running_loop().run_in_executor(None, _create)

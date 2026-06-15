@@ -126,3 +126,49 @@ async def test_custom_source_label():
         req = mock_urlopen.call_args[0][0]
         body = json.loads(req.data)
         assert body["source"] == "my-app/db"
+
+
+@pytest.mark.asyncio
+async def test_degraded_to_healthy_closes_alert():
+    """DEGRADED→HEALTHY also triggers the close path, not a new create."""
+    with patch("fastapi_watch.alerts.urllib.request.urlopen") as mock_urlopen:
+        mock_urlopen.return_value = MagicMock()
+        alerter = OpsGenieAlerter(api_key="test-key")
+        await alerter.notify(_alert(ProbeStatus.DEGRADED, ProbeStatus.HEALTHY))
+        req = mock_urlopen.call_args[0][0]
+        assert "/close" in req.full_url
+        assert "identifierType=alias" in req.full_url
+
+
+@pytest.mark.asyncio
+async def test_http_error_on_create_raises_runtime_error():
+    """A 4xx/5xx from OpsGenie on create surfaces as RuntimeError (not silent)."""
+    import urllib.error
+    with patch("fastapi_watch.alerts.urllib.request.urlopen") as mock_urlopen:
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            url="https://api.opsgenie.com/v2/alerts",
+            code=401,
+            msg="Unauthorized",
+            hdrs=None,
+            fp=None,
+        )
+        alerter = OpsGenieAlerter(api_key="bad-key")
+        with pytest.raises(RuntimeError, match="HTTP 401"):
+            await alerter.notify(_alert(ProbeStatus.HEALTHY, ProbeStatus.UNHEALTHY))
+
+
+@pytest.mark.asyncio
+async def test_http_error_on_close_raises_runtime_error():
+    """A 4xx/5xx from OpsGenie on close surfaces as RuntimeError (not silent)."""
+    import urllib.error
+    with patch("fastapi_watch.alerts.urllib.request.urlopen") as mock_urlopen:
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            url="https://api.opsgenie.com/v2/alerts/fastapi-watch%3Aredis/close",
+            code=404,
+            msg="Not Found",
+            hdrs=None,
+            fp=None,
+        )
+        alerter = OpsGenieAlerter(api_key="test-key")
+        with pytest.raises(RuntimeError, match="HTTP 404"):
+            await alerter.notify(_alert(ProbeStatus.UNHEALTHY, ProbeStatus.HEALTHY))
