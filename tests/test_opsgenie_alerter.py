@@ -172,3 +172,20 @@ async def test_http_error_on_close_raises_runtime_error():
         alerter = OpsGenieAlerter(api_key="test-key")
         with pytest.raises(RuntimeError, match="HTTP 404"):
             await alerter.notify(_alert(ProbeStatus.UNHEALTHY, ProbeStatus.HEALTHY))
+
+
+def test_assert_safe_url_rejects_non_opsgenie_host():
+    """_assert_safe_url must reject any host outside the OpsGenie allowlist."""
+    alerter = OpsGenieAlerter(api_key="test-key")
+    with pytest.raises(ValueError, match="not in allowed hosts"):
+        alerter._assert_safe_url("https://evil.example.com/v2/alerts")
+
+
+def test_assert_safe_url_accepts_us_host():
+    alerter = OpsGenieAlerter(api_key="test-key", region="us")
+    alerter._assert_safe_url("https://api.opsgenie.com/v2/alerts")  # must not raise
+
+
+def test_assert_safe_url_accepts_eu_host():
+    alerter = OpsGenieAlerter(api_key="test-key", region="eu")
+    alerter._assert_safe_url("https://api.eu.opsgenie.com/v2/alerts")  # must not raise

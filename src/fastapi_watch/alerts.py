@@ -506,6 +506,7 @@ class OpsGenieAlerter(BaseAlerter):
         "us": "https://api.opsgenie.com",
         "eu": "https://api.eu.opsgenie.com",
     }
+    _ALLOWED_HOSTS: frozenset[str] = frozenset({"api.opsgenie.com", "api.eu.opsgenie.com"})
     _PRIORITY = {
         ProbeStatus.UNHEALTHY: "P1",
         ProbeStatus.DEGRADED: "P3",
@@ -535,6 +536,12 @@ class OpsGenieAlerter(BaseAlerter):
     def _auth_headers(self) -> dict[str, str]:
         return {"Authorization": f"GenieKey {self.api_key}", "Content-Type": "application/json"}
 
+    def _assert_safe_url(self, url: str) -> None:
+        """Guard: raise if the URL host is not in the OpsGenie allowlist."""
+        host = urllib.parse.urlparse(url).hostname or ""
+        if host not in self._ALLOWED_HOSTS:
+            raise ValueError(f"OpsGenie URL host {host!r} not in allowed hosts")
+
     async def notify(self, alert: AlertRecord) -> None:
         alias = self._alias(alert.probe)
         headers = self._auth_headers()
@@ -543,6 +550,7 @@ class OpsGenieAlerter(BaseAlerter):
 
         if alert.new_status == ProbeStatus.HEALTHY:
             url = f"{base_url}/v2/alerts/{urllib.parse.quote(alias, safe='')}/close?identifierType=alias"
+            self._assert_safe_url(url)
             payload = json.dumps({}).encode()
 
             def _close() -> None:
@@ -562,6 +570,7 @@ class OpsGenieAlerter(BaseAlerter):
         else:
             priority = self._PRIORITY.get(alert.new_status, "P1")
             url = f"{base_url}/v2/alerts"
+            self._assert_safe_url(url)
             payload = json.dumps({
                 "message": f"{alert.probe}: {alert.old_status.value} → {alert.new_status.value}",
                 "alias": alias,
