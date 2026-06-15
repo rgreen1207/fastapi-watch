@@ -1,3 +1,4 @@
+import json
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -100,3 +101,36 @@ def test_failing_excludes_non_critical_in_response():
     resp = client.get("/health/ready")
     assert resp.status_code == 200
     assert resp.json()["failing"] == []
+
+
+def test_failing_only_unhealthy_when_degraded_also_present():
+    """DEGRADED critical probe + UNHEALTHY critical probe: failing lists only the UNHEALTHY one."""
+    results = [
+        ProbeResult(name="db", status=ProbeStatus.UNHEALTHY, critical=True),
+        ProbeResult(name="cache", status=ProbeStatus.DEGRADED, critical=True),
+        ProbeResult(name="queue", status=ProbeStatus.HEALTHY, critical=True),
+    ]
+    report = HealthReport.from_results(results)
+    assert report.status == ProbeStatus.UNHEALTHY
+    assert report.failing == ["db"]
+    assert "cache" not in report.failing
+
+
+def test_failing_present_in_sse_serialization():
+    """HealthReport.model_dump_json() includes the failing field (used by SSE streams)."""
+    results = [
+        ProbeResult(name="redis", status=ProbeStatus.UNHEALTHY, critical=True),
+    ]
+    report = HealthReport.from_results(results)
+    data = json.loads(report.model_dump_json())
+    assert "failing" in data
+    assert data["failing"] == ["redis"]
+
+
+def test_failing_empty_in_sse_serialization_when_healthy():
+    results = [
+        ProbeResult(name="redis", status=ProbeStatus.HEALTHY, critical=True),
+    ]
+    report = HealthReport.from_results(results)
+    data = json.loads(report.model_dump_json())
+    assert data["failing"] == []

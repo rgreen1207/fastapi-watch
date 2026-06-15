@@ -508,6 +508,7 @@ Every response from `/health/ready`, `/health/status`, and the SSE streams share
 | `checked_at` | `string \| null` | UTC ISO 8601 timestamp of the last probe run |
 | `timezone` | `string \| null` | IANA timezone name |
 | `probes` | `array` | Individual probe results |
+| `failing` | `string[]` | Names of critical probes whose status is `"unhealthy"`. Empty array when nothing is failing. Not affected by DEGRADED — only UNHEALTHY probes appear here. |
 
 **Probe result:**
 
@@ -1461,6 +1462,12 @@ registry = HealthRegistry(app, auth=my_auth)
 The auth callable **must return exactly `True`** (the boolean). Returning `None`, `0`, `""`, or any other truthy value is treated as denial and returns `403`. This prevents accidental access grants from callables that return a user object or empty string on failure.
 
 Comparison of static credentials uses `secrets.compare_digest` to prevent timing attacks.
+
+### Response fields and information disclosure
+
+Health responses include probe names in `probes[*].name` and, when probes are failing, in the top-level `failing` array. This means an unauthenticated caller of `/health/ready` on a 503 response can read the names of currently-failing critical infrastructure components (e.g., `"postgres-primary"`, `"redis-session"`). This is intentional — the names are also present in the `probes` array — but it makes enumeration more direct.
+
+If your infrastructure naming is sensitive, configure `auth` so health endpoints are not publicly accessible.
 
 ### Webhook alerters and SSRF
 
