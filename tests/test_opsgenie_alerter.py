@@ -2,6 +2,7 @@ import json
 import pytest
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlparse
 from fastapi_watch.alerts import OpsGenieAlerter
 from fastapi_watch.models import AlertRecord, ProbeStatus
 
@@ -63,7 +64,7 @@ async def test_eu_region_uses_correct_endpoint():
         alerter = OpsGenieAlerter(api_key="test-key", region="eu")
         await alerter.notify(_alert(ProbeStatus.HEALTHY, ProbeStatus.UNHEALTHY))
         req = mock_urlopen.call_args[0][0]
-        assert req.full_url.startswith("https://api.eu.opsgenie.com")
+        assert urlparse(req.full_url).hostname == "api.eu.opsgenie.com"
 
 
 @pytest.mark.asyncio
@@ -73,7 +74,7 @@ async def test_us_region_uses_correct_endpoint():
         alerter = OpsGenieAlerter(api_key="test-key", region="us")
         await alerter.notify(_alert(ProbeStatus.HEALTHY, ProbeStatus.UNHEALTHY))
         req = mock_urlopen.call_args[0][0]
-        assert req.full_url.startswith("https://api.opsgenie.com")
+        assert urlparse(req.full_url).hostname == "api.opsgenie.com"
 
 
 def test_invalid_region_raises():
