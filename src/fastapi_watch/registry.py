@@ -33,17 +33,22 @@ _AUTO_HTTP_METHODS = frozenset({"HEAD", "OPTIONS"})
 def _iter_app_routes(routes, prefix: str = ""):
     """Yield concrete route objects from app.routes, recursing into router containers.
 
-    Newer FastAPI versions may store _IncludedRouter wrapper objects in app.routes
-    rather than flat APIRoute objects. This function descends into them using several
-    heuristics so both the flat layout (old FastAPI) and the nested layout (new FastAPI)
-    are handled transparently.
+    Handles both the flat layout (FastAPI <0.137) where include_router copies routes
+    with their full paths into app.routes, and the nested layout (FastAPI 0.137+) where
+    _IncludedRouter wrapper objects are stored instead.  Routes inside _IncludedRouter
+    retain their short path (without the prefix); callers that need the full effective
+    path should use _effective_path(route, prefix) with the prefix accumulated here.
     """
     for item in routes:
         if hasattr(item, "path"):
             yield item
             continue
 
-        item_prefix = prefix + getattr(item, "prefix", "")
+        # FastAPI 0.137+: _IncludedRouter stores prefix in include_context.prefix.
+        # Older wrappers may have a plain .prefix attribute.
+        include_ctx = getattr(item, "include_context", None)
+        ctx_prefix = getattr(include_ctx, "prefix", None) or getattr(item, "prefix", "")
+        item_prefix = prefix + ctx_prefix
 
         # Try all known container attributes to find sub-routes.
         sub = None
@@ -53,8 +58,8 @@ def _iter_app_routes(routes, prefix: str = ""):
                 break
 
         if sub is None:
-            # Try known container attributes (covers _IncludedRouter.original_router in
-            # newer FastAPI as well as .router.* and .app.* in other versions).
+            # Covers _IncludedRouter.original_router (FastAPI 0.137+) as well as
+            # .router.* and .app.* used by older wrappers.
             for container_attr in ("original_router", "router", "_router", "app", "_app"):
                 container = getattr(item, container_attr, None)
                 if container is not None:
@@ -67,6 +72,31 @@ def _iter_app_routes(routes, prefix: str = ""):
 
         if sub:
             yield from _iter_app_routes(sub, item_prefix)
+
+
+def _effective_path(route, prefix: str) -> str:
+    """Return the full effective path for a route given an accumulated prefix."""
+    return prefix + getattr(route, "path", "")
+
+
+def _invalidate_included_router_caches(routes) -> None:
+    """Reset lazy route caches on _IncludedRouter objects (FastAPI 0.137+).
+
+    After patching route.endpoint for monitoring, this forces the _IncludedRouter to
+    rebuild its _EffectiveRouteContext list on the next request so it picks up the
+    wrapped endpoint.  Safe to call on older FastAPI where these attributes do not
+    exist (the hasattr guards make it a no-op).
+    """
+    for item in routes:
+        orig = getattr(item, "original_router", None)
+        if orig is None:
+            continue
+        # Prefer the official API if available; fall back to direct attribute reset.
+        mark_changed = getattr(orig, "_mark_routes_changed", None)
+        if callable(mark_changed):
+            mark_changed()
+        elif hasattr(item, "_effective_candidates_version"):
+            item._effective_candidates_version = None
 
 
 def _route_description(route, APIWebSocketRoute) -> str:
@@ -517,14 +547,24 @@ class HealthRegistry:
                     **_ws_kwargs,
                 )
 
-            wrapped = probe.watch(route.endpoint)
+            # Unwrap any existing fastapi-watch wrapper before re-watching to avoid
+            # double-wrapping (e.g. discover_routes(refresh=True) after a prior call).
+            original_endpoint = getattr(route.endpoint, "__wrapped__", route.endpoint)
+            wrapped = probe.watch(original_endpoint)
             try:
                 wrapped._fastapi_watch = "discover"
                 wrapped._fastapi_watch_probe = probe
                 route.dependant.call = wrapped
+                # FastAPI 0.137+: _EffectiveRouteContext is built lazily from
+                # route.endpoint, not route.dependant.call, so patch both.
+                route.endpoint = wrapped
             except AttributeError:
                 continue
             self.add(probe, critical=critical)
+
+        # FastAPI 0.137+: reset lazy _IncludedRouter caches so the next request
+        # rebuilds _EffectiveRouteContext with the patched endpoints.
+        _invalidate_included_router_caches(self.app.routes)
 
         return self
 
@@ -615,10 +655,17 @@ class HealthRegistry:
 
         router_routes = getattr(router, "routes", [])
         # Use getattr so _IncludedRouter wrappers (which lack .endpoint) are skipped.
-        router_endpoints = {
-            ep for r in router_routes
-            if (ep := getattr(r, "endpoint", None)) is not None
-        }
+        # Include unwrapped originals too: in FastAPI <0.137 routes are copied into
+        # app.routes, so discover_routes may have already patched those copies' endpoints
+        # while router.routes still holds the originals (or vice-versa in 0.137+).
+        router_endpoints: set = set()
+        for _r in router_routes:
+            _ep = getattr(_r, "endpoint", None)
+            if _ep is not None:
+                router_endpoints.add(_ep)
+                _ep_base = getattr(_ep, "__wrapped__", None)
+                if _ep_base is not None:
+                    router_endpoints.add(_ep_base)
 
         probe_group: ProbeGroup | None = None
         if group:
@@ -632,7 +679,9 @@ class HealthRegistry:
                 return False
             if not hasattr(route, "path"):
                 return False
-            if getattr(route, "endpoint", None) not in router_endpoints:
+            ep = getattr(route, "endpoint", None)
+            ep_base = getattr(ep, "__wrapped__", ep)  # unwrap if already patched
+            if ep not in router_endpoints and ep_base not in router_endpoints:
                 return False
             if included and not any(fnmatch.fnmatch(route.path, p) for p in included):
                 return False
@@ -673,7 +722,10 @@ class HealthRegistry:
                     **_ws_kwargs,
                 )
 
-            wrapped = probe.watch(route.endpoint)
+            # Always watch the original (unwrapped) function to avoid double-wrapping
+            # in the case where discover_routes already patched route.endpoint.
+            original_endpoint = getattr(route.endpoint, "__wrapped__", route.endpoint)
+            wrapped = probe.watch(original_endpoint)
             try:
                 wrapped._fastapi_watch = "router"
                 wrapped._fastapi_watch_probe = probe
@@ -695,8 +747,12 @@ class HealthRegistry:
         processed_endpoints: set = set()
         for route in _iter_app_routes(self.app.routes):
             ep = getattr(route, "endpoint", None)
-            if ep in router_endpoints and _process_route(route):
-                processed_endpoints.add(ep)
+            if ep is None:
+                continue
+            ep_base = getattr(ep, "__wrapped__", ep)
+            if (ep in router_endpoints or ep_base in router_endpoints) and _process_route(route):
+                # Record whichever key is in router_endpoints for the unprocessed diff.
+                processed_endpoints.add(ep_base if ep_base in router_endpoints else ep)
 
         # Fallback pass: newer FastAPI may store routes in _IncludedRouter wrappers
         # that _iter_app_routes cannot descend into. In that case, the route objects
@@ -705,12 +761,20 @@ class HealthRegistry:
         unprocessed = router_endpoints - processed_endpoints
         if unprocessed:
             for route in router_routes:
-                if getattr(route, "endpoint", None) in unprocessed:
-                    if _process_route(route):
-                        unprocessed.discard(route.endpoint)
+                ep = getattr(route, "endpoint", None)
+                if ep is None:
+                    continue
+                ep_base = getattr(ep, "__wrapped__", ep)
+                ep_key = ep_base if ep_base in unprocessed else (ep if ep in unprocessed else None)
+                if ep_key is not None and _process_route(route):
+                    unprocessed.discard(ep_key)
 
         if probe_group is not None:
             self.include(probe_group)
+
+        # FastAPI 0.137+: reset lazy _IncludedRouter caches so the next request
+        # rebuilds _EffectiveRouteContext with the patched endpoints.
+        _invalidate_included_router_caches(self.app.routes)
 
         return self
 

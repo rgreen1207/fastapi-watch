@@ -1,5 +1,31 @@
 # Release Notes
 
+## v1.7.1
+
+**FastAPI 0.137.0 compatibility fix.**
+
+### Bug Fixes
+
+#### `discover_routes` and `watch_router` not recording traffic for routes behind `include_router` (FastAPI 0.137+)
+
+FastAPI 0.137.0 changed how included routers are stored: instead of copying routes with their full paths into `app.routes`, it now stores `_IncludedRouter` wrapper objects whose routes retain short (prefix-less) paths. Request handling is done through a lazily-built `_EffectiveRouteContext` whose `dependant.call` is derived from `route.endpoint` at first-request time — not from `route.dependant.call`.
+
+The old patching strategy only updated `route.dependant.call`, which was invisible to 0.137.0's request pipeline. This meant `discover_routes` would find and register probes but never record any traffic when routes were included with a prefix via `app.include_router(router, prefix="...")`.
+
+**Fix:** `discover_routes` now patches both `route.dependant.call` and `route.endpoint`. After patching, `_IncludedRouter` lazy caches are invalidated (via `APIRouter._mark_routes_changed()` when available, falling back to resetting `_effective_candidates_version`) so the next request rebuilds the effective route context with the wrapped endpoint. `watch_router` already patched `route.endpoint` but now also gets the cache invalidation step.
+
+#### `discover_routes` → `watch_router` override not removing the discover probe (older FastAPI, same session)
+
+When `discover_routes()` was called first and then `watch_router()` was called on the same session in FastAPI <0.137, the discover probe was not removed and a duplicate probe appeared in the registry. This happened because in older FastAPI routes are *copied* into `app.routes` when included — so after `discover_routes` patched the copy's `endpoint`, the `watch_router` primary pass looked for the original endpoint in `router_endpoints` and missed it, falling back to the unpatched router route which had no `_fastapi_watch` marker, creating a second probe without removing the first.
+
+**Fix:** The primary pass now also checks `ep.__wrapped__` (set by `functools.wraps`) when looking up endpoints in `router_endpoints`, so it correctly finds app-route copies that were already patched by `discover_routes`. `_process_route` also unwraps before watching to prevent double-wrapping.
+
+### Compatibility
+
+Tested and passing across FastAPI 0.116.1 – 0.137.0.
+
+---
+
 ## v1.7.0
 
 **Probe introspection, failing field, OpsGenie alerter, and security hardening.**
