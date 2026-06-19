@@ -72,6 +72,34 @@ def test_discover_routes_records_real_traffic():
     assert probes["list_items"]["details"]["request_count"] == 2
 
 
+def test_discover_routes_records_traffic_for_included_router():
+    """discover_routes records real traffic for routes added via include_router with a prefix.
+
+    Regression test for FastAPI 0.137+ where included routes are stored in
+    _IncludedRouter wrappers and served via _EffectiveRouteContext which is built
+    from route.endpoint, not route.dependant.call.
+    """
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None)
+    router = APIRouter()
+
+    @router.get("/products")
+    async def list_products():
+        return {"items": []}
+
+    app.include_router(router, prefix="/api")
+    registry.discover_routes()
+
+    client = TestClient(app)
+    client.get("/api/products")
+    client.get("/api/products")
+
+    resp = client.get("/health/status")
+    probes = {p["name"]: p for p in resp.json()["probes"]}
+    assert "list_products" in probes
+    assert probes["list_products"]["details"]["request_count"] == 2
+
+
 # ---------------------------------------------------------------------------
 # discover_routes — health prefix exclusion
 # ---------------------------------------------------------------------------
