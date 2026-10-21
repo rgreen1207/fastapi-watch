@@ -1,8 +1,8 @@
-"""Probe router for organising probes across modules.
+"""Probe groups for organising probes across modules.
 
-:class:`ProbeRouter` mirrors the FastAPI ``APIRouter`` pattern: declare probes
-in submodules, then include the routers in :class:`~fastapi_watch.HealthRegistry`
-at application startup.  Routers can also be nested inside other routers.
+:class:`ProbeGroup` mirrors the FastAPI ``APIRouter`` pattern: declare probes
+in submodules, then include the groups in :class:`~fastapi_watch.HealthRegistry`
+at application startup.  Groups can also be nested inside other groups.
 """
 from .probes.base import BaseProbe
 
@@ -17,11 +17,16 @@ class ProbeGroup:
     Usage::
 
         # features/database/probes.py
-        from fastapi_watch import ProbeGroup, PostgreSQLProbe, RedisProbe
+        from fastapi_watch import ProbeGroup, TCPProbe
+        from fastapi_watch.probes import PostgreSQLProbe, RedisProbe
 
-        db_probes = ProbeGroup()
-        db_probes.add(PostgreSQLProbe(url=settings.DATABASE_URL))
-        db_probes.add(RedisProbe(url=settings.REDIS_URL), critical=False)
+        pg_probe = PostgreSQLProbe(name="postgres")      # passive: decorate queries with @pg_probe.watch
+        cache_probe = RedisProbe(name="session-cache")   # passive: decorate calls with @cache_probe.watch
+
+        db_probes = ProbeGroup(tags=["data"])
+        db_probes.add(pg_probe)
+        db_probes.add(cache_probe, critical=False)
+        db_probes.add(TCPProbe("db.internal", 5432, name="postgres-tcp"))
 
         # main.py
         from fastapi_watch import HealthRegistry

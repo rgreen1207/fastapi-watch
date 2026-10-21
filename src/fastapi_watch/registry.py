@@ -317,7 +317,8 @@ class HealthRegistry:
             with their own ``poll_interval_ms``.
         logger: Optional :class:`logging.Logger` for warnings and probe exceptions.
         timezone: IANA timezone name for all timestamps (default ``"UTC"``).
-        grace_period_ms: Ignore probe failures for this many ms after startup
+        grace_period_ms: Hold ``/health/ready`` at ``503 {"status": "starting"}``
+            for this many ms, measured from when the registry is created
             (affects ``/health/ready`` only).
         history_size: Number of past results kept per probe (default 120).
         groups: :class:`~fastapi_watch.ProbeGroup` instances to merge at startup.

@@ -90,6 +90,13 @@ With `auth={"type": "apikey", ...}` (or a callable checking a header), the dashb
 
 README.md and DOCS.md showed `auth={"username": ..., "password": ...}` (missing `"type": "basic"`) and `auth={"token": ...}` (not a supported form); both raised `ValueError` at startup. The examples are corrected, and a test now constructs a registry from every `auth=` example in the docs.
 
+#### Documentation corrections
+
+- The `grace_period_ms` docstring said failures are "ignored" during the grace window; it actually holds `/health/ready` at `503 {"status": "starting"}` (as `DOCS.md` already said). The docs now also state that the window starts when the registry is created.
+- The `ProbeGroup` docstring referred to a `ProbeRouter` class and imported `PostgreSQLProbe` / `RedisProbe` from the package root (they live in `fastapi_watch.probes`), constructing them with a `url=` they do not accept. The example is corrected.
+- The `RedisProbeStorage` sketch in the `ProbeStorage` docstring called `run_until_complete()` inside the running event loop (which raises) and used an undefined `self._max_results`. It now works, and a test executes it.
+- New tests check that every `from fastapi_watch… import …` in README.md, DOCS.md, and the docstrings resolves, alongside the existing check that every documented `auth=` example constructs.
+
 #### Custom dashboard renderers with the documented signature
 
 `dashboard=` documented a callable `(report) -> str`, but the registry called it with `(report, maintenance)`, so a renderer written to the documentation raised `TypeError` and `/health/dashboard` returned 500.

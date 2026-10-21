@@ -43,10 +43,12 @@ class ProbeStorage(Protocol):
     Example Redis implementation sketch::
 
         class RedisProbeStorage:
-            def __init__(self, redis, result_ttl_seconds=7200, alert_ttl_seconds=259200):
-                self._redis = redis
+            def __init__(self, redis, max_results=120, result_ttl_seconds=7200, alert_ttl_seconds=259200):
+                self._redis = redis  # a redis.asyncio client created with decode_responses=True
+                self._max_results = max_results
                 self._result_ttl = int(result_ttl_seconds)
                 self._alert_ttl = int(alert_ttl_seconds)
+                self._pending = set()  # strong refs so scheduled tasks are not garbage-collected
 
             async def get_latest(self, name):
                 raw = await self._redis.get(f"fw:latest:{name}")
@@ -69,11 +71,24 @@ class ProbeStorage(Protocol):
                 )
 
             def clear_latest(self):
+                # Called from sync code while the event loop is running, so the
+                # deletion is scheduled on it rather than run to completion here
+                # (run_until_complete would raise "event loop is already running").
                 import asyncio
-                loop = asyncio.get_event_loop()
-                keys = loop.run_until_complete(self._redis.keys("fw:latest:*"))
-                if keys:
-                    loop.run_until_complete(self._redis.delete(*keys))
+
+                async def _clear():
+                    keys = await self._redis.keys("fw:latest:*")
+                    if keys:
+                        await self._redis.delete(*keys)
+
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:  # called outside the loop, e.g. at import time
+                    asyncio.run(_clear())
+                    return
+                task = loop.create_task(_clear())
+                self._pending.add(task)
+                task.add_done_callback(self._pending.discard)
 
             async def append_history(self, result):
                 key = f"fw:history:{result.name}"

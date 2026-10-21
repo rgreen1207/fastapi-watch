@@ -437,7 +437,7 @@ startupProbe:
 registry = HealthRegistry(app, grace_period_ms=15_000)  # hold for 15 s
 ```
 
-Only `/health/ready` is affected — `/health/status` and `/health/live` always reflect real probe results.
+Only `/health/ready` is affected — `/health/status` and `/health/live` always reflect real probe results. The window is measured from when the `HealthRegistry` is created, not from `set_started()`.
 
 ---
 
