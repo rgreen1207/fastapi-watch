@@ -1,4 +1,4 @@
-"""InMemoryProbeStorage.configure() and prune()."""
+"""InMemoryProbeStorage.configure() and forget()."""
 import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -65,18 +65,21 @@ async def test_configure_clamps_counts():
     assert [r.latency_ms for r in (await store.get_history())["db"]] == [1.0]
 
 
-async def test_prune_drops_unlisted_probes():
+async def test_forget_drops_only_the_named_probes():
     store = InMemoryProbeStorage()
-    for name in ("keep", "drop"):
+    for name in ("keep", "drop", "other"):
         await store.set_latest(_result(name=name))
         await store.append_history(_result(name=name))
     await store.append_alert(_alert("drop"))
-    await store.prune({"keep"})
-    assert list(await store.get_all_latest()) == ["keep"]
-    assert list(await store.get_history()) == ["keep"]
+    await store.forget({"drop"})
+    assert sorted(await store.get_all_latest()) == ["keep", "other"]
+    assert sorted(await store.get_history()) == ["keep", "other"]
     assert await store.get_latest("drop") is None
     assert [a.probe for a in await store.get_alerts()] == ["drop"]  # alert log is left alone
-    await store.prune(set())
+    await store.forget(set())  # nothing named: nothing dropped
+    await store.forget({"never-written"})  # unknown name: no error
+    assert sorted(await store.get_all_latest()) == ["keep", "other"]
+    await store.forget({"keep", "other"})
     assert await store.get_all_latest() == {} and await store.get_history() == {}
 
 

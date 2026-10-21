@@ -53,10 +53,10 @@ _SSE_KEEPALIVE_S = 15.0
 _SINGLE_FETCH_RETRY_MS = 30_000
 # Storage: returned by _storage_call when an operation fails or times out; a
 # failing operation is logged at most once per interval; stored data of
-# probes no longer registered is pruned at most this often.
+# probes this process wrote but no longer registers is forgotten at most this often.
 _STORAGE_FAILED: Any = object()
 _STORAGE_LOG_INTERVAL_S = 60.0
-_PRUNE_INTERVAL_S = 600.0
+_FORGET_INTERVAL_S = 600.0
 # Shutdown: how long each probe's aclose() may take.
 _ACLOSE_TIMEOUT_S = 5.0
 # Retry-After (seconds) sent when max_stream_connections streams are open.
@@ -645,9 +645,12 @@ class HealthRegistry:
         self._last_results: dict[str, ProbeResult] = {}
         # id(probe) -> its in-flight run, shared by concurrent callers
         self._inflight: dict[int, asyncio.Task] = {}
-        # Storage pruning of probes no longer registered (monotonic time of the last one)
-        self._last_prune: float | None = None
-        self._prune_task: asyncio.Task | None = None
+        # Probe names this process has written to storage.  Bounded: only names
+        # it registered.  Those it stops registering are forgotten in storage
+        # (monotonic time of the last pass).
+        self._written_names: set[str] = set()
+        self._last_forget: float | None = None
+        self._forget_task: asyncio.Task | None = None
 
         # Circuit breaker state
         self._circuit_breaker_enabled: bool = circuit_breaker
@@ -1289,6 +1292,8 @@ class HealthRegistry:
         self._probe_last_run[probe.name] = asyncio.get_running_loop().time()
         if not from_cache:
             self._last_checked_at = checked_at
+        if result.name == probe.name:  # only ever forget a name both registered and written here
+            self._written_names.add(result.name)
         await asyncio.gather(
             self._storage_call("set_latest", result),
             self._storage_call("append_history", result),
@@ -1503,7 +1508,7 @@ class HealthRegistry:
         backend cannot slow or fail health checks.
         """
         self._ensure_background_polling()
-        self._schedule_prune()
+        self._schedule_forget()
         now = asyncio.get_running_loop().time()
         to_run = [
             (p, c) for p, c in self._probes
@@ -1521,36 +1526,47 @@ class HealthRegistry:
                 results.setdefault(p.name, result)
         return list(results.values())
 
-    def _prune_due(self) -> bool:
-        return self._last_prune is None or time.monotonic() - self._last_prune >= _PRUNE_INTERVAL_S
+    def _forget_due(self) -> bool:
+        return self._last_forget is None or time.monotonic() - self._last_forget >= _FORGET_INTERVAL_S
 
-    def _schedule_prune(self) -> None:
-        """Start a background :meth:`_prune_storage` when one is due; never awaited by a request."""
-        if not self._prune_due() or self._shutting_down:
+    def _schedule_forget(self) -> None:
+        """Start a background :meth:`_forget_unregistered` when one is due; never awaited by a request."""
+        if not self._forget_due() or self._shutting_down:
             return
-        if self._prune_task is not None and not self._prune_task.done():
+        if self._forget_task is not None and not self._forget_task.done():
             return
-        self._prune_task = asyncio.get_running_loop().create_task(self._prune_storage())
+        self._forget_task = asyncio.get_running_loop().create_task(self._forget_unregistered())
 
-    async def _prune_storage(self) -> None:
-        """Drop data of probes that are no longer registered, here and in storage.
+    async def _forget_unregistered(self) -> None:
+        """Drop data of probes this process wrote but no longer registers, here and in storage.
 
-        Runs at most every ``_PRUNE_INTERVAL_S``: from the first health request
+        Runs at most every ``_FORGET_INTERVAL_S``: from the first health request
         and from the poll loop.  Without it, a renamed or removed probe (e.g.
-        after ``discover_routes(refresh=True)`` or a deploy) would keep its
-        results and history in storage until their TTL, or forever with TTL 0.
-        Storage support is optional (``prune(keep)``).
+        after ``discover_routes(refresh=True)``) would keep its results and
+        history in storage until their TTL, or forever with TTL 0.
+
+        Only names in ``_written_names`` are ever deleted, via the optional
+        storage method ``forget(names)``.  Data written by other apps or other
+        replicas under the same prefix -- including probes this process never
+        registered, as during a rolling deploy -- is never touched.  A name
+        stays tracked until ``forget()`` succeeds, so a failed call is retried.
         """
-        self._last_prune = time.monotonic()
-        keep = {p.name for p, _ in self._probes}
+        self._last_forget = time.monotonic()
+        registered = {p.name for p, _ in self._probes}
         for state in (
             self._last_results, self._probe_last_run, self._probe_states,
             self._alerted_states, self._alert_last_sent_at, self._alert_pending,
         ):
-            for name in [n for n in state if n not in keep]:
+            for name in [n for n in state if n not in registered]:
                 del state[name]
-        if callable(getattr(self._storage, "prune", None)):
-            await self._storage_call("prune", keep)
+        stale = self._written_names - registered
+        if not stale:
+            return
+        if callable(getattr(self._storage, "forget", None)):
+            if await self._storage_call("forget", set(stale)) is _STORAGE_FAILED:
+                return
+        # A name registered again meanwhile is re-added by its next write.
+        self._written_names -= stale
 
     # ------------------------------------------------------------------
     # Polling loop
@@ -1673,13 +1689,13 @@ class HealthRegistry:
             except (asyncio.CancelledError, Exception):
                 pass
             self._alert_worker = None
-        if self._prune_task is not None and not self._prune_task.done():
-            self._prune_task.cancel()
+        if self._forget_task is not None and not self._forget_task.done():
+            self._forget_task.cancel()
             try:
-                await self._prune_task
+                await self._forget_task
             except (asyncio.CancelledError, Exception):
                 pass
-        self._prune_task = None
+        self._forget_task = None
         await self._close_probes()
 
     async def _close_probes(self) -> None:
@@ -1720,8 +1736,8 @@ class HealthRegistry:
                 due = [(p, c) for p, c in self._probes if self._is_probe_due(p, now)]
                 if due:
                     await self._execute_probes(due)
-                if self._prune_due():
-                    await self._prune_storage()
+                if self._forget_due():
+                    await self._forget_unregistered()
             except Exception:
                 (self._logger or _LIB_LOGGER).exception("fastapi-watch: poll iteration failed")
             await asyncio.sleep(1.0)

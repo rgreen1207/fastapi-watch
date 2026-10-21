@@ -77,9 +77,18 @@ class RedisProbeStorage:
             entries lose their biggest ``details`` values first and are marked
             ``details["_truncated"] = True``.  Latest results are stored in full.
 
-    When passed to :class:`~fastapi_watch.HealthRegistry`, the registry applies
-    its own ``history_size``, ``result_ttl_seconds``, ``alert_ttl_seconds`` and
-    ``max_alerts`` through :meth:`configure`.
+    The retention arguments above apply unless :class:`~fastapi_watch.HealthRegistry`
+    is given ``history_size``, ``result_ttl_seconds``, ``alert_ttl_seconds`` or
+    ``max_alerts`` explicitly.  When at least one of those is passed, the
+    registry calls :meth:`configure` with all four of its effective values
+    (its defaults for the ones not passed); otherwise this backend keeps its
+    constructor values.
+
+    Applications and replicas may share a prefix safely: the registry only
+    ever calls :meth:`forget` with names it wrote itself and no longer
+    registers.  Two apps registering the same probe name on one prefix do
+    share that probe's data, though, so a distinct prefix per app is still
+    recommended.
 
     Keys (``P`` = *prefix*): ``P:probes`` (set of probe names), ``P:latest:<name>``
     (string), ``P:history:<name>`` (sorted set scored by ``checked_at``) and
@@ -91,8 +100,8 @@ class RedisProbeStorage:
         N × (max_results × max_entry_bytes + L) + max_alerts × A + N × len(name) + C
 
     plus Redis' per-key overhead, where ``N`` is the number of probe names
-    written within the last ``result_ttl_seconds`` (or since the last
-    :meth:`prune` when that TTL is ``0``), ``L`` the size of one probe's
+    written within the last ``result_ttl_seconds`` (or, when that TTL is
+    ``0``, ever written and not yet removed by :meth:`forget`), ``L`` the size of one probe's
     serialized latest result and ``A`` the size of one serialized alert (about
     150 bytes plus the probe name) and ``C`` the alert claims live at once (one
     small key per claimed alert, each expiring after its claim TTL).  Each history entry is cut to
@@ -384,11 +393,15 @@ class RedisProbeStorage:
             return True
         return bool(await self._redis.set(f"{self._prefix}:alert-claim:{key}", 1, nx=True, px=ttl_ms))
 
-    # ------------------------------------------------------------------ prune
+    # ----------------------------------------------------------------- forget
 
-    async def prune(self, keep: set[str]) -> None:
-        """Delete the latest result and history of every probe not in *keep*."""
-        drop = [name for name in await self._names() if name not in keep]
+    async def forget(self, names: set[str]) -> None:
+        """Delete the latest result, history and index entry of exactly the probes in *names*.
+
+        Nothing else under the prefix is touched, so apps and replicas sharing
+        it keep their data.
+        """
+        drop = sorted(names)
         if not drop:
             return
         async with self._redis.pipeline(transaction=True) as pipe:

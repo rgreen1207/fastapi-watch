@@ -325,7 +325,7 @@ async def test_never_uses_keys_or_scan(client, spy, prefix):
     await asyncio.sleep(0.3)  # let everything expire so the lazy cleanup paths run
     await store.get_all_latest()
     await store.get_history()
-    await store.prune(set())
+    await store.forget({"a", "b"})
     # Server-side check too: covers any path the spy could miss.
     assert calls(await client.info("commandstats")) == before
 
@@ -383,24 +383,72 @@ async def test_prefixes_are_isolated(client, spy, prefix):
     assert await two.get_alerts() == []
     two.clear_latest()
     await asyncio.gather(*two._pending)
-    await two.prune(set())
+    await two.forget({"a", "b"})
     assert list(await one.get_all_latest()) == ["a"]
     assert list(await one.get_history()) == ["a"]
 
 
-# --- prune / configure ------------------------------------------------------
+# --- forget / configure -----------------------------------------------------
 
-async def test_prune_deletes_removed_probes(client, spy, prefix):
+async def test_forget_deletes_only_the_named_probes(client, spy, prefix):
     store = _store(spy, prefix, result_ttl_seconds=0)
-    for name in ("keep", "drop"):
+    for name in ("keep", "drop", "other"):
         await store.set_latest(_result(name=name))
         await store.append_history(_result(name=name))
-    await store.prune({"keep"})
-    assert list(await store.get_all_latest()) == ["keep"]
-    assert list(await store.get_history()) == ["keep"]
+    await store.append_alert(_alert(probe="drop"))
+    await store.forget({"drop"})
+    assert sorted(await store.get_all_latest()) == ["keep", "other"]
+    assert sorted(await store.get_history()) == ["keep", "other"]
     assert await client.exists(f"{prefix}:latest:drop", f"{prefix}:history:drop") == 0
     assert await client.sismember(f"{prefix}:probes", "drop") in (0, False)
-    await store.prune({"keep"})  # nothing to drop: no error
+    assert [a.probe for a in await store.get_alerts()] == ["drop"]  # alert log is left alone
+    before = spy.round_trips
+    await store.forget(set())  # nothing named: no round trip
+    assert spy.round_trips == before
+    await store.forget({"never-written"})  # unknown name: no error
+    assert sorted(await store.get_all_latest()) == ["keep", "other"]
+
+
+def _redis_app(spy, prefix, *names):
+    registry = HealthRegistry(FastAPI(), storage=_store(spy, prefix), poll_interval_ms=None)
+    for name in names:
+        registry.add(NoOpProbe(name=name))
+    return registry
+
+
+async def _stored_names(store):
+    return set(await store.get_all_latest()) | set(await store.get_history())
+
+
+async def test_apps_sharing_a_prefix_keep_each_others_data(spy, prefix):
+    one = _redis_app(spy, prefix, "orders-db", "orders-cache")
+    two = _redis_app(spy, prefix, "billing-db")
+    await one.run_all()
+    await two.run_all()
+    await one._forget_unregistered()
+    await two._forget_unregistered()
+    assert await _stored_names(_store(spy, prefix)) == {"orders-db", "orders-cache", "billing-db"}
+
+
+async def test_rolling_deploy_keeps_both_probe_sets(spy, prefix):
+    old = _redis_app(spy, prefix, "a", "b")  # old pod
+    new = _redis_app(spy, prefix, "b", "c")  # new pod, same prefix
+    await old.run_all()
+    await new.run_all()
+    for registry in (old, new, old, new):
+        await registry._forget_unregistered()
+    assert await _stored_names(_store(spy, prefix)) == {"a", "b", "c"}
+
+
+async def test_registry_forgets_a_probe_it_stopped_registering(spy, prefix):
+    one = _redis_app(spy, prefix, "a", "gone")
+    other = _redis_app(spy, prefix, "x")
+    await one.run_all()
+    await other.run_all()
+    one._probes = [(p, c) for p, c in one._probes if p.name != "gone"]
+    await one._forget_unregistered()
+    assert await _stored_names(_store(spy, prefix)) == {"a", "x"}
+    assert one._written_names == {"a"}
 
 
 async def test_configure_applies_new_limits(client, spy, prefix):
@@ -459,7 +507,7 @@ def test_clear_latest_without_a_loop_then_reuse_the_client():
         try:
             return await store.get_all_latest()
         finally:
-            await store.prune(set())
+            await store.forget({"db"})
             await client.aclose()
 
     store = RedisProbeStorage(client, prefix=prefix)

@@ -48,8 +48,11 @@ class ProbeStorage(Protocol):
         def configure(self, *, max_results: int, result_ttl_seconds: float,
                       alert_ttl_seconds: float, max_alerts: int) -> None: ...
 
-        # Delete the latest result and history of every probe not in keep.
-        async def prune(self, keep: set[str]) -> None: ...
+        # Delete the latest result, history and any index entry of exactly the
+        # probes in names, and nothing else.  The registry passes only names
+        # it wrote itself and no longer registers, so apps and replicas
+        # sharing one namespace never delete each other's data.
+        async def forget(self, names: set[str]) -> None: ...
 
         # Return True if this caller is the first to claim key within
         # ttl_seconds (and record the claim), False if another caller holds it.
@@ -150,12 +153,11 @@ class InMemoryProbeStorage:
             self._history_times[name] = deque(self._history_times[name], maxlen=self._max_results)
         self._alerts = deque(self._alerts, maxlen=self._max_alerts)
 
-    async def prune(self, keep: set[str]) -> None:
-        """Drop the latest result and history of every probe not named in *keep*."""
-        for name in [n for n in self._cache if n not in keep]:
+    async def forget(self, names: set[str]) -> None:
+        """Drop the latest result and history of exactly the probes in *names*."""
+        for name in names:
             self._cache.pop(name, None)
             self._cache_times.pop(name, None)
-        for name in [n for n in self._history if n not in keep]:
             self._history.pop(name, None)
             self._history_times.pop(name, None)
 

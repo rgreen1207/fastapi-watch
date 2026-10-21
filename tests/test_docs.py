@@ -58,7 +58,7 @@ def test_bundled_backends_satisfy_the_protocol():
 
 
 def test_optional_protocol_methods_are_not_required():
-    # Backends written before configure()/prune() existed must still qualify.
+    # Backends written before configure()/forget()/claim_alert() existed must still qualify.
     class Legacy:
         async def get_latest(self, name): ...
         async def get_all_latest(self): ...
