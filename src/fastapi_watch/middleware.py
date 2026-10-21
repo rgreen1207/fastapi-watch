@@ -136,8 +136,8 @@ def _route_key(scope: dict, entry_root_path: str) -> str:
 
 OTHER_ROUTE = "<other>"
 
-# Bound to fastapi_watch.registry._is_health_handler on first use; importing it
-# at module load would be circular (registry -> dashboard -> ... -> here).
+# Bound to fastapi_watch.registry._is_health_handler on first use, so this module
+# has no load-time dependency on registry (which may come to import it).
 _is_health_handler: "Callable[[Any], bool] | None" = None
 
 
