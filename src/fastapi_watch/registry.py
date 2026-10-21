@@ -340,6 +340,8 @@ class HealthRegistry:
         self._probe_last_run: dict[str, float] = {}
         self._last_checked_at: datetime | None = None
         self._cache_lock = asyncio.Lock()
+        # id(probe) -> its in-flight run, shared by concurrent callers
+        self._inflight: dict[int, asyncio.Task] = {}
 
         # Circuit breaker state
         self._circuit_breaker_enabled: bool = circuit_breaker
@@ -922,35 +924,53 @@ class HealthRegistry:
         )
 
     async def _execute_probes(self, pairs: list[tuple[BaseProbe, bool]]) -> list[ProbeResult]:
-        """Run a subset of probes, update the cache, history, and fire callbacks."""
+        """Run a subset of probes concurrently and return their results.
+
+        A probe already being checked is not started again: callers join the
+        run in flight.  Without this, concurrent requests (readiness checks,
+        dashboards, the poll loop) each re-ran every due probe against the same
+        dependency, and a slower, older run could land last and overwrite a
+        newer result.  ``shield`` keeps one caller's cancellation (e.g. a client
+        disconnecting) from cancelling a run other callers are waiting on.
+        """
         if not pairs:
             return []
-        raw = list(await asyncio.gather(*(self._safe_check(p, c) for p, c in pairs)))
-        probe_meta = {p.name: p for p, _ in pairs}
-        results = []
-        for r in raw:
-            probe = probe_meta.get(r.name)
-            if probe is not None:
-                updates: dict = {}
-                if getattr(probe, "description", None) is not None and r.description is None:
-                    updates["description"] = probe.description
-                probe_tags = getattr(probe, "tags", None) or []
-                if probe_tags and not r.tags:
-                    updates["tags"] = probe_tags
-                if updates:
-                    r = r.model_copy(update=updates)
-            results.append(r)
-        now_dt = datetime.now(self._tzinfo)
+        return list(await asyncio.gather(*(asyncio.shield(self._shared_run(p, c)) for p, c in pairs)))
+
+    def _shared_run(self, probe: BaseProbe, critical: bool) -> "asyncio.Task[ProbeResult]":
+        """Return the in-flight run of *probe*, starting one if none exists."""
+        key = id(probe)
+        task = self._inflight.get(key)
+        if task is None:
+            task = asyncio.ensure_future(self._run_probe(probe, critical))
+            self._inflight[key] = task
+
+            def _forget(done: asyncio.Task) -> None:
+                if self._inflight.get(key) is done:
+                    del self._inflight[key]
+
+            task.add_done_callback(_forget)
+        return task
+
+    async def _run_probe(self, probe: BaseProbe, critical: bool) -> ProbeResult:
+        """Check one probe, then record its result, history, and state change exactly once."""
+        result = await self._safe_check(probe, critical)
+        updates: dict = {}
+        if getattr(probe, "description", None) is not None and result.description is None:
+            updates["description"] = probe.description
+        probe_tags = getattr(probe, "tags", None) or []
+        if probe_tags and not result.tags:
+            updates["tags"] = probe_tags
+        if updates:
+            result = result.model_copy(update=updates)
         run_time = asyncio.get_running_loop().time()
         async with self._cache_lock:
-            for r in results:
-                await self._storage.set_latest(r)
-                self._probe_last_run[r.name] = run_time
-            self._last_checked_at = now_dt
-        for r in results:
-            await self._storage.append_history(r)
-        await self._fire_state_changes(results)
-        return results
+            await self._storage.set_latest(result)
+            self._probe_last_run[result.name] = run_time
+            self._last_checked_at = datetime.now(self._tzinfo)
+        await self._storage.append_history(result)
+        await self._fire_state_changes([result])
+        return result
 
     def _is_cb_active(self, probe: BaseProbe) -> bool:
         """Return True if the circuit breaker is active for this probe."""

@@ -44,6 +44,14 @@ Callbacks registered with `on_state_change()` ran unguarded inside the probe run
 
 **Fix:** the constructor's `timeout` keeps its meaning (per-broadcast wait, now also exposed as `reply_timeout`), and the probe's overall deadline covers every broadcast it issues plus a 2 s margin: `timeout + 2` for ping-only, `7 × timeout + 2` with `detailed=True`.
 
+### Performance
+
+#### Concurrent requests share one probe run
+
+Each request that found a probe due ran it independently, so a burst of readiness checks, open dashboards, and the poll loop multiplied load on the very dependency being checked (20 concurrent `/health/ready` requests ran a 60-second-interval probe 20 times). Because the runs raced, a slower, older result could also land last and overwrite a newer one, producing spurious state flips and alerts.
+
+**Fix:** a probe that is already being checked is joined rather than restarted; every caller receives the same result, and storage, history, and state-change handling happen exactly once per run. A caller that disconnects mid-run no longer cancels the run for the others.
+
 ### Security Fixes
 
 #### Maintenance write endpoints require `auth=`
