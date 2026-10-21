@@ -52,18 +52,36 @@ This file contains the complete reference for fastapi-watch. For the condensed o
 
 ## Health dashboard
 
-`GET /health/dashboard` returns a server-rendered HTML page that shows all probe results in a card grid and updates live over SSE. No extra Python dependencies are required.
+`GET /health/dashboard` returns a timeboard: every graph shares one time axis, so a status change, a latency spike, and an error burst line up vertically. It is a single self-contained HTML page — inline SVG and vanilla JavaScript, no CDN or external assets, so it works in air-gapped clusters and under a strict CSP — and it updates live over SSE. Light and dark themes follow the viewer's OS setting.
 
 ```python
 registry = HealthRegistry(app)                  # dashboard on — GET /health/dashboard
 registry = HealthRegistry(app, dashboard=False) # dashboard off
 ```
 
-**Header bar** — overall status at the top. Green when all critical probes are healthy, amber when any is degraded, red when any is unhealthy. A maintenance banner appears when maintenance mode is active.
+**Header** — a plain-language status sentence (`orders-db unhealthy for 8 min`, `All 6 probes healthy`), a probe count summary, and the last check time. A maintenance banner appears when maintenance mode is active.
 
-**Probe cards** — one card per probe with: colored left border, probe name, optional badge for non-critical probes, average latency, status pill, error message (if failing), and a details table. Hovering a field label shows a one-line tooltip.
+**Time range** — 15 min, 1 hour, 2 hours, or all retained history (remembered per browser). Graphs draw from the registry's stored history, which is embedded in the page and extended by live updates. How far back "All" reaches depends on `history_size` and `result_ttl_seconds` (120 results per probe and 2 hours by default); use a custom `storage=` backend for longer retention.
 
-**Live updates** — the embedded JavaScript opens an `EventSource` connection to `/health/status/stream` and surgically updates the DOM on each event — no full page reload.
+**Status over time** — one lane per probe, colored by status, with a tick at every state change. Gaps in the data are left blank rather than drawn as healthy.
+
+**Probe rows** — the probe's name, description, tags, status, current latency, and any error on the left; on the right, the graphs its results support:
+
+| Graph | Shown for | Series |
+|---|---|---|
+| Latency | probes reporting percentiles (route, passive, request metrics) | p50 (red, solid), p95 (yellow, dashed), p99 (green, dotted) |
+| Latency | other probes that report a latency | latency |
+| Event loop lag | `EventLoopProbe` | lag, with dashed `warn_ms` / `fail_ms` lines |
+| Error rate | probes reporting `error_rate` | errors |
+| Throughput | probes reporting `requests_per_minute` | requests |
+
+Each multi-series graph has a legend and labels every line at its right end, and the percentile lines differ by dash pattern as well as color, so they stay distinguishable for color-blind viewers. "All fields" expands the probe's full details table.
+
+**Routes** — when `RequestMetricsProbe` runs with `per_route=True`, the eight busiest route templates get their own p95 latency graph, with current p95, error rate, and throughput alongside.
+
+**Crosshair** — hovering any graph shows the same moment on every graph, with that graph's values in a tooltip.
+
+**Live updates** — the page opens an `EventSource` to `/health/status/stream`, appends each new result to the graphs, and updates the rows in place. If the set of probes changes it reloads once to pick up the new rows.
 
 ---
 

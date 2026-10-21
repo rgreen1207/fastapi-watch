@@ -55,10 +55,10 @@ def test_render_includes_all_probe_names():
 # render_dashboard — overall status
 # ---------------------------------------------------------------------------
 
-def test_render_healthy_report_shows_all_systems_operational():
+def test_render_healthy_report_states_all_probes_healthy():
     report = _make_report([ProbeResult(name="db", status=ProbeStatus.HEALTHY)])
     html = render_dashboard(report, stream_url="/health/status/stream")
-    assert "All Systems Operational" in html
+    assert '<h1 class="status-badge" id="status-badge-text">All 1 probe healthy</h1>' in html
 
 
 def test_render_unhealthy_report_shows_unhealthy():
@@ -176,9 +176,10 @@ def test_render_none_detail_values_skipped():
         details={"present": "yes", "missing": None},
     )]
     html = render_dashboard(_make_report(probes), stream_url="/health/status/stream")
-    assert "present" in html.lower()
+    markup = html.split('<script type="application/json"')[0]  # the embedded data keeps raw details
+    assert "present" in markup.lower()
     # None values are not rendered
-    assert "missing" not in html.lower()
+    assert "missing" not in markup.lower()
 
 
 def test_render_no_details_table_when_details_empty():
@@ -458,7 +459,7 @@ def test_empty_routes_breakdown_renders_dash():
 def test_summary_has_an_id_and_live_update_hooks():
     html = render_dashboard(HealthReport.from_results([]), stream_url="/s")
     assert 'id="probe-summary"' in html
-    for hook in ("function summaryText", "function routesTable", "function probeSetChanged", "probe-summary"):
+    for hook in ("function summaryText", "function drawRoutes", "function probeSetChanged", "probe-summary"):
         assert hook in html
 
 

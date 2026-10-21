@@ -168,6 +168,22 @@ The early-shutdown hook cancelled SSE, poll, and alert tasks directly inside a `
 
 ### New Features
 
+#### Redesigned dashboard: a timeboard with graphs
+
+`/health/dashboard` is rebuilt as a Datadog/Kibana-style timeboard. Every graph shares one time axis, so a status change, a latency spike, and an error burst line up vertically:
+
+- **Status over time** — one lane per probe, colored by status, with a tick at each state change; gaps in the data stay blank.
+- **Per-probe graphs** — latency (p50/p95/p99 where reported), event-loop lag with its warn/fail thresholds, error rate, and throughput, drawn only when the probe reports them.
+- **Per-route graphs** — p95 latency for the eight busiest routes from `RequestMetricsProbe(per_route=True)`.
+- **Time ranges** — 15 min / 1 hour / 2 hours / all retained history, from the registry's stored history embedded in the page and extended live over SSE.
+- **Shared crosshair** — hover any graph to see the same moment on all of them, with values in a tooltip.
+- **Readable for everyone** — percentile lines are told apart by color and by dash pattern, labeled at their ends, and listed in a legend; status colors are reserved for status. Light and dark themes follow the OS.
+- **A plain-language header** — "orders-db unhealthy for 8 min" instead of a generic status banner.
+
+The page remains a single self-contained HTML document: inline SVG and vanilla JavaScript shipped inside the package (`fastapi_watch/static/`), with no CDN or external assets. Custom renderers (`dashboard=callable` or an `.html` path) are unaffected. `render_dashboard()` gains an optional `history=` argument.
+
+To support the graphs, every `ProbeResult` now carries `checked_at` — the time the registry recorded it — in all responses, history, and stored results. Custom storage backends that serialize the model pick it up automatically.
+
 #### `metrics_prefix` for Prometheus metric names
 
 The `/metrics` endpoint names every metric `probe_*` (`probe_healthy`, `probe_latency_ms`, …), which collides with blackbox_exporter's `probe_*` metrics when both are scraped into one Prometheus. New `HealthRegistry(metrics_prefix="fastapi_watch_")` namespaces them. The default `""` keeps the existing names, so current dashboards and alerts are unaffected; a non-empty default may come in a future minor release.

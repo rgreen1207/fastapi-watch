@@ -1,0 +1,341 @@
+/* fastapi-watch dashboard — an aligned timeboard: every plot shares one time
+   axis, with names and current values in a fixed left gutter. */
+
+:root {
+  --page: #f2f4f7;
+  --surface: #ffffff;
+  --ink: #1c2430;
+  --ink-soft: #566173;
+  --ink-faint: #8a94a3;
+  --rule: #d5dbe3;
+  --grid: #e6eaf0;
+  /* Single-series charts.  Percentile lines use red/yellow/green, separated by
+     lightness so they stay distinct under color-blindness (validated: CVD
+     ΔE ≥ 9.0 all pairs on this surface) and also by dash pattern. */
+  --series-1: #2a78d6;
+  --p50: #9e1a28;
+  --p95: #d29400;
+  --p99: #45cf7b;
+  --ok: #0ca30c;
+  --warn: #fab219;
+  --bad: #d03b3b;
+  --ok-soft: #dff2df;
+  --warn-soft: #fdf0d0;
+  --bad-soft: #f8dcdc;
+  --focus: #2a78d6;
+  --gutter: 15rem;
+  --chart-h: 5.5rem;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --page: #171d27;
+    --surface: #1f2632;
+    --ink: #e4e8ee;
+    --ink-soft: #a7b0be;
+    --ink-faint: #737e8f;
+    --rule: #323b4a;
+    --grid: #283040;
+    --series-1: #3987e5;
+    --p50: #e26478;
+    --p95: #b78c12;
+    --p99: #187a3e;
+    --ok: #0ca30c;
+    --warn: #fab219;
+    --bad: #d03b3b;
+    --ok-soft: #1d3a1d;
+    --warn-soft: #3d3418;
+    --bad-soft: #43262a;
+    --focus: #3987e5;
+    color-scheme: dark;
+  }
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+/* ── Status header: the plain-language answer first ─────────────────── */
+
+.maintenance-banner {
+  background: var(--warn-soft);
+  color: var(--ink);
+  border-bottom: 1px solid var(--warn);
+  padding: 0.6rem 1rem;
+  font-weight: 600;
+  text-align: center;
+}
+
+.header {
+  padding: 1.5rem 1.5rem 1rem;
+  border-bottom: 1px solid var(--rule);
+  border-top: 6px solid var(--ok);
+  background: var(--surface);
+}
+.header.degraded { border-top-color: var(--warn); }
+.header.unhealthy { border-top-color: var(--bad); }
+
+.header-inner {
+  max-width: 90rem;
+  margin: 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 2rem;
+  align-items: flex-end;
+  justify-content: space-between;
+}
+
+.status-badge {
+  margin: 0;
+  font-size: 1.75rem;
+  line-height: 1.15;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.status-subtitle { margin: 0.25rem 0 0; color: var(--ink-soft); }
+
+.header-right { display: flex; flex-direction: column; align-items: flex-end; gap: 0.35rem; }
+
+.live-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--ink-soft);
+  font-size: 0.85rem;
+}
+.live-dot { width: 0.55rem; height: 0.55rem; border-radius: 50%; background: var(--ink-faint); }
+.live-dot.connected { background: var(--ok); }
+
+.checked-at { color: var(--ink-faint); font-size: 0.85rem; }
+
+/* ── Controls ───────────────────────────────────────────────────────── */
+
+.controls {
+  max-width: 90rem;
+  margin: 0 auto;
+  padding: 0.85rem 1.5rem 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem 1rem;
+  align-items: center;
+}
+
+.range { display: inline-flex; border: 1px solid var(--rule); border-radius: 6px; overflow: hidden; }
+.range button {
+  border: 0;
+  border-right: 1px solid var(--rule);
+  background: var(--surface);
+  color: var(--ink-soft);
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.3rem 0.7rem;
+  cursor: pointer;
+}
+.range button:last-child { border-right: 0; }
+.range button[aria-pressed="true"] { background: var(--ink); color: var(--surface); }
+
+.probe-search {
+  flex: 1 1 12rem;
+  min-width: 0;  /* an input's intrinsic width would otherwise stop the row wrapping */
+  max-width: 20rem;
+  font: inherit;
+  font-size: 0.9rem;
+  padding: 0.3rem 0.6rem;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.tag-filter { display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: center; }
+.tag-filter-label { color: var(--ink-faint); font-size: 0.85rem; }
+.tag-filter-btn, .tag-filter-clear {
+  font: inherit;
+  font-size: 0.8rem;
+  padding: 0.1rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid var(--rule);
+  background: var(--surface);
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+.tag-filter-btn.active { border-color: var(--focus); color: var(--ink); background: var(--grid); }
+.tag-filter-clear { display: none; }
+.tag-filter-clear.visible { display: inline-block; }
+
+/* ── Timeboard ──────────────────────────────────────────────────────── */
+
+.content { max-width: 90rem; margin: 0 auto; padding: 1rem 1.5rem 3rem; }
+
+.board-row {
+  display: grid;
+  grid-template-columns: var(--gutter) minmax(0, 1fr);
+  gap: 0 1rem;
+  align-items: stretch;
+}
+.gutter { min-width: 0; }
+.plot { min-width: 0; position: relative; }
+.plot svg { display: block; width: 100%; overflow: visible; }
+
+/* The status tape: one lane per probe — the board's single bold element. */
+.tape {
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 0.75rem 1rem 0.5rem;
+  margin-bottom: 1.5rem;
+}
+.tape-head { color: var(--ink-soft); font-size: 0.85rem; margin: 0 0 0.25rem; }
+.lane { padding: 0.15rem 0; }
+.lane .gutter {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.9rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.lane-svg { height: 1.25rem; }
+.axis-svg { height: 1.25rem; }
+
+.seg-healthy { fill: var(--ok); }
+.seg-degraded { fill: var(--warn); }
+.seg-unhealthy { fill: var(--bad); }
+.seg-gap { fill: var(--grid); }
+.tick-mark { stroke: var(--ink); stroke-width: 1.5; }
+
+.status-chip { width: 0.6rem; height: 0.6rem; border-radius: 2px; flex: none; background: var(--ok); }
+.status-chip.degraded { background: var(--warn); }
+.status-chip.unhealthy { background: var(--bad); }
+
+.section-title { color: var(--ink-soft); font-size: 0.9rem; margin: 0 0 0.5rem; }
+
+/* Probe rows */
+.probe-card {
+  padding: 1rem 0;
+  border-top: 1px solid var(--rule);
+}
+.probe-card .gutter { display: flex; flex-direction: column; gap: 0.3rem; }
+.probe-name-group { display: flex; flex-direction: column; gap: 0.2rem; }
+.probe-name { font-weight: 600; overflow-wrap: anywhere; }
+.probe-description { color: var(--ink-soft); font-size: 0.85rem; }
+.probe-tags { display: flex; flex-wrap: wrap; gap: 0.25rem; }
+.probe-tag { font-size: 0.75rem; color: var(--ink-soft); border: 1px solid var(--rule); border-radius: 999px; padding: 0 0.45rem; }
+.probe-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
+.probe-latency { color: var(--ink-soft); font-size: 0.85rem; }
+.probe-error { color: var(--ink); font-size: 0.85rem; overflow-wrap: anywhere; border-left: 3px solid var(--bad); padding-left: 0.45rem; }
+.probe-timestamps { color: var(--ink-faint); font-size: 0.8rem; }
+
+/* Status reads from the label; the color is a marker, never the text itself. */
+.badge { font-size: 0.75rem; font-weight: 600; padding: 0.05rem 0.5rem 0.05rem 0.4rem; border-radius: 4px; color: var(--ink); display: inline-flex; align-items: center; gap: 0.3rem; }
+.badge-status::before { content: ""; width: 0.5rem; height: 0.5rem; border-radius: 50%; }
+.badge-healthy { background: var(--ok-soft); }
+.badge-healthy::before { background: var(--ok); }
+.badge-degraded { background: var(--warn-soft); }
+.badge-degraded::before { background: var(--warn); }
+.badge-unhealthy { background: var(--bad-soft); }
+.badge-unhealthy::before { background: var(--bad); }
+.badge-optional { color: var(--ink-faint); border: 1px solid var(--rule); }
+
+.charts { display: grid; gap: 0.75rem; }
+.chart { margin: 0; }
+.chart[hidden] { display: none; }
+.chart figcaption { font-size: 0.8rem; color: var(--ink-soft); margin-bottom: 0.15rem; display: flex; gap: 0.75rem; flex-wrap: wrap; }
+.chart svg { height: var(--chart-h); }
+.legend-key { display: inline-flex; align-items: center; gap: 0.3rem; }
+.legend-key::before { content: ""; width: 1.1rem; height: 0; border-top: 3px solid var(--series-1); }
+.charts-empty { color: var(--ink-faint); font-size: 0.85rem; align-self: center; }
+
+.grid-line { stroke: var(--grid); stroke-width: 1; }
+.axis-label { fill: var(--ink-faint); font-size: 10px; }
+.line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.line-latency, .line-rpm, .line-error { stroke: var(--series-1); }
+/* Each percentile also has its own dash, so identity never rests on color. */
+.line-p50 { stroke: var(--p50); }
+.line-p95 { stroke: var(--p95); stroke-dasharray: 7 4; }
+.line-p99 { stroke: var(--p99); stroke-dasharray: 1.5 4; }
+.area-error { fill: var(--series-1); fill-opacity: 0.14; stroke: none; }
+.direct-label { fill: var(--ink-soft); font-size: 10px; }
+/* Legend text stays ink; the swatch carries the series color. */
+.legend-key { color: var(--ink-soft); }
+.legend-p50::before { border-top-color: var(--p50); }
+.legend-p95::before { border-top: 3px dashed var(--p95); }
+.legend-p99::before { border-top: 3px dotted var(--p99); }
+.threshold { stroke-width: 1; stroke-dasharray: 4 3; }
+.threshold-warn { stroke: var(--warn); }
+.threshold-fail { stroke: var(--bad); }
+.xhair { stroke: var(--ink-soft); stroke-width: 1; pointer-events: none; }
+
+.chart-tooltip {
+  position: fixed;
+  z-index: 10;
+  pointer-events: none;
+  background: var(--surface);
+  color: var(--ink);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: 0.35rem 0.55rem;
+  font-size: 0.8rem;
+  line-height: 1.35;
+  max-width: 20rem;
+}
+.chart-tooltip[hidden] { display: none; }
+.chart-tooltip .tt-time { color: var(--ink-faint); }
+
+.probe-fields { margin-top: 0.5rem; grid-column: 2; }
+.probe-fields summary { cursor: pointer; color: var(--ink-soft); font-size: 0.85rem; }
+.details-table, .routes-table { border-collapse: collapse; font-size: 0.82rem; margin-top: 0.4rem; }
+.details-table td, .routes-table td, .routes-table th { padding: 0.15rem 0.75rem 0.15rem 0; text-align: left; vertical-align: top; }
+.details-table td:first-child, .routes-table th { color: var(--ink-soft); font-weight: 500; }
+.routes-table td:first-child { overflow-wrap: anywhere; }
+.error-count-btn { cursor: pointer; text-decoration: underline dotted; }
+
+/* Routes */
+.routes { margin-top: 1.5rem; }
+.routes .board-row { padding: 0.6rem 0; border-top: 1px solid var(--rule); }
+.route-path { font-weight: 600; overflow-wrap: anywhere; font-size: 0.9rem; }
+.route-stats { color: var(--ink-soft); font-size: 0.8rem; }
+
+/* Reference + footer */
+.glossary-details { margin-top: 2rem; color: var(--ink-soft); font-size: 0.85rem; }
+.glossary-details summary { cursor: pointer; }
+.glossary-table { border-collapse: collapse; margin-top: 0.5rem; }
+.glossary-table td, .glossary-table th { padding: 0.2rem 1rem 0.2rem 0; text-align: left; vertical-align: top; }
+.footer { margin-top: 2rem; color: var(--ink-faint); font-size: 0.85rem; }
+.footer a { color: var(--ink-soft); }
+
+.error-tooltip-popup {
+  display: none;
+  position: fixed;
+  z-index: 11;
+  max-width: 26rem;
+  background: var(--surface);
+  color: var(--ink);
+  border: 1px solid var(--bad);
+  border-radius: 6px;
+  padding: 0.5rem 0.65rem;
+  font-size: 0.82rem;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 45rem) {
+  .header { padding: 1rem; }
+  .controls, .content { padding-left: 1rem; padding-right: 1rem; }
+  .header-right { align-items: flex-start; }
+  .board-row { grid-template-columns: minmax(0, 1fr); gap: 0.4rem; }
+  .lane .gutter { font-size: 0.8rem; }
+  .probe-fields { grid-column: 1; }
+  .status-badge { font-size: 1.4rem; }
+  .probe-search { flex-basis: 100%; max-width: none; }
+}

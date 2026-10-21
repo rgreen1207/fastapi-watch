@@ -996,19 +996,19 @@ class HealthRegistry:
     async def _run_probe(self, probe: BaseProbe, critical: bool) -> ProbeResult:
         """Check one probe, then record its result, history, and state change exactly once."""
         result = await self._safe_check(probe, critical)
-        updates: dict = {}
+        checked_at = datetime.now(self._tzinfo)
+        updates: dict = {"checked_at": checked_at}
         if getattr(probe, "description", None) is not None and result.description is None:
             updates["description"] = probe.description
         probe_tags = getattr(probe, "tags", None) or []
         if probe_tags and not result.tags:
             updates["tags"] = probe_tags
-        if updates:
-            result = result.model_copy(update=updates)
+        result = result.model_copy(update=updates)
         run_time = asyncio.get_running_loop().time()
         async with self._cache_lock:
             await self._storage.set_latest(result)
             self._probe_last_run[result.name] = run_time
-            self._last_checked_at = datetime.now(self._tzinfo)
+            self._last_checked_at = checked_at
         await self._storage.append_history(result)
         await self._fire_state_changes([result])
         return result
@@ -1818,20 +1818,23 @@ class HealthRegistry:
                 return JSONResponse({"active": False, "until": None})
 
         if dashboard is not False:
+            # Only the built-in page charts history; don't make custom renderers
+            # pay for a (possibly remote) history read on every page load.
+            builtin_dashboard = dashboard is True
             if callable(dashboard):
                 user_renderer = dashboard
                 # The documented form is (report) -> str; 1.7.1 always passed
                 # (report, maintenance), so keep honoring renderers written that way.
                 pass_maintenance = _takes_two_positional(user_renderer)
 
-                def _renderer(report: HealthReport, maintenance: bool, request: Request) -> str:
+                def _renderer(report: HealthReport, maintenance: bool, request: Request, history: dict | None) -> str:
                     return user_renderer(report, maintenance) if pass_maintenance else user_renderer(report)
             elif isinstance(dashboard, (str, Path)):
                 dashboard_path = Path(dashboard).resolve()
                 if dashboard_path.suffix in (".html", ".htm"):
                     _html_content = dashboard_path.read_text(encoding="utf-8")
 
-                    def _renderer(report: HealthReport, maintenance: bool, request: Request) -> str:
+                    def _renderer(report: HealthReport, maintenance: bool, request: Request, history: dict | None) -> str:
                         return _html_content
                 else:
                     raise ValueError(
@@ -1840,14 +1843,14 @@ class HealthRegistry:
                     )
             else:
 
-                def _renderer(report: HealthReport, maintenance: bool, request: Request) -> str:
+                def _renderer(report: HealthReport, maintenance: bool, request: Request, history: dict | None) -> str:
                     # root_path carries any mount or proxy prefix the app is served
                     # under; without it the page would stream from the wrong URL.
                     root_path = request.scope.get("root_path", "").rstrip("/")
                     stream_url = f"{root_path}{prefix}/status/stream"
                     if token_key is not None:
                         stream_url += f"?token={_mint_stream_token(token_key)}"
-                    return render_dashboard(report, stream_url=stream_url, maintenance_banner=maintenance)
+                    return render_dashboard(report, stream_url=stream_url, maintenance_banner=maintenance, history=history)
 
             @self.app.get(
                 f"{prefix}/dashboard",
@@ -1864,4 +1867,5 @@ class HealthRegistry:
                     checked_at=registry._last_checked_at,
                     timezone=registry._timezone_name,
                 )
-                return HTMLResponse(content=_renderer(report, registry._in_maintenance(), request))
+                history = await registry._storage.get_history() if builtin_dashboard else None
+                return HTMLResponse(content=_renderer(report, registry._in_maintenance(), request, history))

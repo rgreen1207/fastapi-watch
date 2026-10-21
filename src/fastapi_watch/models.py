@@ -20,6 +20,9 @@ class ProbeResult(BaseModel):
     description: str | None = None
     tags: list[str] = Field(default_factory=list)
     details: dict[str, Any] | None = None
+    # When the registry recorded this result; lets history and live updates be
+    # plotted over time.  Set by the registry, not by probes.
+    checked_at: datetime | None = None
 
     @property
     def is_healthy(self) -> bool:

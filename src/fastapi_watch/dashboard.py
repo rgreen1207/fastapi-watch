@@ -2,14 +2,18 @@
 
 :func:`render_dashboard` produces a single self-contained HTML page from a
 :class:`~fastapi_watch.models.HealthReport`.  The page auto-refreshes via a
-Server-Sent Events stream so probe cards update in real-time without a full
-page reload.
+Server-Sent Events stream so probe rows and charts update in real time without
+a full page reload.  The page is an aligned timeboard: a status tape (one lane
+per probe) above per-probe latency, error-rate, and throughput charts, all on a
+shared time axis, drawn as inline SVG with no external assets.
 
 The dashboard is enabled by default in :class:`~fastapi_watch.HealthRegistry`
 and served at ``<prefix>/dashboard``.  Pass ``dashboard=False`` to disable it,
 or pass a custom renderer callable to replace the default design.
 """
 import html as _html
+import json
+from importlib.resources import files
 from typing import Any
 
 from .models import HealthReport, ProbeResult, ProbeStatus
@@ -143,819 +147,14 @@ def _fmt_detail_key(key: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# CSS
+# Assets — shipped as package files, inlined so the page stays self-contained
 # ---------------------------------------------------------------------------
 
-_CSS = """
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-body {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  font-size: 14px;
-  background: #f1f5f9;
-  color: #1e293b;
-  min-height: 100vh;
-}
-
-/* ── Header ─────────────────────────────────────────────────── */
-
-.header {
-  padding: 28px 32px 24px;
-  transition: background 0.4s;
-}
-.header.healthy   { background: #15803d; }
-.header.degraded  { background: #b45309; }
-.header.unhealthy { background: #b91c1c; }
-
-.maintenance-banner {
-  background: #fef3c7;
-  color: #92400e;
-  border-bottom: 1px solid #fde68a;
-  text-align: center;
-  font-size: 13px;
-  font-weight: 600;
-  padding: 10px 16px;
-  letter-spacing: .01em;
-}
-
-.header-inner {
-  max-width: 1200px;
-  margin: 0 auto;
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 24px;
-}
-
-.header-left {}
-
-.status-label {
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: .1em;
-  text-transform: uppercase;
-  color: rgba(255,255,255,.65);
-  margin-bottom: 6px;
-}
-
-.status-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 26px;
-  font-weight: 700;
-  color: #fff;
-  letter-spacing: -.02em;
-}
-
-.status-dot {
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  background: #fff;
-  flex-shrink: 0;
-}
-.healthy  .status-dot { box-shadow: 0 0 0 4px rgba(255,255,255,.25); }
-.degraded .status-dot { animation: pulse-amber 1.4s ease-in-out infinite; }
-.unhealthy .status-dot { animation: pulse-red 1.4s ease-in-out infinite; }
-
-@keyframes pulse-amber {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(255,255,255,.5); }
-  50%       { box-shadow: 0 0 0 7px rgba(255,255,255,0); }
-}
-
-@keyframes pulse-red {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(255,255,255,.5); }
-  50%       { box-shadow: 0 0 0 7px rgba(255,255,255,0); }
-}
-
-.status-subtitle {
-  margin-top: 6px;
-  font-size: 13px;
-  color: rgba(255,255,255,.7);
-}
-
-.header-right {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 8px;
-  padding-top: 4px;
-}
-
-.live-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  font-weight: 600;
-  color: rgba(255,255,255,.8);
-  background: rgba(255,255,255,.12);
-  border: 1px solid rgba(255,255,255,.2);
-  border-radius: 999px;
-  padding: 4px 12px;
-}
-
-.live-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: rgba(255,255,255,.5);
-  transition: background .3s;
-}
-.live-dot.connected {
-  background: #4ade80;
-  animation: pulse-live 2s ease-in-out infinite;
-}
-@keyframes pulse-live {
-  0%, 100% { opacity: 1; }
-  50%       { opacity: .5; }
-}
-
-.checked-at {
-  font-size: 12px;
-  color: rgba(255,255,255,.55);
-}
-
-/* ── Probe grid ──────────────────────────────────────────────── */
-
-.content {
-  max-width: 1200px;
-  margin: 32px auto;
-  padding: 0 32px 48px;
-}
-
-.section-title {
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: .08em;
-  text-transform: uppercase;
-  color: #64748b;
-  margin-bottom: 14px;
-}
-
-.routes-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-.routes-table th, .routes-table td { text-align: left; padding: 2px 6px; white-space: nowrap; }
-.routes-table th { color: #64748b; font-weight: 600; }
-.routes-table td:first-child { white-space: normal; word-break: break-all; }
-
-.probe-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-  gap: 16px;
-}
-
-/* ── Probe card ──────────────────────────────────────────────── */
-
-.probe-card {
-  background: #fff;
-  border-radius: 10px;
-  border: 1px solid #e2e8f0;
-  border-left-width: 4px;
-  overflow: hidden;
-  transition: border-left-color .3s;
-}
-.probe-card.healthy   { border-left-color: #16a34a; }
-.probe-card.degraded  { border-left-color: #d97706; }
-.probe-card.unhealthy { border-left-color: #dc2626; }
-
-.probe-card-header {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 14px 16px 10px;
-}
-
-.probe-indicator {
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  flex-shrink: 0;
-  transition: background .3s;
-}
-.probe-card.healthy   .probe-indicator { background: #16a34a; }
-.probe-card.degraded  .probe-indicator { background: #d97706; }
-.probe-card.unhealthy .probe-indicator { background: #dc2626; }
-
-.probe-name-group {
-  flex: 1;
-  min-width: 0;
-}
-
-.probe-name {
-  font-weight: 600;
-  font-size: 15px;
-  color: #0f172a;
-}
-
-.probe-description {
-  font-size: 11px;
-  color: #64748b;
-  margin-top: 1px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.probe-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 3px;
-  margin-top: 4px;
-}
-.probe-tag {
-  font-size: 10px;
-  padding: 1px 7px;
-  border-radius: 10px;
-  background: #e2e8f0;
-  color: #475569;
-  font-weight: 500;
-}
-
-.tag-filter {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-  margin-bottom: 14px;
-}
-.tag-filter-label {
-  font-size: 11px;
-  font-weight: 600;
-  color: #94a3b8;
-  text-transform: uppercase;
-  letter-spacing: .06em;
-  margin-right: 2px;
-}
-.tag-filter-btn {
-  font-size: 11px;
-  padding: 3px 10px;
-  border-radius: 12px;
-  border: 1px solid #cbd5e1;
-  background: #f8fafc;
-  color: #475569;
-  cursor: pointer;
-  font-weight: 500;
-  transition: background .12s, border-color .12s, color .12s;
-}
-.tag-filter-btn:hover {
-  background: #e2e8f0;
-  border-color: #94a3b8;
-}
-.tag-filter-btn.active {
-  background: #1e40af;
-  border-color: #1e40af;
-  color: #fff;
-}
-.tag-filter-clear {
-  font-size: 11px;
-  padding: 3px 10px;
-  border-radius: 12px;
-  border: 1px solid transparent;
-  background: transparent;
-  color: #94a3b8;
-  cursor: pointer;
-  font-weight: 500;
-  display: none;
-}
-.tag-filter-clear.visible {
-  display: inline-block;
-}
-.tag-filter-clear:hover {
-  color: #475569;
-}
-
-.probe-search {
-  width: 100%;
-  max-width: 320px;
-  padding: 6px 12px;
-  border: 1px solid #cbd5e1;
-  border-radius: 8px;
-  font-size: 13px;
-  color: #1e293b;
-  background: #f8fafc;
-  margin-bottom: 10px;
-  outline: none;
-  box-sizing: border-box;
-}
-.probe-search:focus {
-  border-color: #94a3b8;
-  background: #fff;
-}
-
-.badge {
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: .05em;
-  text-transform: uppercase;
-  border-radius: 4px;
-  padding: 2px 6px;
-}
-.badge-optional {
-  background: #f1f5f9;
-  color: #64748b;
-  border: 1px solid #e2e8f0;
-}
-.badge-healthy {
-  background: #dcfce7;
-  color: #15803d;
-}
-.badge-degraded {
-  background: #fef3c7;
-  color: #92400e;
-}
-.badge-unhealthy {
-  background: #fee2e2;
-  color: #b91c1c;
-}
-
-.probe-latency {
-  font-size: 12px;
-  font-weight: 600;
-  color: #3b82f6;
-  background: #eff6ff;
-  border-radius: 4px;
-  padding: 2px 7px;
-  white-space: nowrap;
-}
-
-.probe-error {
-  margin: 0 16px 12px;
-  padding: 8px 10px;
-  font-size: 12px;
-  color: #991b1b;
-  background: #fff5f5;
-  border: 1px solid #fecaca;
-  border-radius: 6px;
-  font-family: ui-monospace, monospace;
-  word-break: break-word;
-}
-
-/* ── Details table ───────────────────────────────────────────── */
-
-.details-table {
-  width: 100%;
-  border-collapse: collapse;
-  border-top: 1px solid #f1f5f9;
-}
-.details-table tr:not(:last-child) td {
-  border-bottom: 1px solid #f8fafc;
-}
-.details-table td {
-  padding: 6px 16px;
-  font-size: 12.5px;
-  vertical-align: top;
-}
-.details-table td:first-child {
-  color: #64748b;
-  width: 55%;
-  padding-right: 8px;
-}
-.details-table td:last-child {
-  color: #0f172a;
-  font-weight: 500;
-  word-break: break-all;
-}
-.details-table tr:last-child td {
-  padding-bottom: 14px;
-}
-
-/* ── Field glossary ──────────────────────────────────────────── */
-
-.glossary-details {
-  margin: 20px 0 8px;
-  background: #fff;
-  border-radius: 10px;
-  border: 1px solid #e2e8f0;
-  overflow: hidden;
-}
-
-.glossary-details summary {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 11px 16px;
-  cursor: pointer;
-  user-select: none;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: .08em;
-  text-transform: uppercase;
-  color: #64748b;
-  list-style: none;
-}
-.glossary-details summary::-webkit-details-marker { display: none; }
-.glossary-details summary::before {
-  content: '▶';
-  font-size: 9px;
-  transition: transform .2s;
-  color: #94a3b8;
-}
-.glossary-details[open] summary::before {
-  transform: rotate(90deg);
-}
-.glossary-details summary:hover {
-  background: #f8fafc;
-  color: #475569;
-}
-
-.glossary-table {
-  width: 100%;
-  border-collapse: collapse;
-  border-top: 1px solid #e2e8f0;
-}
-.glossary-table th {
-  text-align: left;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: .06em;
-  text-transform: uppercase;
-  color: #64748b;
-  background: #f8fafc;
-  padding: 8px 16px;
-  border-bottom: 1px solid #e2e8f0;
-}
-.glossary-table td {
-  padding: 7px 16px;
-  font-size: 12.5px;
-  vertical-align: top;
-  border-bottom: 1px solid #f1f5f9;
-}
-.glossary-table tr:last-child td {
-  border-bottom: none;
-  padding-bottom: 12px;
-}
-.glossary-table td:first-child {
-  width: 22%;
-  font-family: ui-monospace, monospace;
-  font-size: 12px;
-  color: #3b82f6;
-  white-space: nowrap;
-}
-.glossary-table td:last-child {
-  color: #475569;
-}
-
-/* ── Probe timestamps ────────────────────────────────────────── */
-
-.probe-timestamps {
-  padding: 0 16px 8px;
-  font-size: 11px;
-  color: #94a3b8;
-  display: flex;
-  gap: 14px;
-  flex-wrap: wrap;
-}
-
-/* ── Error count tooltip ─────────────────────────────────────── */
-
-.error-count-btn {
-  cursor: pointer;
-  color: #dc2626;
-  text-decoration: underline dotted;
-  font-weight: 600;
-}
-.error-count-btn:hover { color: #991b1b; }
-
-.error-tooltip-popup {
-  display: none;
-  position: fixed;
-  z-index: 9999;
-  background: #1e293b;
-  color: #f1f5f9;
-  font-size: 12px;
-  font-family: ui-monospace, monospace;
-  padding: 10px 14px;
-  border-radius: 7px;
-  max-width: 420px;
-  word-break: break-word;
-  box-shadow: 0 4px 24px rgba(0,0,0,.4);
-  pointer-events: none;
-  white-space: pre-wrap;
-  line-height: 1.5;
-}
-
-/* ── Footer ──────────────────────────────────────────────────── */
-
-.footer {
-  text-align: center;
-  font-size: 11px;
-  color: #94a3b8;
-  padding: 16px 0 32px;
-}
-.footer a {
-  color: #64748b;
-  text-decoration: none;
-}
-.footer a:hover { text-decoration: underline; }
-
-/* ── Responsive ──────────────────────────────────────────────── */
-
-@media (max-width: 600px) {
-  .header { padding: 20px 16px 18px; }
-  .header-inner { flex-direction: column; gap: 12px; }
-  .header-right { align-items: flex-start; }
-  .content { padding: 0 16px 32px; margin-top: 20px; }
-  .probe-grid { grid-template-columns: 1fr; }
-  .glossary-table td:first-child { width: 35%; white-space: normal; }
-}
-"""
-
-# ---------------------------------------------------------------------------
-# JavaScript
-# ---------------------------------------------------------------------------
-
-_JS = r"""
-(function () {
-  var streamUrl = document.body.getAttribute('data-stream-url');
-  if (!streamUrl) return;
-
-  var liveDot  = document.getElementById('live-dot');
-  var header   = document.querySelector('.header');
-  var badge    = document.getElementById('status-badge-text');
-  var subtitle = document.getElementById('status-subtitle');
-  var checkedEl = document.getElementById('checked-at');
-
-  var H_COLOR  = '#15803d';
-  var D_COLOR  = '#b45309';
-  var U_COLOR  = '#b91c1c';
-  var H_LABEL  = 'All Systems Operational';
-  var D_LABEL  = 'Degraded — one or more probes warning';
-  var U_LABEL  = 'Unhealthy — one or more probes failing';
-
-  function fmtMs(val) {
-    if (val == null) return '—';
-    return parseFloat(val).toFixed(2) + ' ms';
-  }
-
-  function fmtDetailVal(key, val) {
-    if (val == null) return '—';
-    if (key === 'error_rate') return (parseFloat(val) * 100).toFixed(2) + '%';
-    if (key.endsWith('_ms') && typeof val === 'number') return val.toFixed(2) + ' ms';
-    if (typeof val === 'boolean') return val ? 'yes' : 'no';
-    if (typeof val === 'number') {
-      return val.toFixed(4).replace(/\.?0+$/, '');
-    }
-    if (key === 'circuit_breaker' && typeof val === 'object' && val !== null) {
-      var failures = val.consecutive_failures || 0;
-      var trips = val.trips_total || 0;
-      var tripStr = trips ? ', ' + trips + ' trip' + (trips !== 1 ? 's' : '') + ' total' : '';
-      if (val.open) {
-        return 'open \u2014 suspended (' + failures + ' consecutive failure' + (failures !== 1 ? 's' : '') + tripStr + ')';
-      }
-      return 'closed' + tripStr;
-    }
-    if ((key === 'status_distribution' || key === 'error_types') && typeof val === 'object' && val !== null) {
-      return Object.keys(val).sort().map(function(dictKey) { return escAttr(dictKey) + ': ' + escAttr(String(val[dictKey])); }).join(', ');
-    }
-    if (key === 'routes' && typeof val === 'object' && val !== null) return routesTable(val);
-    if (typeof val === 'object') return '—';
-    return escAttr(String(val));
-  }
-
-  // Mirrors the server-side _routes_table() so live updates match the first render.
-  function routesTable(routes) {
-    var paths = Object.keys(routes).sort();
-    if (!paths.length) return '—';
-    var rows = paths.map(function(path) {
-      var s = routes[path] || {};
-      return '<tr><td>' + escAttr(path) + '</td><td>' + escAttr(String(s.request_count || 0)) +
-        '</td><td>' + escAttr(String(s.error_count || 0)) + '</td><td>' + fmtDetailVal('error_rate', s.error_rate) +
-        '</td><td>' + fmtDetailVal('p95_rtt_ms', s.p95_rtt_ms) + '</td></tr>';
-    }).join('');
-    return '<table class="routes-table"><thead><tr><th>Route</th><th>Requests</th><th>Errors</th>' +
-      '<th>Error rate</th><th>p95</th></tr></thead><tbody>' + rows + '</tbody></table>';
-  }
-
-  function summaryText(probes) {
-    var total = probes.length, healthy = 0, degraded = 0;
-    probes.forEach(function(p) {
-      if (p.status === 'healthy') healthy++;
-      else if (p.status === 'degraded') degraded++;
-    });
-    var unhealthy = total - healthy - degraded;
-    var noun = 'probe' + (total !== 1 ? 's' : '');
-    if (degraded || unhealthy) {
-      return healthy + ' healthy, ' + degraded + ' degraded, ' + unhealthy + ' unhealthy / ' + total + ' ' + noun;
-    }
-    return healthy + ' / ' + total + ' ' + noun + ' healthy';
-  }
-
-  // Cards are server-rendered; when the set of probes changes (one added or
-  // removed after page load) reload once to pick it up.  The timestamp guard
-  // stops a reload loop should the page and stream ever disagree.
-  function probeSetChanged(probes) {
-    var shown = Array.prototype.map.call(document.querySelectorAll('.probe-card'), function(c) {
-      return c.getAttribute('data-probe');
-    }).sort().join('\n');
-    return shown !== probes.map(function(p) { return p.name; }).sort().join('\n');
-  }
-
-  // At most one reload per 30 s (across reloads, via sessionStorage), and a
-  // reload asked for inside that window is deferred rather than dropped.
-  var reloadPending = false;
-  function reloadPage() {
-    if (reloadPending) return;
-    reloadPending = true;
-    var key = 'fastapi-watch-reloaded-at', last = 0;
-    try { last = parseInt(sessionStorage.getItem(key) || '0', 10); } catch (_) {}
-    setTimeout(function () {
-      try { sessionStorage.setItem(key, String(Date.now())); } catch (_) {}
-      window.location.reload();
-    }, Math.max(0, 30000 - (Date.now() - last)));
-  }
-
-  function statusLabel(status) {
-    return status === 'healthy' ? 'Healthy' : status === 'degraded' ? 'Degraded' : 'Unhealthy';
-  }
-  function statusBadgeCls(status) {
-    return status === 'healthy' ? 'badge-healthy' : status === 'degraded' ? 'badge-degraded' : 'badge-unhealthy';
-  }
-
-  function escAttr(s) {
-    return String(s)
-      .replace(/&/g, '&amp;')
-      .replace(/"/g, '&quot;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;');
-  }
-
-  function updateCard(probe) {
-    var card = document.querySelector('[data-probe="' + probe.name + '"]');
-    if (!card) return;
-
-    card.className = 'probe-card ' + probe.status;
-
-    var badgeEl = card.querySelector('.badge-status');
-    if (badgeEl) {
-      badgeEl.textContent = statusLabel(probe.status);
-      badgeEl.className = 'badge badge-status ' + statusBadgeCls(probe.status);
-    }
-
-    var latEl = card.querySelector('.probe-latency');
-    if (latEl) latEl.textContent = probe.latency_ms ? fmtMs(probe.latency_ms) : '—';
-
-    var errEl = card.querySelector('.probe-error');
-    if (errEl) {
-      errEl.textContent = probe.error || '';
-      errEl.style.display = probe.error ? '' : 'none';
-    }
-
-    var tsEl = card.querySelector('.probe-timestamps');
-    if (tsEl && probe.details) {
-      var tsParts = [];
-      if (probe.details.last_error_at) {
-        tsParts.push('last error: ' + String(probe.details.last_error_at).slice(0, 19).replace('T', ' ') + ' UTC');
-      }
-      if (probe.details.last_success_at) {
-        tsParts.push('last success: ' + String(probe.details.last_success_at).slice(0, 19).replace('T', ' ') + ' UTC');
-      }
-      tsEl.innerHTML = tsParts.join(' &bull; ');
-      tsEl.style.display = tsParts.length ? '' : 'none';
-    }
-
-    var tbody = card.querySelector('.details-table tbody');
-    if (tbody && probe.details) {
-      var lastErr = probe.details.last_error || null;
-      var TS_KEYS = {last_error: 1, last_error_at: 1, last_success_at: 1};
-      var rows = '';
-      Object.entries(probe.details).forEach(function(entry) {
-        var key = entry[0], val = entry[1];
-        if (val == null || TS_KEYS[key]) return;
-        var label;
-        if (key === 'error_count' && typeof val === 'number' && val > 0 && lastErr) {
-          label = '<span class="error-count-btn" data-error="' + escAttr(lastErr) + '" tabindex="0">Error Count &#9658;</span>';
-        } else {
-          label = escAttr(key.replace(/_/g, ' ').replace(/\b\w/g, function(char) { return char.toUpperCase(); }));
-        }
-        rows += '<tr><td>' + label + '</td><td>' + fmtDetailVal(key, val) + '</td></tr>';
-      });
-      tbody.innerHTML = rows;
-    }
-  }
-
-  function applyReport(report) {
-    var ok  = report.status === 'healthy';
-    var deg = report.status === 'degraded';
-
-    header.className = 'header ' + report.status;
-    header.style.background = ok ? H_COLOR : (deg ? D_COLOR : U_COLOR);
-    if (badge)    badge.textContent    = ok ? 'All Systems Operational' : (deg ? 'Degraded' : 'Unhealthy');
-    if (subtitle) subtitle.textContent = ok ? H_LABEL : (deg ? D_LABEL : U_LABEL);
-
-    if (checkedEl && report.checked_at) {
-      var tz = report.timezone || 'UTC';
-      checkedEl.textContent = 'Last checked ' + report.checked_at.replace('T', ' ').slice(0, 19) + ' ' + tz;
-    }
-
-    var probes = report.probes || [];
-    var summaryEl = document.getElementById('probe-summary');
-    if (summaryEl) summaryEl.textContent = summaryText(probes);
-    if (probeSetChanged(probes)) reloadPage();
-    probes.forEach(updateCard);
-  }
-
-  // Combined filter: tags + search text
-  var activeTags = new Set();
-  var searchQuery = '';
-
-  function applyFilters() {
-    var cards = document.querySelectorAll('.probe-card');
-    cards.forEach(function(card) {
-      var tagOk = activeTags.size === 0 || (function() {
-        var cardTags = (card.getAttribute('data-tags') || '').split(',').filter(Boolean);
-        return cardTags.some(function(t) { return activeTags.has(t); });
-      })();
-      var searchOk = searchQuery === '' ||
-        (card.getAttribute('data-name') || '').toLowerCase().indexOf(searchQuery) !== -1;
-      card.style.display = (tagOk && searchOk) ? '' : 'none';
-    });
-  }
-
-  // Tag filter
-  var tagFilterEl = document.getElementById('tag-filter');
-  if (tagFilterEl) {
-    var clearBtn = document.getElementById('tag-filter-clear');
-    function syncClearBtn() {
-      if (clearBtn) clearBtn.className = activeTags.size ? 'tag-filter-clear visible' : 'tag-filter-clear';
-    }
-    tagFilterEl.addEventListener('click', function(e) {
-      var btn = e.target.closest('.tag-filter-btn');
-      if (!btn) return;
-      var tag = btn.getAttribute('data-tag');
-      if (activeTags.has(tag)) { activeTags.delete(tag); btn.classList.remove('active'); }
-      else { activeTags.add(tag); btn.classList.add('active'); }
-      applyFilters();
-      syncClearBtn();
-    });
-    if (clearBtn) {
-      clearBtn.addEventListener('click', function() {
-        activeTags.clear();
-        tagFilterEl.querySelectorAll('.tag-filter-btn').forEach(function(b) { b.classList.remove('active'); });
-        applyFilters();
-        syncClearBtn();
-      });
-    }
-  }
-
-  // Search box
-  var searchEl = document.getElementById('probe-search');
-  if (searchEl) {
-    searchEl.addEventListener('input', function() {
-      searchQuery = searchEl.value.trim().toLowerCase();
-      applyFilters();
-    });
-  }
-
-  // Error tooltip popup
-  var tooltipEl = document.createElement('div');
-  tooltipEl.id = 'error-tooltip';
-  tooltipEl.className = 'error-tooltip-popup';
-  document.body.appendChild(tooltipEl);
-
-  document.addEventListener('click', function (e) {
-    var btn = e.target.closest('.error-count-btn');
-    if (btn) {
-      var msg = btn.getAttribute('data-error') || '(no error message)';
-      tooltipEl.textContent = msg;
-      tooltipEl.style.display = 'block';
-      var btnRect = btn.getBoundingClientRect();
-      var top = btnRect.bottom + 8;
-      var left = Math.min(btnRect.left, window.innerWidth - 440);
-      tooltipEl.style.top = top + 'px';
-      tooltipEl.style.left = Math.max(8, left) + 'px';
-      e.stopPropagation();
-    } else {
-      tooltipEl.style.display = 'none';
-    }
-  });
-
-  document.addEventListener('keydown', function (e) {
-    if (e.key === 'Escape') tooltipEl.style.display = 'none';
-  });
-
-  var source = new EventSource(streamUrl);
-
-  source.onopen = function () {
-    if (liveDot) liveDot.className = 'live-dot connected';
-  };
-
-  source.onmessage = function (e) {
-    try { applyReport(JSON.parse(e.data)); } catch (_) {}
-  };
-
-  source.onerror = function () {
-    if (liveDot) liveDot.className = 'live-dot';
-    // CLOSED means the browser gave up (e.g. a non-200 such as an expired
-    // stream token); a fresh page load gets a new token and reconnects.
-    if (source.readyState === 2) reloadPage();
-  };
-})();
-"""
-
-# ---------------------------------------------------------------------------
-# Status label / badge lookups
-# ---------------------------------------------------------------------------
+_STATIC = files(__package__) / "static"
+_CSS = (_STATIC / "dashboard.css").read_text(encoding="utf-8")
+_JS = (_STATIC / "dashboard.js").read_text(encoding="utf-8")
+
+_RANGES = (("15m", "15 min"), ("1h", "1 hour"), ("2h", "2 hours"), ("all", "All"))
 
 _STATUS_LABEL = {
     ProbeStatus.HEALTHY: "Healthy",
@@ -967,77 +166,95 @@ _STATUS_BADGE_CLS = {
     ProbeStatus.DEGRADED: "badge-degraded",
     ProbeStatus.UNHEALTHY: "badge-unhealthy",
 }
-_STATUS_TEXT = {
-    ProbeStatus.HEALTHY: ("All Systems Operational", "All probes are passing."),
-    ProbeStatus.DEGRADED: ("Degraded", "One or more probes are warning."),
-    ProbeStatus.UNHEALTHY: ("Unhealthy", "One or more probes are failing."),
-}
+
+
+def _status_sentence(report: HealthReport) -> str:
+    """The header's plain-language answer; the page script refines it with durations."""
+    critical = [p for p in report.probes if p.critical]
+    for status, word in ((ProbeStatus.UNHEALTHY, "unhealthy"), (ProbeStatus.DEGRADED, "degraded")):
+        matching = [p.name for p in critical if p.status == status]
+        if len(matching) == 1:
+            return f"{matching[0]} {word}"
+        if matching:
+            return f"{len(matching)} probes {word}: {', '.join(matching)}"
+    count = len(report.probes)
+    return f"All {count} probe{'s' if count != 1 else ''} healthy" if count else "No probes registered"
+
+
+def _summary(report: HealthReport) -> str:
+    total = len(report.probes)
+    healthy = sum(1 for p in report.probes if p.is_healthy)
+    degraded = sum(1 for p in report.probes if p.is_degraded)
+    unhealthy = total - healthy - degraded
+    noun = f"probe{'s' if total != 1 else ''}"
+    if degraded or unhealthy:
+        return f"{healthy} healthy, {degraded} degraded, {unhealthy} unhealthy / {total} {noun}"
+    return f"{healthy} / {total} {noun} healthy"
+
+
+def _json_for_script(value: Any) -> str:
+    """JSON safe to embed in a ``<script type="application/json">`` element.
+
+    ``<``, ``>`` and ``&`` are escaped so no value — a probe error message, a
+    route path — can close the element or open a comment.
+    """
+    return (
+        json.dumps(value, default=str, separators=(",", ":"))
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
+
 
 # ---------------------------------------------------------------------------
-# Per-probe card renderer
+# Rows
 # ---------------------------------------------------------------------------
+
+def _lane(probe: ProbeResult) -> str:
+    tags_attr = _e(",".join(probe.tags))
+    return (
+        f'<div class="lane board-row" data-probe="{_e(probe.name)}" data-name="{_e(probe.name)}" data-tags="{tags_attr}">'
+        f'<div class="gutter"><span class="status-chip {probe.status.value}"></span>{_e(probe.name)}</div>'
+        f'<div class="plot"><svg class="lane-svg" aria-hidden="true"></svg></div>'
+        f"</div>"
+    )
+
 
 def _probe_card(probe: ProbeResult) -> str:
-    status_cls = probe.status.value
+    """One timeboard row: identity and current values in the gutter, charts in the plot column."""
     status_label = _STATUS_LABEL[probe.status]
     badge_cls = _STATUS_BADGE_CLS[probe.status]
-
     latency = f"{probe.latency_ms:.2f} ms" if probe.latency_ms else "—"
-
-    optional_badge = (
-        '<span class="badge badge-optional">optional</span>'
-        if not probe.critical else ""
-    )
-    status_badge = (
-        f'<span class="badge badge-status {badge_cls}">{status_label}</span>'
-    )
-
-    error_style = "" if probe.error else ' style="display:none"'
-    error_html = (
-        f'<div class="probe-error"{error_style}>{_e(probe.error or "")}</div>'
-    )
-
-    _TS_KEYS = {"last_error", "last_error_at", "last_success_at"}
+    optional_badge = '<span class="badge badge-optional">optional</span>' if not probe.critical else ""
 
     probe_details = probe.details or {}
     last_error = probe_details.get("last_error")
-    last_error_at = probe_details.get("last_error_at")
-    last_success_at = probe_details.get("last_success_at")
-
     ts_parts = []
-    if last_error_at:
-        ts_parts.append(f"last error: {str(last_error_at)[:19].replace('T', ' ')} UTC")
-    if last_success_at:
-        ts_parts.append(f"last success: {str(last_success_at)[:19].replace('T', ' ')} UTC")
-    ts_inner = " &bull; ".join(_e(p) for p in ts_parts)
+    if probe_details.get("last_error_at"):
+        ts_parts.append(f"last error: {str(probe_details['last_error_at'])[:19].replace('T', ' ')} UTC")
+    if probe_details.get("last_success_at"):
+        ts_parts.append(f"last success: {str(probe_details['last_success_at'])[:19].replace('T', ' ')} UTC")
     ts_style = "" if ts_parts else ' style="display:none"'
-    timestamps_html = f'<div class="probe-timestamps"{ts_style}>{ts_inner}</div>'
+    timestamps_html = f'<div class="probe-timestamps"{ts_style}>{" &bull; ".join(_e(p) for p in ts_parts)}</div>'
+    error_style = "" if probe.error else ' style="display:none"'
+    error_html = f'<div class="probe-error"{error_style}>{_e(probe.error or "")}</div>'
 
-    details_html = ""
-    if probe.details:
-        rows_parts = []
-        for k, v in probe.details.items():
-            if v is None or k in _TS_KEYS:
-                continue
-            if k == "error_count" and isinstance(v, int) and v > 0 and last_error:
-                key_cell = (
-                    f'<span class="error-count-btn" '
-                    f'data-error="{_e(last_error)}" tabindex="0">'
-                    f'Error Count &#9658;</span>'
-                )
-            else:
-                key_cell = _fmt_detail_key(k)
-            rows_parts.append(
-                f"<tr><td>{key_cell}</td><td>{_fmt_detail_value(k, v)}</td></tr>"
-            )
-        rows = "".join(rows_parts)
-        if rows:
-            details_html = f'<table class="details-table"><tbody>{rows}</tbody></table>'
-
-    description_html = (
-        f'<div class="probe-description">{_e(probe.description)}</div>'
-        if probe.description else ""
+    rows = []
+    for key, value in probe_details.items():
+        if value is None or key in ("last_error", "last_error_at", "last_success_at"):
+            continue
+        if key == "error_count" and isinstance(value, int) and value > 0 and last_error:
+            key_cell = f'<span class="error-count-btn" data-error="{_e(last_error)}" tabindex="0">Error Count &#9658;</span>'
+        else:
+            key_cell = _fmt_detail_key(key)
+        rows.append(f"<tr><td>{key_cell}</td><td>{_fmt_detail_value(key, value)}</td></tr>")
+    fields_html = (
+        f'<details class="probe-fields"><summary>All fields</summary>'
+        f'<table class="details-table"><tbody>{"".join(rows)}</tbody></table></details>'
+        if rows else ""
     )
+
+    description_html = f'<div class="probe-description">{_e(probe.description)}</div>' if probe.description else ""
     tags_html = ""
     if probe.tags:
         chips = "".join(f'<span class="probe-tag">{_e(t)}</span>' for t in probe.tags)
@@ -1045,38 +262,26 @@ def _probe_card(probe: ProbeResult) -> str:
     tags_attr = _e(",".join(probe.tags)) if probe.tags else ""
 
     return (
-        f'<div class="probe-card {status_cls}" data-probe="{_e(probe.name)}" data-name="{_e(probe.name)}" data-tags="{tags_attr}">'
-        f'  <div class="probe-card-header">'
-        f'    <div class="probe-indicator"></div>'
-        f'    <div class="probe-name-group">'
-        f'      <div class="probe-name">{_e(probe.name)}</div>'
-        f'      {description_html}'
-        f'      {tags_html}'
-        f'    </div>'
-        f'    {optional_badge}'
-        f'    <span class="probe-latency">{latency}</span>'
-        f'    {status_badge}'
-        f'  </div>'
-        f'  {timestamps_html}'
-        f'  {error_html}'
-        f'  {details_html}'
-        f'</div>'
+        f'<section class="probe-card {probe.status.value} board-row" data-probe="{_e(probe.name)}" '
+        f'data-name="{_e(probe.name)}" data-tags="{tags_attr}" aria-label="{_e(probe.name)}">'
+        f'<div class="gutter">'
+        f'<div class="probe-name-group"><div class="probe-name">{_e(probe.name)}</div>{description_html}{tags_html}</div>'
+        f'<div class="probe-meta"><span class="badge badge-status {badge_cls}">{status_label}</span>{optional_badge}'
+        f'<span class="probe-latency">{latency}</span></div>'
+        f"{error_html}{timestamps_html}"
+        f"</div>"
+        f'<div class="plot charts"><p class="charts-empty">Charts load with JavaScript.</p></div>'
+        f"{fields_html}"
+        f"</section>"
     )
 
 
 def _glossary_html() -> str:
-    rows = "".join(
-        f"<tr><td>{_e(key)}</td><td>{_e(desc)}</td></tr>"
-        for key, desc in _FIELD_GLOSSARY
-    )
+    rows = "".join(f"<tr><td>{_e(key)}</td><td>{_e(desc)}</td></tr>" for key, desc in _FIELD_GLOSSARY)
     return (
-        '<details class="glossary-details">'
-        "<summary>Field Reference</summary>"
-        '<table class="glossary-table">'
-        "<thead><tr><th>Field</th><th>Description</th></tr></thead>"
-        f"<tbody>{rows}</tbody>"
-        "</table>"
-        "</details>"
+        '<details class="glossary-details"><summary>Field reference</summary>'
+        '<table class="glossary-table"><thead><tr><th>Field</th><th>Description</th></tr></thead>'
+        f"<tbody>{rows}</tbody></table></details>"
     )
 
 
@@ -1088,101 +293,91 @@ def render_dashboard(
     report: HealthReport,
     stream_url: str,
     maintenance_banner: bool = False,
+    history: dict[str, list[ProbeResult]] | None = None,
 ) -> str:
-    header_cls = report.status.value
-    status_text, status_subtitle = _STATUS_TEXT[report.status]
+    """Render the dashboard page.
 
+    Args:
+        report: Current results, rendered server-side so the page is useful
+            before (and without) JavaScript.
+        stream_url: SSE endpoint the page subscribes to for live updates.
+        maintenance_banner: Show the maintenance-mode banner.
+        history: Recent results per probe (``HealthRegistry`` passes its
+            stored history); embedded so the charts have data on first paint.
+    """
+    checked_at_text = ""
     if report.checked_at:
-        tz = report.timezone or "UTC"
-        checked_at_str = report.checked_at.strftime("%Y-%m-%d %H:%M:%S")
-        checked_at_text = f"Last checked {checked_at_str} {tz}"
-    else:
-        checked_at_text = ""
-
-    probe_count = len(report.probes)
-    healthy_count = sum(1 for p in report.probes if p.is_healthy)
-    degraded_count = sum(1 for p in report.probes if p.is_degraded)
-    unhealthy_count = probe_count - healthy_count - degraded_count
-    if degraded_count or unhealthy_count:
-        summary = (
-            f"{healthy_count} healthy, {degraded_count} degraded, {unhealthy_count} unhealthy"
-            f" / {probe_count} probe{'s' if probe_count != 1 else ''}"
-        )
-    else:
-        summary = f"{healthy_count} / {probe_count} probe{'s' if probe_count != 1 else ''} healthy"
-
-    probe_cards = "\n".join(_probe_card(p) for p in report.probes)
+        checked_at_text = f"Last checked {report.checked_at.strftime('%Y-%m-%d %H:%M:%S')} {report.timezone or 'UTC'}"
 
     all_tags = sorted({t for p in report.probes for t in p.tags})
+    tag_filter_html = ""
     if all_tags:
-        btns = "".join(
-            f'<button class="tag-filter-btn" data-tag="{_e(t)}">{_e(t)}</button>'
-            for t in all_tags
-        )
+        buttons = "".join(f'<button class="tag-filter-btn" data-tag="{_e(t)}">{_e(t)}</button>' for t in all_tags)
         tag_filter_html = (
-            f'<div id="tag-filter" class="tag-filter">'
-            f'<span class="tag-filter-label">Filter</span>{btns}'
-            f'<button id="tag-filter-clear" class="tag-filter-clear">Clear</button>'
-            f'</div>'
+            f'<div id="tag-filter" class="tag-filter"><span class="tag-filter-label">Tags</span>{buttons}'
+            f'<button id="tag-filter-clear" class="tag-filter-clear">Clear</button></div>'
         )
-    else:
-        tag_filter_html = ""
-
-    maint_html = (
-        '<div class="maintenance-banner">&#128679; Scheduled maintenance in progress — '
-        'probe failures are suppressed.</div>'
-        if maintenance_banner
-        else ""
+    range_buttons = "".join(
+        f'<button type="button" data-range="{key}" aria-pressed="{"true" if key == "1h" else "false"}">{label}</button>'
+        for key, label in _RANGES
     )
+    maint_html = (
+        '<div class="maintenance-banner">Maintenance in progress — probe failures are not alerting.</div>'
+        if maintenance_banner else ""
+    )
+    data = {
+        "probes": [p.model_dump(mode="json") for p in report.probes],
+        "history": {name: [r.model_dump(mode="json") for r in results] for name, results in (history or {}).items()},
+    }
+    lanes = "".join(_lane(p) for p in report.probes)
+    cards = "\n".join(_probe_card(p) for p in report.probes)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Health Dashboard</title>
+  <title>Service health</title>
   <style>{_CSS}</style>
 </head>
 <body data-stream-url="{_e(stream_url)}">
-
   {maint_html}
-  <header class="header {header_cls}">
+  <header class="header {report.status.value}">
     <div class="header-inner">
       <div class="header-left">
-        <div class="status-label">System Status</div>
-        <div class="status-badge">
-          <div class="status-dot"></div>
-          <span id="status-badge-text">{status_text}</span>
-        </div>
-        <div class="status-subtitle" id="status-subtitle">{status_subtitle}</div>
+        <h1 class="status-badge" id="status-badge-text">{_e(_status_sentence(report))}</h1>
+        <p class="status-subtitle" id="status-subtitle">{_e(_summary(report))}</p>
       </div>
       <div class="header-right">
-        <div class="live-pill">
-          <div class="live-dot" id="live-dot"></div>
-          Live
-        </div>
+        <div class="live-pill"><span class="live-dot" id="live-dot"></span>Live</div>
         <div class="checked-at" id="checked-at">{_e(checked_at_text)}</div>
       </div>
     </div>
   </header>
-
-  <div class="content">
-    {_glossary_html()}
-    <input id="probe-search" class="probe-search" type="search" placeholder="Search probes…" autocomplete="off" />
+  <div class="controls">
+    <div class="range" role="group" aria-label="Time range">{range_buttons}</div>
+    <input id="probe-search" class="probe-search" type="search" placeholder="Filter probes" aria-label="Filter probes" autocomplete="off" />
     {tag_filter_html}
-    <div class="section-title" id="probe-summary">{summary}</div>
-    <div class="probe-grid">
-{probe_cards}
-    </div>
-
-    <div class="footer">
-      <a href="status">JSON status</a> &nbsp;·&nbsp;
-      <a href="history">History</a> &nbsp;·&nbsp;
-      <a href="ready">Readiness</a> &nbsp;·&nbsp;
-      <a href="metrics">Metrics</a>
-    </div>
   </div>
-
+  <main class="content">
+    <section class="tape" aria-label="Status over time">
+      <p class="tape-head">Status over time</p>
+      <div class="board-row"><div class="gutter"></div><div class="plot"><svg class="axis-svg" aria-hidden="true"></svg></div></div>
+      {lanes}
+    </section>
+    <h2 class="section-title" id="probe-summary">Probes</h2>
+    <div class="probe-grid">
+{cards}
+    </div>
+    <section class="routes" id="routes" hidden></section>
+    {_glossary_html()}
+    <div class="footer">
+      <a href="status">JSON status</a> &nbsp;·&nbsp; <a href="history">History</a> &nbsp;·&nbsp;
+      <a href="ready">Readiness</a> &nbsp;·&nbsp; <a href="metrics">Metrics</a>
+    </div>
+  </main>
+  <div class="chart-tooltip" id="chart-tooltip" hidden></div>
+  <script type="application/json" id="fw-data">{_json_for_script(data)}</script>
   <script>{_JS}</script>
 </body>
 </html>"""
