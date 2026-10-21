@@ -32,6 +32,12 @@ When a route raised an exception that no exception handler caught, `call_next` r
 
 **Fix:** new `HealthRegistry(probe_timeout=30.0)` bounds every probe that does not set its own `timeout`; a per-probe `timeout` still takes precedence. `probe_timeout=None` restores unbounded checks. Timeouts now report `"probe timed out after N s"` and log a warning, instead of the generic `"probe check failed"` with a full traceback.
 
+#### A raising `on_state_change` callback no longer breaks health checks; the poll loop no longer dies silently
+
+Callbacks registered with `on_state_change()` ran unguarded inside the probe run, so an exception in one turned the `/health/ready` (or `/status`, `/metrics`) request that observed the state change into a `500`, skipped the remaining callbacks, and skipped alerting. The background poll loop had no error handling at all: one failing iteration (a callback, a storage backend error) ended background polling for the life of the process, and it was never restarted because `_on_connect` only checked whether a task object existed.
+
+**Fix:** each callback is isolated — failures are logged with a traceback and the remaining callbacks and alerters still run. A failing poll iteration is logged and the loop continues; a poll task that has exited is restarted when the next streaming client connects. Errors are logged through `logger=` when given, otherwise the `fastapi_watch` logger.
+
 ### Security Fixes
 
 #### Maintenance write endpoints require `auth=`

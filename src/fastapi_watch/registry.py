@@ -28,6 +28,8 @@ from .storage import InMemoryProbeStorage, ProbeStorage
 
 _MIN_POLL_INTERVAL_MS = 1000
 _AUTO_HTTP_METHODS = frozenset({"HEAD", "OPTIONS"})
+# Used when the caller passed no logger= but an error must still be reported.
+_LIB_LOGGER = logging.getLogger("fastapi_watch")
 
 
 def _iter_app_routes(routes, prefix: str = ""):
@@ -387,7 +389,7 @@ class HealthRegistry:
         if auth is None and serve_routes:
             # Falls back to the library logger: a security notice must not depend
             # on the caller having passed logger=.
-            (self._logger or logging.getLogger("fastapi_watch")).warning(
+            (self._logger or _LIB_LOGGER).warning(
                 "fastapi-watch: health endpoints are publicly accessible (auth=None). "
                 "POST/DELETE %s/maintenance are not mounted without auth; use "
                 "set_maintenance()/clear_maintenance() or pass auth= to HealthRegistry.",
@@ -1120,7 +1122,9 @@ class HealthRegistry:
             self._signal_handler_installed = True
             self._install_early_shutdown_hook()
         self._active_connections += 1
-        if self._active_connections == 1 and self._poll_task is None:
+        # done() covers a loop that exited unexpectedly, so it is restarted rather
+        # than leaving every later client without background polling.
+        if self._active_connections == 1 and (self._poll_task is None or self._poll_task.done()):
             if self._poll_interval_ms is not None or self._has_custom_intervals():
                 self._poll_task = asyncio.create_task(self._poll_loop())
 
@@ -1197,13 +1201,21 @@ class HealthRegistry:
             self._alert_worker = None
 
     async def _poll_loop(self) -> None:
-        """Background loop: run each probe when its interval elapses (1 s granularity)."""
+        """Background loop: run each probe when its interval elapses (1 s granularity).
+
+        A failing iteration (e.g. a storage backend error) is logged and the loop
+        carries on; letting it escape would end background polling for good with
+        nothing but an unretrieved-exception warning to show for it.
+        """
         loop = asyncio.get_running_loop()
         while True:
-            now = loop.time()
-            due = [(p, c) for p, c in self._probes if self._is_probe_due(p, now)]
-            if due:
-                await self._execute_probes(due)
+            try:
+                now = loop.time()
+                due = [(p, c) for p, c in self._probes if self._is_probe_due(p, now)]
+                if due:
+                    await self._execute_probes(due)
+            except Exception:
+                (self._logger or _LIB_LOGGER).exception("fastapi-watch: poll iteration failed")
             await asyncio.sleep(1.0)
 
     def _in_grace_period(self) -> bool:
@@ -1287,9 +1299,18 @@ class HealthRegistry:
                 )
                 await self._storage.append_alert(alert_record)
                 for cb in self._state_change_callbacks:
-                    ret = cb(result.name, old, result.status)
-                    if asyncio.iscoroutine(ret):
-                        await ret
+                    # User code: one broken callback must not fail the health check
+                    # that triggered it, nor stop the callbacks and alerts after it.
+                    try:
+                        ret = cb(result.name, old, result.status)
+                        if asyncio.iscoroutine(ret):
+                            await ret
+                    except Exception:
+                        (self._logger or _LIB_LOGGER).exception(
+                            "fastapi-watch: on_state_change callback %r failed for probe %r",
+                            getattr(cb, "__name__", cb),
+                            result.name,
+                        )
                 if self._alerters and not in_maintenance:
                     self._ensure_alert_worker()
                     try:
