@@ -2,6 +2,7 @@
 import asyncio
 import signal
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -144,3 +145,39 @@ def test_signal_handler_without_a_running_loop_only_sets_the_flag(monkeypatch):
     installed[signal.SIGINT](signal.SIGINT, None)
     assert registry._shutting_down is True
     assert chained_to == [signal.SIGINT]
+
+
+# ---------------------------------------------------------------------------
+# Startup probes run through the same guarded path
+# ---------------------------------------------------------------------------
+
+class _RaisingProbe(BaseProbe):
+    name = "boot"
+
+    async def check(self):
+        raise RuntimeError("init failed")
+
+
+class _HangingStartupProbe(BaseProbe):
+    name = "boot"
+
+    async def check(self):
+        await asyncio.sleep(3600)
+
+
+def test_raising_startup_probe_answers_503_not_500():
+    app = FastAPI()
+    HealthRegistry(app, startup_probes=[_RaisingProbe()]).set_started()
+    resp = TestClient(app, raise_server_exceptions=False).get("/health/startup")
+    assert resp.status_code == 503
+    assert resp.json()["failing"] == ["boot"]
+
+
+@pytest.mark.asyncio
+async def test_hung_startup_probe_is_bounded_by_probe_timeout():
+    app = FastAPI()
+    HealthRegistry(app, startup_probes=[_HangingStartupProbe()], probe_timeout=0.05).set_started()
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as client:
+        resp = await asyncio.wait_for(client.get("/health/startup"), 2)
+    assert resp.status_code == 503
+    assert resp.json()["probes"][0]["error"] == "probe timed out after 0.05 s"

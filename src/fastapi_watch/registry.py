@@ -1009,6 +1009,36 @@ class HealthRegistry:
             return False
         return self._circuit_breaker_enabled
 
+    async def _guarded_check(self, probe: BaseProbe, critical: bool) -> ProbeResult:
+        """Run ``probe.check()`` bounded by its timeout, turning any failure into a result.
+
+        Every probe is bounded: endpoints await the probes they run, so a single
+        hung check would otherwise hang every one of them.
+        """
+        timeout = probe.timeout if probe.timeout is not None else self._probe_timeout
+        try:
+            coro = probe.check()
+            result = await asyncio.wait_for(coro, timeout) if timeout is not None else await coro
+        except asyncio.TimeoutError:
+            if self._logger:
+                self._logger.warning("Probe %r timed out after %g s", probe.name, timeout)
+            return ProbeResult(
+                name=probe.name,
+                status=ProbeStatus.UNHEALTHY,
+                critical=critical,
+                error=f"probe timed out after {timeout:g} s",
+            )
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception("Probe %r raised an unhandled %s", probe.name, type(exc).__name__)
+            return ProbeResult(
+                name=probe.name,
+                status=ProbeStatus.UNHEALTHY,
+                critical=critical,
+                error="probe check failed",
+            )
+        return result if result.critical == critical else result.model_copy(update={"critical": critical})
+
     async def _safe_check(self, probe: BaseProbe, critical: bool) -> ProbeResult:
         """Run one probe with circuit-breaker and timeout handling."""
         loop = asyncio.get_running_loop()
@@ -1031,39 +1061,7 @@ class HealthRegistry:
                     details={"circuit_breaker": cb_info},
                 )
 
-        # Run the probe.  Every probe is bounded: all endpoints await the whole
-        # batch, so a single hung check would otherwise hang every one of them.
-        timeout = probe.timeout if probe.timeout is not None else self._probe_timeout
-        try:
-            coro = probe.check()
-            result = await asyncio.wait_for(coro, timeout) if timeout is not None else await coro
-            result = (
-                result
-                if result.critical == critical
-                else result.model_copy(update={"critical": critical})
-            )
-        except asyncio.TimeoutError:
-            if self._logger:
-                self._logger.warning("Probe %r timed out after %g s", probe.name, timeout)
-            result = ProbeResult(
-                name=probe.name,
-                status=ProbeStatus.UNHEALTHY,
-                critical=critical,
-                error=f"probe timed out after {timeout:g} s",
-            )
-        except Exception as exc:
-            if self._logger:
-                self._logger.exception(
-                    "Probe %r raised an unhandled %s",
-                    probe.name,
-                    type(exc).__name__,
-                )
-            result = ProbeResult(
-                name=probe.name,
-                status=ProbeStatus.UNHEALTHY,
-                critical=critical,
-                error="probe check failed",
-            )
+        result = await self._guarded_check(probe, critical)
 
         # Update circuit breaker state
         if cb_active:
@@ -1603,8 +1601,10 @@ class HealthRegistry:
             if not registry._started:
                 return JSONResponse({"status": "starting"}, status_code=503)
             if registry._startup_probes:
+                # Same timeout and error handling as regular probes, so a hung or
+                # raising startup probe answers 503 rather than hanging or 500ing.
                 results = list(
-                    await asyncio.gather(*(p.check() for p in registry._startup_probes))
+                    await asyncio.gather(*(registry._guarded_check(p, True) for p in registry._startup_probes))
                 )
                 if not all(r.is_passing for r in results):
                     report = HealthReport.from_results(results)
