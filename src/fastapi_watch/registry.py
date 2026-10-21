@@ -585,6 +585,9 @@ class HealthRegistry:
 
         # State-change callbacks and streaming
         self._probe_states: dict[str, ProbeStatus] = {}
+        # Last status handed to the alerters, per probe.  Differs from
+        # _probe_states after maintenance, which suppresses alerters only.
+        self._alerted_states: dict[str, ProbeStatus] = {}
         self._state_change_callbacks: list[
             Callable[[str, ProbeStatus, ProbeStatus], None | Awaitable[None]]
         ] = []
@@ -1534,11 +1537,20 @@ class HealthRegistry:
         probe that is already failing at startup alerts (``healthy -> unhealthy``)
         instead of staying silent until it happens to recover and fail again.
         A first HEALTHY result is not a change and fires nothing.
+
+        Alerters are compared against the last status *they* were sent, not the
+        previous result: maintenance suppresses alerters but not state tracking,
+        so a dependency that failed during maintenance and stayed down would
+        otherwise never alert.  The first check after maintenance sends any
+        difference (``healthy -> unhealthy``); a failure that recovered within
+        the window sends nothing.  Callbacks and stored alert records still
+        follow real transitions only.
         """
         in_maintenance = self._in_maintenance()
         for result in results:
             old = self._probe_states.get(result.name, ProbeStatus.HEALTHY)
             self._probe_states[result.name] = result.status
+            alert_record: AlertRecord | None = None
             if old != result.status:
                 alert_record = AlertRecord(
                     probe=result.name,
@@ -1560,16 +1572,36 @@ class HealthRegistry:
                             getattr(cb, "__name__", cb),
                             result.name,
                         )
-                if self._alerters and not in_maintenance:
-                    self._ensure_alert_worker()
-                    try:
-                        self._alert_queue.put_nowait(alert_record)
-                    except asyncio.QueueFull:
-                        if self._logger:
-                            self._logger.warning(
-                                "Alert queue full, dropping alert for probe %r",
-                                alert_record.probe,
-                            )
+            if self._alerters and not in_maintenance:
+                self._send_to_alerters(result, alert_record)
+
+    def _send_to_alerters(self, result: ProbeResult, transition: AlertRecord | None) -> None:
+        """Queue an alert if *result* differs from the status alerters last received.
+
+        *transition* is the record of a real state change, reused when it
+        starts from what alerters last saw; otherwise (catching up after
+        maintenance) a record from the last-sent status is built.  The
+        last-sent status advances only once the alert is queued, so an alert
+        dropped on a full queue is retried at the next check.
+        """
+        sent = self._alerted_states.get(result.name, ProbeStatus.HEALTHY)
+        if sent == result.status:
+            return
+        if transition is None or transition.old_status != sent:
+            transition = AlertRecord(
+                probe=result.name,
+                old_status=sent,
+                new_status=result.status,
+                timestamp=datetime.now(self._tzinfo),
+            )
+        self._ensure_alert_worker()
+        try:
+            self._alert_queue.put_nowait(transition)
+        except asyncio.QueueFull:
+            if self._logger:
+                self._logger.warning("Alert queue full, dropping alert for probe %r", transition.probe)
+            return
+        self._alerted_states[result.name] = result.status
 
     def _ensure_alert_worker(self) -> None:
         """Start the alert worker task if not already running."""
