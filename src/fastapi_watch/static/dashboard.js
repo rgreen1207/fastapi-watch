@@ -9,6 +9,11 @@
   var PLOT_RIGHT = 34;    // px reserved for direct line labels; shared so every plot's x range matches
   var PLOT_BOTTOM = 16;   // px reserved for x-axis labels
   var MIN_GAP_MS = 5000;  // never treat points closer than this as a gap
+  // An open tab must not grow without bound: each probe keeps at most
+  // MAX_POINTS points, and none older than the retention span (retentionMs).
+  var MAX_POINTS = 2000;  // matches _MAX_CHART_POINTS in dashboard.py
+  var TOP_ROUTES = 8;     // routes charted; matches _CHART_ROUTES in dashboard.py
+  var ROUTE_FIELDS = ['request_count', 'p95_rtt_ms', 'error_rate', 'requests_per_minute'];
 
   // ── Pure helpers ──────────────────────────────────────────────────────
 
@@ -52,11 +57,31 @@
         lag: num(d.lag_ms),
         warnMs: num(d.warn_ms),
         failMs: num(d.fail_ms),
-        routes: d.routes && typeof d.routes === 'object' ? d.routes : null,
+        routes: d.routes && typeof d.routes === 'object' ? slimRoutes(d.routes, TOP_ROUTES) : null,
       };
     });
     return Object.keys(byTime).map(Number).sort(function (a, b) { return a - b; })
       .map(function (t) { return byTime[t]; });
+  }
+
+  /** Route paths ranked by request volume, busiest first. */
+  function rankRoutes(routes) {
+    return Object.keys(routes).sort(function (a, b) {
+      return ((routes[b] || {}).request_count || 0) - ((routes[a] || {}).request_count || 0) || (a < b ? -1 : 1);
+    });
+  }
+
+  /** The *limit* busiest routes, each with only the fields the routes section reads. */
+  function slimRoutes(routes, limit) {
+    var out = {};
+    rankRoutes(routes).slice(0, limit).forEach(function (path) {
+      var stats = routes[path];
+      if (!stats || typeof stats !== 'object') return;
+      var slim = {};
+      ROUTE_FIELDS.forEach(function (f) { if (f in stats) slim[f] = stats[f]; });
+      out[path] = slim;
+    });
+    return out;
   }
 
   /** Append a live point unless it is not newer than the last one. Returns true if added. */
@@ -66,6 +91,32 @@
     if (last && point.t <= last.t) return false;
     points.push(point);
     return true;
+  }
+
+  /**
+   * Drop the oldest points in place so at most *maxPoints* remain and none is
+   * more than *maxAgeMs* older than the newest.  Returns how many were dropped.
+   */
+  function capPoints(points, maxAgeMs, maxPoints) {
+    if (!points.length) return 0;
+    var cutoff = points[points.length - 1].t - maxAgeMs;
+    var drop = Math.max(0, points.length - maxPoints);
+    while (drop < points.length && points[drop].t < cutoff) drop++;
+    if (drop) points.splice(0, drop);
+    return drop;
+  }
+
+  /**
+   * How far back live points are kept: the longest range button with data —
+   * 2 h, or the embedded history's span when "All" reaches further.
+   */
+  function retentionMs(history) {
+    var span = RANGES['2h'];
+    Object.keys(history).forEach(function (name) {
+      var pts = history[name];
+      if (pts.length) span = Math.max(span, pts[pts.length - 1].t - pts[0].t);
+    });
+    return span;
   }
 
   /** [[t, value], ...] for one field, skipping points where it is absent. */
@@ -188,11 +239,7 @@
   /** Routes ranked by request volume in the latest point that has a breakdown. */
   function topRoutes(points, limit) {
     for (var i = points.length - 1; i >= 0; i--) {
-      var routes = points[i].routes;
-      if (!routes) continue;
-      return Object.keys(routes).sort(function (a, b) {
-        return ((routes[b] || {}).request_count || 0) - ((routes[a] || {}).request_count || 0) || (a < b ? -1 : 1);
-      }).slice(0, limit);
+      if (points[i].routes) return rankRoutes(points[i].routes).slice(0, limit);
     }
     return [];
   }
@@ -214,10 +261,12 @@
   }
 
   var api = {
-    niceCeil: niceCeil, scale: scale, pointsFor: pointsFor, addPoint: addPoint, series: series,
+    niceCeil: niceCeil, scale: scale, pointsFor: pointsFor, addPoint: addPoint, capPoints: capPoints,
+    retentionMs: retentionMs, slimRoutes: slimRoutes, series: series,
     gapThreshold: gapThreshold, pathD: pathD, areaD: areaD, segments: segments, transitions: transitions,
     nearest: nearest, heldSince: heldSince, fmtDuration: fmtDuration, fmtValue: fmtValue,
-    topRoutes: topRoutes, statusSentence: statusSentence, RANGES: RANGES,
+    topRoutes: topRoutes, statusSentence: statusSentence, RANGES: RANGES, MAX_POINTS: MAX_POINTS,
+    TOP_ROUTES: TOP_ROUTES,
   };
   if (typeof module !== 'undefined' && module.exports) { module.exports = api; return; }
 
@@ -232,8 +281,8 @@
   try { initial = JSON.parse(dataEl ? dataEl.textContent : '{}') || {}; } catch (_) { initial = {}; }
   var history = {};
   Object.keys(initial.history || {}).forEach(function (name) { history[name] = pointsFor(initial.history[name]); });
-  var latest = {};
-  (initial.probes || []).forEach(function (p) { latest[p.name] = p; });
+  var retainMs = retentionMs(history);
+  Object.keys(history).forEach(function (name) { capPoints(history[name], retainMs, MAX_POINTS); });
 
   var range = '1h';
   try { var saved = root.localStorage.getItem('fastapi-watch-range'); if (saved in RANGES) range = saved; } catch (_) {}
@@ -729,9 +778,8 @@
   function applyReport(report) {
     var probes = report.probes || [];
     probes.forEach(function (p) {
-      latest[p.name] = p;
-      history[p.name] = history[p.name] || [];
-      addPoint(history[p.name], pointsFor([p])[0]);
+      var points = history[p.name] = history[p.name] || [];
+      if (addPoint(points, pointsFor([p])[0])) capPoints(points, retainMs, MAX_POINTS);
     });
     if (header) header.className = 'header ' + report.status;
     if (badge) badge.textContent = statusSentence(probes, history, Date.now());

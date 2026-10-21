@@ -207,6 +207,82 @@ def _json_for_script(value: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Embedded chart data — only what static/dashboard.js reads
+# ---------------------------------------------------------------------------
+
+# Detail fields pointsFor() reads from each history entry.
+_CHART_DETAIL_FIELDS = (
+    "p50_rtt_ms", "p95_rtt_ms", "p99_rtt_ms", "error_rate", "requests_per_minute", "lag_ms", "warn_ms", "fail_ms",
+)
+# Per-route fields the routes section reads (topRoutes() ranks, drawRoutes() charts and labels).
+_CHART_ROUTE_FIELDS = ("request_count", "p95_rtt_ms", "error_rate", "requests_per_minute")
+# Routes charted; matches TOP_ROUTES in dashboard.js.
+_CHART_ROUTES = 8
+# Newest results embedded per probe; matches MAX_POINTS in dashboard.js.
+_MAX_CHART_POINTS = 2000
+
+
+def _top_routes(routes: dict) -> list[str]:
+    """The busiest routes by request count, ranked as topRoutes() in dashboard.js ranks them."""
+    def count(path: str) -> int:
+        stats = routes[path]
+        return (stats.get("request_count") or 0) if isinstance(stats, dict) else 0
+
+    return sorted(routes, key=lambda path: (-count(path), path))[:_CHART_ROUTES]
+
+
+def _slim_routes(routes: dict, keep: list[str]) -> dict:
+    """*routes* reduced to the paths in *keep*, each with only the fields the charts read."""
+    return {
+        path: {field: routes[path][field] for field in _CHART_ROUTE_FIELDS if field in routes[path]}
+        for path in keep
+        if isinstance(routes.get(path), dict)
+    }
+
+
+def _chart_history(results: list[ProbeResult]) -> list[dict]:
+    """One probe's stored history as chart points: a few fields per result, not every detail.
+
+    Routes are cut to the busiest few of the newest breakdown — the ones the
+    page charts — and kept under the same paths in every entry so each chart
+    line covers the whole history.  At most the newest ``_MAX_CHART_POINTS``
+    results are kept, as the page itself keeps no more.
+    """
+    results = results[-_MAX_CHART_POINTS:]
+    keep: list[str] = []
+    for result in reversed(results):
+        routes = (result.details or {}).get("routes")
+        if isinstance(routes, dict):
+            keep = _top_routes(routes)
+            break
+    points = []
+    for result in results:
+        point: dict[str, Any] = {
+            "checked_at": result.checked_at.isoformat() if result.checked_at else None,
+            "status": result.status.value,
+            "latency_ms": result.latency_ms,
+        }
+        details = result.details or {}
+        slim = {field: details[field] for field in _CHART_DETAIL_FIELDS if field in details}
+        routes = details.get("routes")
+        if isinstance(routes, dict):
+            slim["routes"] = _slim_routes(routes, keep)
+        if slim:
+            point["details"] = slim
+        points.append(point)
+    return points
+
+
+def _current_probe(probe: ProbeResult) -> dict:
+    """A current result for the page script: full details, but routes cut to those the page shows."""
+    data = probe.model_dump(mode="json")
+    routes = (data.get("details") or {}).get("routes")
+    if isinstance(routes, dict):
+        data["details"]["routes"] = _slim_routes(routes, _top_routes(routes))
+    return data
+
+
+# ---------------------------------------------------------------------------
 # Rows
 # ---------------------------------------------------------------------------
 
@@ -304,6 +380,8 @@ def render_dashboard(
         maintenance_banner: Show the maintenance-mode banner.
         history: Recent results per probe (``HealthRegistry`` passes its
             stored history); embedded so the charts have data on first paint.
+            Only the fields the charts read are embedded, so the page stays
+            small however many details or routes each result carries.
     """
     checked_at_text = ""
     if report.checked_at:
@@ -326,8 +404,8 @@ def render_dashboard(
         if maintenance_banner else ""
     )
     data = {
-        "probes": [p.model_dump(mode="json") for p in report.probes],
-        "history": {name: [r.model_dump(mode="json") for r in results] for name, results in (history or {}).items()},
+        "probes": [_current_probe(p) for p in report.probes],
+        "history": {name: _chart_history(results) for name, results in (history or {}).items()},
     }
     lanes = "".join(_lane(p) for p in report.probes)
     cards = "\n".join(_probe_card(p) for p in report.probes)

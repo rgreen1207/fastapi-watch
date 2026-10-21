@@ -40,6 +40,66 @@ const tests = {
     assert.strictEqual(pts.length, 2);
   },
 
+  capPointsDropsPointsOlderThanTheSpan() {
+    const pts = [0, 10, 20, 30, 40].map((t) => ({ t }));
+    assert.strictEqual(h.capPoints(pts, 15, 100), 3);
+    assert.deepStrictEqual(pts.map((p) => p.t), [30, 40]);
+    assert.strictEqual(h.capPoints([], 15, 100), 0);
+  },
+
+  capPointsKeepsAtMostMaxPoints() {
+    const pts = [0, 1, 2, 3, 4].map((t) => ({ t }));
+    assert.strictEqual(h.capPoints(pts, 1e9, 3), 2);
+    assert.deepStrictEqual(pts.map((p) => p.t), [2, 3, 4]);
+    assert.strictEqual(h.capPoints(pts, 1e9, 3), 0, 'nothing to drop under the cap');
+  },
+
+  liveUpdatesStayBounded() {
+    // A tab left open for a day of 1 s updates: the series never exceeds the
+    // cap, and with a short retention span the span wins.
+    const retain = h.retentionMs({});
+    let pts = [];
+    let peak = 0;
+    for (let i = 0; i < 24 * 3600; i++) {
+      if (h.addPoint(pts, { t: i * 1000 })) h.capPoints(pts, retain, h.MAX_POINTS);
+      peak = Math.max(peak, pts.length);
+    }
+    assert.strictEqual(h.MAX_POINTS, 2000);
+    assert.strictEqual(peak, h.MAX_POINTS);
+    assert.strictEqual(pts[pts.length - 1].t, (24 * 3600 - 1) * 1000);
+    pts = [];
+    for (let i = 0; i < 1000; i++) {
+      if (h.addPoint(pts, { t: i * 60e3 })) h.capPoints(pts, retain, h.MAX_POINTS);
+    }
+    assert.strictEqual(pts[pts.length - 1].t - pts[0].t, retain, 'one point a minute: 2 h retained');
+  },
+
+  retentionMsIsTwoHoursOrTheHistorySpan() {
+    assert.strictEqual(h.retentionMs({}), 2 * 3600e3);
+    assert.strictEqual(h.retentionMs({ a: [{ t: 0 }, { t: 60e3 }], b: [] }), 2 * 3600e3);
+    assert.strictEqual(h.retentionMs({ a: [{ t: 0 }, { t: 60e3 }], b: [{ t: 0 }, { t: 5 * 3600e3 }] }), 5 * 3600e3);
+  },
+
+  slimRoutesKeepsTopRoutesAndChartedFields() {
+    const routes = {};
+    for (let i = 0; i < 20; i++) {
+      routes['/r' + i] = { request_count: i, error_count: 1, p50_rtt_ms: 1, p95_rtt_ms: i, p99_rtt_ms: 3, error_rate: 0.1, requests_per_minute: 5, avg_rtt_ms: 2 };
+    }
+    const slim = h.slimRoutes(routes, h.TOP_ROUTES);
+    assert.deepStrictEqual(Object.keys(slim), ['/r19', '/r18', '/r17', '/r16', '/r15', '/r14', '/r13', '/r12']);
+    assert.deepStrictEqual(slim['/r19'], { request_count: 19, p95_rtt_ms: 19, error_rate: 0.1, requests_per_minute: 5 });
+    assert.deepStrictEqual(h.slimRoutes({ '/x': null }, 8), {});
+  },
+
+  pointsForSlimsRoutes() {
+    const routes = {};
+    for (let i = 0; i < 30; i++) routes['/r' + i] = { request_count: i, p95_rtt_ms: 1, avg_rtt_ms: 2 };
+    const [pt] = h.pointsFor([{ checked_at: '2026-01-01T00:00:00Z', status: 'healthy', details: { routes } }]);
+    assert.strictEqual(Object.keys(pt.routes).length, 8);
+    assert.deepStrictEqual(pt.routes['/r29'], { request_count: 29, p95_rtt_ms: 1 });
+    assert.deepStrictEqual(h.topRoutes([pt], 8)[0], '/r29');
+  },
+
   pathDBreaksAcrossGaps() {
     const id = (v) => v;
     const d = h.pathD([[0, 1], [1, 2], [10, 3]], id, id, 5);
