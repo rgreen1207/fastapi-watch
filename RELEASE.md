@@ -122,6 +122,13 @@ The circuit breaker was on by default for passive probes (`PassiveProbe` and its
 
 Current aiohttp deprecates `aiohttp.BasicAuth` (removed in aiohttp 4.0). The management-API request now sends a standard `Authorization: Basic` header built directly, which works across every supported aiohttp version.
 
+#### Alerters: concurrent, isolated, and no longer leaking sockets
+
+- Alerters were called one after another, so a slow integration (each built-in waits up to its 5-second `timeout`) delayed every other alerter and every later alert. They now run concurrently per state change, each bounded by a 30-second ceiling that also catches custom alerters that never return.
+- Alerter failures were logged without a traceback (and not at all without `logger=`), and the alert worker silently swallowed its own errors and skipped `task_done()`. Failures are now logged with their traceback through `logger=` or the `fastapi_watch` logger, and the worker always marks the alert done.
+- The built-in alerters never closed the HTTP response from `urlopen`, leaking a socket per alert until garbage collection; success and error responses are now closed.
+- `OpsGenieAlerter`'s host-allowlist helper was defined but unused, with the same check duplicated inline twice; the requests now go through it.
+
 #### `EventLoopProbe` catches stalls between checks
 
 `EventLoopProbe` timed a single `asyncio.sleep(0)` at check time. That measurement only runs once the loop is free again, so a stall between checks — the thing the probe exists to catch — was invisible, and what it did measure was mostly the sibling probes' synchronous work in the same batch.
@@ -175,6 +182,12 @@ With the default `auth=None`, anyone who could reach the service could `POST /he
 **Fix:** `POST` and `DELETE /health/maintenance` are mounted only when `auth=` is configured. `GET /health/maintenance` and the `set_maintenance()` / `clear_maintenance()` methods are unaffected. The "health endpoints are publicly accessible" startup warning now always logs (through the `fastapi_watch` logger when no `logger=` is passed — previously it only appeared when one was) and names the routes that were left out.
 
 **Upgrading:** if you toggle maintenance over HTTP without `auth=`, those calls now return `405`. Pass `auth=` to `HealthRegistry`, or call `registry.set_maintenance()` / `registry.clear_maintenance()` from your own authenticated endpoint.
+
+#### Webhook URL validation closes several bypasses; redirects are no longer followed
+
+`_validate_webhook_url` only rejected a short list of private ranges in their canonical spelling, and alerter requests followed redirects. `0.0.0.0`, IPv4-mapped IPv6 (`::ffff:127.0.0.1`), integer/octal/hex hosts (`http://2130706433/`), multicast/reserved addresses, and `localhost.` all passed, and any validated public URL could redirect the POST — with its auth headers — to an internal address.
+
+**Fix:** every IP literal that is not publicly routable unicast is rejected, in any spelling a resolver accepts, along with `localhost` / `*.localhost`. Alerter requests use an opener that never follows redirects.
 
 #### Basic auth no longer short-circuits on the username
 

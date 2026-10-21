@@ -1630,7 +1630,11 @@ SlackAlerter(webhook_url="https://192.168.1.10/hook")
 SlackAlerter(webhook_url="https://hooks.slack.com/services/...")
 ```
 
-Rejected ranges: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`, `169.254.0.0/16` (AWS metadata), `100.64.0.0/10` (CGNAT), and IPv6 equivalents.
+Rejected: any IP literal that is not publicly routable unicast — private, loopback, link-local (`169.254.0.0/16`, cloud metadata), carrier-grade NAT (`100.64.0.0/10`), unspecified (`0.0.0.0`, `::`), multicast, and reserved ranges — in every spelling a resolver accepts, including IPv4-mapped IPv6 (`::ffff:127.0.0.1`) and integer/octal/hex forms (`2130706433`, `0x7f000001`, `0177.0.0.1`), plus `localhost` / `*.localhost` (with or without a trailing dot). Alerters never follow redirects, so a validated URL cannot hand the request on to an internal address.
+
+This is a construction-time check without DNS resolution: a public hostname that *resolves* to a private address is not caught. Restrict outbound traffic at the network layer if that matters in your environment.
+
+Alerters are dispatched concurrently per state change, each bounded by a 30-second ceiling, so a slow or failing integration never delays the others; failures are logged with their traceback.
 
 ### Probe error messages
 

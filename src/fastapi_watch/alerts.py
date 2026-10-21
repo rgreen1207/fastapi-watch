@@ -43,6 +43,8 @@ Custom alerters::
 import asyncio
 import ipaddress
 import json
+import socket
+import urllib.error
 import urllib.parse
 import urllib.request
 from abc import ABC, abstractmethod
@@ -50,18 +52,34 @@ from typing import Any
 
 from .models import AlertRecord, ProbeStatus
 
-# Private IPv4 and IPv6 ranges that must not be reachable via alerter webhooks.
-_PRIVATE_NETS = [
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("169.254.0.0/16"),   # link-local / AWS metadata
-    ipaddress.ip_network("100.64.0.0/10"),    # Carrier-grade NAT
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fc00::/7"),
-    ipaddress.ip_network("fe80::/10"),
-]
+# Upper bound on one alerter's notify() call.  Built-in alerters time out their
+# own request after ``timeout`` (default 5 s); this only catches custom alerters
+# that never return, so one of them cannot stall every later alert.
+_NOTIFY_TIMEOUT_S = 30.0
+
+
+def _ip_literal(hostname: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Return the address *hostname* denotes if it is an IP literal, else ``None``.
+
+    Besides dotted-quad and IPv6, this recognises the legacy integer forms that
+    C resolvers still accept as IPv4 — ``2130706433``, ``0x7f000001``,
+    ``0177.0.0.1``, ``127.1`` — which ``ipaddress`` alone does not.
+    """
+    try:
+        return ipaddress.ip_address(hostname)
+    except ValueError:
+        pass
+    try:
+        return ipaddress.IPv4Address(socket.inet_aton(hostname))
+    except OSError:
+        return None
+
+
+def _is_internal(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """True for any address that is not publicly routable unicast."""
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped  # ::ffff:127.0.0.1 reaches 127.0.0.1
+    return addr.is_multicast or not addr.is_global
 
 
 def _validate_webhook_url(url: str) -> None:
@@ -69,8 +87,12 @@ def _validate_webhook_url(url: str) -> None:
 
     Rejects:
     - Non-HTTP(S) schemes (``file://``, ``ftp://``, etc.)
-    - Bare IP literals in private/loopback/link-local ranges
-    - ``localhost`` hostnames
+    - IP literals that are not publicly routable unicast — private, loopback,
+      link-local (including cloud metadata), carrier-grade NAT, unspecified
+      (``0.0.0.0``, ``::``), multicast, and reserved ranges — in any spelling
+      a resolver accepts, including IPv4-mapped IPv6 (``::ffff:127.0.0.1``)
+      and integer forms (``2130706433``, ``0x7f000001``)
+    - ``localhost`` and ``*.localhost`` hostnames, with or without a trailing dot
 
     Both ``http://`` and ``https://`` are accepted. Use ``https://`` for
     production endpoints. Plain HTTP is only appropriate for local sidecars
@@ -78,10 +100,13 @@ def _validate_webhook_url(url: str) -> None:
 
     This is a best-effort defence-in-depth check. It does **not** perform
     DNS resolution — a hostname that resolves to a private IP will pass.
+    Alerters never follow redirects, so a validated URL cannot hand the
+    request on to an internal one.
     """
     try:
         parsed = urllib.parse.urlparse(url)
-    except Exception as exc:
+        hostname = (parsed.hostname or "").rstrip(".").lower()
+    except ValueError as exc:
         raise ValueError(f"Invalid webhook URL: {exc}") from exc
 
     if parsed.scheme not in ("https", "http"):
@@ -89,25 +114,53 @@ def _validate_webhook_url(url: str) -> None:
             f"Webhook URL must use https:// or http:// scheme, got {parsed.scheme!r}"
         )
 
-    hostname = parsed.hostname or ""
-
-    # Reject bare IP literals in private ranges immediately.
-    try:
-        addr = ipaddress.ip_address(hostname)
-        if any(addr in net for net in _PRIVATE_NETS):
-            raise ValueError(
-                f"Webhook URL hostname {hostname!r} resolves to a private/loopback "
-                "address. Use a public HTTPS endpoint."
-            )
-    except ValueError as exc:
-        if "private" in str(exc) or "loopback" in str(exc):
-            raise
-        # Not a valid IP literal — hostname string, fine to pass through.
-
-    if hostname.lower() in ("localhost", ""):
+    if not hostname or hostname == "localhost" or hostname.endswith(".localhost"):
         raise ValueError(
             "Webhook URL must not target localhost. Use a public HTTPS endpoint."
         )
+
+    addr = _ip_literal(hostname)
+    if addr is not None and _is_internal(addr):
+        raise ValueError(
+            f"Webhook URL hostname {hostname!r} is a private, loopback, or otherwise "
+            "non-public address. Use a public HTTPS endpoint."
+        )
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Turn every 3xx into an ``HTTPError`` instead of following it.
+
+    Following redirects would let a validated public URL bounce the request
+    (and its auth headers) to an internal address.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _post_json(
+    url: str, payload: bytes, timeout: float, headers: dict[str, str] | None = None
+) -> None:
+    """POST *payload* as JSON and close the response.  Raises on non-2xx.
+
+    Blocking — call it through ``run_in_executor``.  Error responses are closed
+    too, so a failing endpoint cannot leak a socket per alert.
+    """
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json", **(headers or {})},
+        method="POST",
+    )
+    try:
+        with _OPENER.open(req, timeout=timeout):
+            pass
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        raise
 
 
 class BaseAlerter(ABC):
@@ -198,16 +251,9 @@ class WebhookAlerter(BaseAlerter):
         }).encode()
 
     async def notify(self, alert: AlertRecord) -> None:
-        payload = self._build_payload(alert)
-        headers = {"Content-Type": "application/json", **self.headers}
-        url = self.url
-        timeout = self.timeout
-
-        def _post() -> None:
-            req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-            urllib.request.urlopen(req, timeout=timeout)
-
-        await asyncio.get_running_loop().run_in_executor(None, _post)
+        await asyncio.get_running_loop().run_in_executor(
+            None, _post_json, self.url, self._build_payload(alert), self.timeout, self.headers
+        )
 
 
 class SlackAlerter(BaseAlerter):
@@ -294,20 +340,9 @@ class SlackAlerter(BaseAlerter):
         return json.dumps(body).encode()
 
     async def notify(self, alert: AlertRecord) -> None:
-        payload = self._build_payload(alert)
-        url = self.webhook_url
-        timeout = self.timeout
-
-        def _post() -> None:
-            req = urllib.request.Request(
-                url,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            urllib.request.urlopen(req, timeout=timeout)
-
-        await asyncio.get_running_loop().run_in_executor(None, _post)
+        await asyncio.get_running_loop().run_in_executor(
+            None, _post_json, self.webhook_url, self._build_payload(alert), self.timeout
+        )
 
 
 class TeamsAlerter(BaseAlerter):
@@ -368,20 +403,9 @@ class TeamsAlerter(BaseAlerter):
         return json.dumps(body).encode()
 
     async def notify(self, alert: AlertRecord) -> None:
-        payload = self._build_payload(alert)
-        url = self.webhook_url
-        timeout = self.timeout
-
-        def _post() -> None:
-            req = urllib.request.Request(
-                url,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            urllib.request.urlopen(req, timeout=timeout)
-
-        await asyncio.get_running_loop().run_in_executor(None, _post)
+        await asyncio.get_running_loop().run_in_executor(
+            None, _post_json, self.webhook_url, self._build_payload(alert), self.timeout
+        )
 
 
 class PagerDutyAlerter(BaseAlerter):
@@ -462,20 +486,9 @@ class PagerDutyAlerter(BaseAlerter):
         return json.dumps(body).encode()
 
     async def notify(self, alert: AlertRecord) -> None:
-        payload = self._build_payload(alert)
-        url = self._EVENTS_URL
-        timeout = self.timeout
-
-        def _post() -> None:
-            req = urllib.request.Request(
-                url,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            urllib.request.urlopen(req, timeout=timeout)
-
-        await asyncio.get_running_loop().run_in_executor(None, _post)
+        await asyncio.get_running_loop().run_in_executor(
+            None, _post_json, self._EVENTS_URL, self._build_payload(alert), self.timeout
+        )
 
 
 class OpsGenieAlerter(BaseAlerter):
@@ -539,42 +552,40 @@ class OpsGenieAlerter(BaseAlerter):
         return {"Authorization": f"GenieKey {self.api_key}", "Content-Type": "application/json"}
 
     def _assert_safe_url(self, url: str) -> None:
-        """Guard: raise if the URL host is not in the OpsGenie allowlist."""
+        """Guard: raise if the URL host is not in the OpsGenie allowlist.
+
+        The API key travels in the ``Authorization`` header, so it must only
+        ever be sent to OpsGenie itself.
+        """
         host = urllib.parse.urlparse(url).hostname or ""
         if host not in self._ALLOWED_HOSTS:
             raise ValueError(f"OpsGenie URL host {host!r} not in allowed hosts")
 
+    def _send(self, url: str, payload: bytes, action: str, subject: str) -> None:
+        """POST to the OpsGenie API, raising ``RuntimeError`` with context on failure.
+
+        Blocking — called through ``run_in_executor``.
+        """
+        self._assert_safe_url(url)
+        try:
+            _post_json(url, payload, self.timeout, self._auth_headers())
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"OpsGenie {action} returned HTTP {exc.code} for {subject}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"OpsGenie {action} network error for {subject}: {exc.reason}") from exc
+
     async def notify(self, alert: AlertRecord) -> None:
         alias = self._alias(alert.probe)
-        headers = self._auth_headers()
-        allowed = self._ALLOWED_HOSTS
-        base_url = self._base_url
-        timeout = self.timeout
+        loop = asyncio.get_running_loop()
 
         if alert.new_status == ProbeStatus.HEALTHY:
-            url = f"{base_url}/v2/alerts/{urllib.parse.quote(alias, safe='')}/close?identifierType=alias"
-            payload = json.dumps({}).encode()
-
-            def _close() -> None:
-                host = urllib.parse.urlparse(url).hostname or ""
-                if host not in allowed:
-                    raise ValueError(f"OpsGenie URL host {host!r} not in allowed hosts")
-                req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-                try:
-                    urllib.request.urlopen(req, timeout=timeout)
-                except urllib.error.HTTPError as exc:
-                    raise RuntimeError(
-                        f"OpsGenie close-alert returned HTTP {exc.code} for alias {alias!r}"
-                    ) from exc
-                except urllib.error.URLError as exc:
-                    raise RuntimeError(
-                        f"OpsGenie close-alert network error for alias {alias!r}: {exc.reason}"
-                    ) from exc
-
-            await asyncio.get_running_loop().run_in_executor(None, _close)
+            url = f"{self._base_url}/v2/alerts/{urllib.parse.quote(alias, safe='')}/close?identifierType=alias"
+            await loop.run_in_executor(
+                None, self._send, url, json.dumps({}).encode(), "close-alert", f"alias {alias!r}"
+            )
         else:
             priority = self._PRIORITY.get(alert.new_status, "P1")
-            url = f"{base_url}/v2/alerts"
+            url = f"{self._base_url}/v2/alerts"
             payload = json.dumps({
                 "message": f"{alert.probe}: {alert.old_status.value} → {alert.new_status.value}",
                 "alias": alias,
@@ -590,21 +601,6 @@ class OpsGenieAlerter(BaseAlerter):
                     "new_status": alert.new_status.value,
                 },
             }).encode()
-
-            def _create() -> None:
-                host = urllib.parse.urlparse(url).hostname or ""
-                if host not in allowed:
-                    raise ValueError(f"OpsGenie URL host {host!r} not in allowed hosts")
-                req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-                try:
-                    urllib.request.urlopen(req, timeout=timeout)
-                except urllib.error.HTTPError as exc:
-                    raise RuntimeError(
-                        f"OpsGenie create-alert returned HTTP {exc.code} for probe {alert.probe!r}"
-                    ) from exc
-                except urllib.error.URLError as exc:
-                    raise RuntimeError(
-                        f"OpsGenie create-alert network error for probe {alert.probe!r}: {exc.reason}"
-                    ) from exc
-
-            await asyncio.get_running_loop().run_in_executor(None, _create)
+            await loop.run_in_executor(
+                None, self._send, url, payload, "create-alert", f"probe {alert.probe!r}"
+            )

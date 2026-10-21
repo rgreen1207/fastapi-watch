@@ -18,7 +18,7 @@ def _alert(old: ProbeStatus, new: ProbeStatus, probe: str = "redis") -> AlertRec
 
 @pytest.mark.asyncio
 async def test_creates_alert_on_unhealthy():
-    with patch("fastapi_watch.alerts.urllib.request.urlopen") as mock_urlopen:
+    with patch("fastapi_watch.alerts._OPENER.open") as mock_urlopen:
         mock_urlopen.return_value = MagicMock()
         alerter = OpsGenieAlerter(api_key="test-key")
         await alerter.notify(_alert(ProbeStatus.HEALTHY, ProbeStatus.UNHEALTHY))
@@ -34,7 +34,7 @@ async def test_creates_alert_on_unhealthy():
 
 @pytest.mark.asyncio
 async def test_creates_alert_on_degraded():
-    with patch("fastapi_watch.alerts.urllib.request.urlopen") as mock_urlopen:
+    with patch("fastapi_watch.alerts._OPENER.open") as mock_urlopen:
         mock_urlopen.return_value = MagicMock()
         alerter = OpsGenieAlerter(api_key="test-key")
         await alerter.notify(_alert(ProbeStatus.HEALTHY, ProbeStatus.DEGRADED))
@@ -47,7 +47,7 @@ async def test_creates_alert_on_degraded():
 
 @pytest.mark.asyncio
 async def test_closes_alert_on_healthy():
-    with patch("fastapi_watch.alerts.urllib.request.urlopen") as mock_urlopen:
+    with patch("fastapi_watch.alerts._OPENER.open") as mock_urlopen:
         mock_urlopen.return_value = MagicMock()
         alerter = OpsGenieAlerter(api_key="test-key")
         await alerter.notify(_alert(ProbeStatus.UNHEALTHY, ProbeStatus.HEALTHY))
@@ -59,7 +59,7 @@ async def test_closes_alert_on_healthy():
 
 @pytest.mark.asyncio
 async def test_eu_region_uses_correct_endpoint():
-    with patch("fastapi_watch.alerts.urllib.request.urlopen") as mock_urlopen:
+    with patch("fastapi_watch.alerts._OPENER.open") as mock_urlopen:
         mock_urlopen.return_value = MagicMock()
         alerter = OpsGenieAlerter(api_key="test-key", region="eu")
         await alerter.notify(_alert(ProbeStatus.HEALTHY, ProbeStatus.UNHEALTHY))
@@ -69,7 +69,7 @@ async def test_eu_region_uses_correct_endpoint():
 
 @pytest.mark.asyncio
 async def test_us_region_uses_correct_endpoint():
-    with patch("fastapi_watch.alerts.urllib.request.urlopen") as mock_urlopen:
+    with patch("fastapi_watch.alerts._OPENER.open") as mock_urlopen:
         mock_urlopen.return_value = MagicMock()
         alerter = OpsGenieAlerter(api_key="test-key", region="us")
         await alerter.notify(_alert(ProbeStatus.HEALTHY, ProbeStatus.UNHEALTHY))
@@ -89,7 +89,7 @@ def test_repr_does_not_leak_api_key():
 
 @pytest.mark.asyncio
 async def test_auth_header_uses_genie_key():
-    with patch("fastapi_watch.alerts.urllib.request.urlopen") as mock_urlopen:
+    with patch("fastapi_watch.alerts._OPENER.open") as mock_urlopen:
         mock_urlopen.return_value = MagicMock()
         alerter = OpsGenieAlerter(api_key="my-key")
         await alerter.notify(_alert(ProbeStatus.HEALTHY, ProbeStatus.UNHEALTHY))
@@ -99,7 +99,7 @@ async def test_auth_header_uses_genie_key():
 
 @pytest.mark.asyncio
 async def test_close_sends_empty_json_body():
-    with patch("fastapi_watch.alerts.urllib.request.urlopen") as mock_urlopen:
+    with patch("fastapi_watch.alerts._OPENER.open") as mock_urlopen:
         mock_urlopen.return_value = MagicMock()
         alerter = OpsGenieAlerter(api_key="test-key")
         await alerter.notify(_alert(ProbeStatus.UNHEALTHY, ProbeStatus.HEALTHY))
@@ -109,7 +109,7 @@ async def test_close_sends_empty_json_body():
 
 @pytest.mark.asyncio
 async def test_alias_includes_probe_name():
-    with patch("fastapi_watch.alerts.urllib.request.urlopen") as mock_urlopen:
+    with patch("fastapi_watch.alerts._OPENER.open") as mock_urlopen:
         mock_urlopen.return_value = MagicMock()
         alerter = OpsGenieAlerter(api_key="test-key")
         await alerter.notify(_alert(ProbeStatus.HEALTHY, ProbeStatus.UNHEALTHY, probe="postgresql"))
@@ -120,7 +120,7 @@ async def test_alias_includes_probe_name():
 
 @pytest.mark.asyncio
 async def test_custom_source_label():
-    with patch("fastapi_watch.alerts.urllib.request.urlopen") as mock_urlopen:
+    with patch("fastapi_watch.alerts._OPENER.open") as mock_urlopen:
         mock_urlopen.return_value = MagicMock()
         alerter = OpsGenieAlerter(api_key="test-key", source="my-app/db")
         await alerter.notify(_alert(ProbeStatus.HEALTHY, ProbeStatus.UNHEALTHY))
@@ -132,7 +132,7 @@ async def test_custom_source_label():
 @pytest.mark.asyncio
 async def test_degraded_to_healthy_closes_alert():
     """DEGRADED→HEALTHY also triggers the close path, not a new create."""
-    with patch("fastapi_watch.alerts.urllib.request.urlopen") as mock_urlopen:
+    with patch("fastapi_watch.alerts._OPENER.open") as mock_urlopen:
         mock_urlopen.return_value = MagicMock()
         alerter = OpsGenieAlerter(api_key="test-key")
         await alerter.notify(_alert(ProbeStatus.DEGRADED, ProbeStatus.HEALTHY))
@@ -145,7 +145,7 @@ async def test_degraded_to_healthy_closes_alert():
 async def test_http_error_on_create_raises_runtime_error():
     """A 4xx/5xx from OpsGenie on create surfaces as RuntimeError (not silent)."""
     import urllib.error
-    with patch("fastapi_watch.alerts.urllib.request.urlopen") as mock_urlopen:
+    with patch("fastapi_watch.alerts._OPENER.open") as mock_urlopen:
         mock_urlopen.side_effect = urllib.error.HTTPError(
             url="https://api.opsgenie.com/v2/alerts",
             code=401,
@@ -162,7 +162,7 @@ async def test_http_error_on_create_raises_runtime_error():
 async def test_http_error_on_close_raises_runtime_error():
     """A 4xx/5xx from OpsGenie on close surfaces as RuntimeError (not silent)."""
     import urllib.error
-    with patch("fastapi_watch.alerts.urllib.request.urlopen") as mock_urlopen:
+    with patch("fastapi_watch.alerts._OPENER.open") as mock_urlopen:
         mock_urlopen.side_effect = urllib.error.HTTPError(
             url="https://api.opsgenie.com/v2/alerts/fastapi-watch%3Aredis/close",
             code=404,

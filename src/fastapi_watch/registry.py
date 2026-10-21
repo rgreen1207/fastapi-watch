@@ -1450,28 +1450,50 @@ class HealthRegistry:
                 return
             try:
                 await self._dispatch_alert(alert)
-                self._alert_queue.task_done()
             except asyncio.CancelledError:
                 return
             except Exception:
-                pass
+                # The worker must outlive any one bad alert, but not silently.
+                (self._logger or _LIB_LOGGER).exception(
+                    "Dispatching alert for probe %s failed", alert.probe
+                )
+            finally:
+                self._alert_queue.task_done()
 
     async def _dispatch_alert(self, alert: AlertRecord) -> None:
-        """Call each registered alerter for a probe state change.
+        """Call every registered alerter concurrently for a probe state change.
 
-        Failures in individual alerters are caught and logged so one broken
-        integration cannot silence the others.
+        Each alerter runs as its own task bounded by ``_NOTIFY_TIMEOUT_S``, so a
+        slow or hung integration cannot delay the others or every later alert.
+        Failures are logged with their traceback and never propagate.
         """
-        for alerter in self._alerters:
-            try:
-                await alerter.notify(alert)
-            except Exception:
-                if self._logger:
-                    self._logger.warning(
-                        "Alerter %s failed for probe %s",
-                        type(alerter).__name__,
-                        alert.probe,
-                    )
+        from .alerts import _NOTIFY_TIMEOUT_S
+
+        async def _notify(alerter: BaseAlerter) -> None:
+            await alerter.notify(alert)
+
+        tasks = {asyncio.ensure_future(_notify(alerter)): alerter for alerter in self._alerters}
+        if not tasks:
+            return
+        try:
+            _, pending = await asyncio.wait(tasks, timeout=_NOTIFY_TIMEOUT_S)
+        finally:
+            # Also reached when this dispatch is itself cancelled at shutdown.
+            for task in tasks:
+                task.cancel()
+        logger = self._logger or _LIB_LOGGER
+        for task, alerter in tasks.items():
+            if task in pending:
+                logger.warning(
+                    "Alerter %s timed out after %g s for probe %s",
+                    type(alerter).__name__, _NOTIFY_TIMEOUT_S, alert.probe,
+                )
+            elif not task.cancelled() and task.exception() is not None:
+                logger.warning(
+                    "Alerter %s failed for probe %s",
+                    type(alerter).__name__, alert.probe,
+                    exc_info=task.exception(),
+                )
 
     # ------------------------------------------------------------------
     # Route registration
