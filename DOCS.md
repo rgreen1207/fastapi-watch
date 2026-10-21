@@ -913,6 +913,8 @@ async def lifespan(app):
 
 `RequestMetricsMiddleware` wraps your app at the ASGI layer and collects aggregate stats for every route without touching individual handlers.
 
+It is plain ASGI middleware (not a `BaseHTTPMiddleware`), so it adds no extra task or response copy per request and context variables set by your app propagate normally. A response is timed until its last body chunk is sent, so streaming responses count their full duration while background tasks that run afterwards do not. An unhandled exception, or a response that never starts, counts as a 500 and the exception is re-raised. WebSocket and lifespan traffic pass straight through, and requests to a `HealthRegistry`'s own routes (status, readiness, the dashboard and its streams) are not counted, so health checks never skew your app's numbers.
+
 ```python
 from fastapi_watch import HealthRegistry, RequestMetricsMiddleware, RequestMetricsProbe
 
@@ -925,16 +927,17 @@ registry.add(RequestMetricsProbe(app, max_error_rate=0.05, max_avg_rtt_ms=500))
 
 Pass the **app** to `RequestMetricsProbe`. Starlette builds middleware instances lazily (on the first request or lifespan event), so the probe looks up the live `RequestMetricsMiddleware` in `app.middleware_stack` on its first check. Until then it reports `"no requests observed yet"`; if the stack is built without the middleware it reports UNHEALTHY with a configuration error. Passing a `RequestMetricsMiddleware` instance you serve yourself still works.
 
-`per_route=True` breaks stats down by route template (e.g. `/users/{user_id}`, including any `include_router` or `Mount` prefix). Requests that match no route share one `"<unmatched>"` entry and a `Mount` without inner routes (static files, raw ASGI apps) shares one `"/static/{path:path}"`-style entry, so the table stays bounded however many distinct URLs arrive. `per_route=False` collects aggregates only.
+`per_route=True` breaks stats down by route template (e.g. `/users/{user_id}`, including any `include_router` or `Mount` prefix). Requests that match no route share one `"<unmatched>"` entry and a `Mount` without inner routes (static files, raw ASGI apps) shares one `"/static/{path:path}"`-style entry, so the table stays bounded however many distinct URLs arrive. Route keys can still multiply when a `Mount` has a path parameter (`app.mount("/t/{tenant}", sub)` makes one key per tenant), so the table also holds at most `max_routes` entries; requests for further routes share one `"<other>"` entry. `per_route=False` collects aggregates only.
 
 **`RequestMetricsMiddleware` args:**
 
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `per_route` | `True` | Per-route-template breakdown |
-| `window_size` | `200` | Recent requests used for `error_rate`, percentiles, and requests-per-minute. A count, not a time span: on a busy route it covers seconds, on a quiet one it can cover hours |
-| `ema_alpha` | `0.1` | EMA smoothing factor |
+| `window_size` | `200` | Recent requests used for `error_rate`, percentiles, and requests-per-minute. A count, not a time span: on a busy route it covers seconds, on a quiet one it can cover hours. Must be positive |
+| `ema_alpha` | `0.1` | EMA smoothing factor, in `(0, 1]` |
 | `min_error_status` | `500` | Status codes counted as errors (`500` = 5xx only; `400` = 4xx and 5xx) |
+| `max_routes` | `500` | Most per-route entries kept; further routes share one `"<other>"` entry. Must be positive |
 
 **`RequestMetricsProbe` args:**
 

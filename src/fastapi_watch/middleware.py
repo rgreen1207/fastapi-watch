@@ -7,11 +7,9 @@ without decorating individual routes.
 import threading
 import time
 from collections import deque
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import Response
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .models import ProbeResult, ProbeStatus
 from .probes.base import BaseProbe, _calc_percentiles, _update_ema
@@ -136,14 +134,41 @@ def _route_key(scope: dict, entry_root_path: str) -> str:
 # Middleware
 # ---------------------------------------------------------------------------
 
-class RequestMetricsMiddleware(BaseHTTPMiddleware):
-    """Starlette middleware that records request metrics across all routes.
+OTHER_ROUTE = "<other>"
+
+# Bound to fastapi_watch.registry._is_health_handler on first use; importing it
+# at module load would be circular (registry -> dashboard -> ... -> here).
+_is_health_handler: "Callable[[Any], bool] | None" = None
+
+
+def _is_health_route(scope: Scope) -> bool:
+    """True when routing sent the request to a HealthRegistry's own handler."""
+    global _is_health_handler
+    if _is_health_handler is None:
+        from .registry import _is_health_handler as is_health_handler
+
+        _is_health_handler = is_health_handler
+    effective = (scope.get("fastapi") or {}).get("effective_route_context")
+    endpoint = getattr(effective, "endpoint", None) or getattr(scope.get("route"), "endpoint", None)
+    return endpoint is not None and _is_health_handler(endpoint)
+
+
+class RequestMetricsMiddleware:
+    """ASGI middleware that records request metrics across all routes.
 
     Attach it with ``app.add_middleware(...)``, then pass the *app* to
     :class:`RequestMetricsProbe` to expose the collected data as a health probe.
     Starlette builds middleware instances lazily (on the first request or
     lifespan event), so the probe finds the live instance in the app's
     middleware stack when it first checks.
+
+    It is plain ASGI middleware, not a ``BaseHTTPMiddleware``: requests pass
+    through with one wrapped ``send`` and no extra task, context variables set
+    by the app propagate normally, and a streaming response is timed until its
+    last body chunk is sent rather than until its headers are.  WebSocket and
+    lifespan traffic pass straight through, and requests served by a
+    :class:`~fastapi_watch.HealthRegistry`'s own routes are not counted, so
+    health checks and dashboard streams never skew the app's numbers.
 
     Args:
         app: The ASGI application (injected automatically by FastAPI/Starlette).
@@ -157,10 +182,20 @@ class RequestMetricsMiddleware(BaseHTTPMiddleware):
         window_size: Number of recent requests used for the error rate,
             percentiles, and requests-per-minute (default ``200``).
         ema_alpha: Smoothing factor for the exponential moving average RTT
-            (default ``0.1``; higher = reacts faster to changes).
+            (default ``0.1``; higher = reacts faster to changes).  Must be in
+            ``(0, 1]``.
         min_error_status: HTTP status codes at or above this value are counted
             as errors (default ``500``).  4xx client errors such as 404 are not
             counted as errors by default; set to ``400`` to include them.
+        max_routes: Most per-route entries kept (default ``500``).  Requests
+            for further routes share one ``"<other>"`` entry — this caps the
+            table when route keys are not a fixed set, e.g. a Mount with a path
+            parameter (``app.mount("/t/{tenant}", sub)``) yields a key per
+            tenant.
+
+    Raises:
+        ValueError: If ``window_size`` or ``max_routes`` is not positive, or
+            ``ema_alpha`` is outside ``(0, 1]``.
 
     Example::
 
@@ -176,50 +211,94 @@ class RequestMetricsMiddleware(BaseHTTPMiddleware):
 
     def __init__(
         self,
-        app,
+        app: ASGIApp,
         per_route: bool = True,
         window_size: int = 200,
         ema_alpha: float = 0.1,
         min_error_status: int = 500,
+        max_routes: int = 500,
     ) -> None:
-        super().__init__(app)
+        if window_size <= 0:
+            raise ValueError(f"window_size must be positive, got {window_size!r}")
+        if not 0 < ema_alpha <= 1:
+            raise ValueError(f"ema_alpha must be in (0, 1], got {ema_alpha!r}")
+        if max_routes <= 0:
+            raise ValueError(f"max_routes must be positive, got {max_routes!r}")
+        self.app = app
         self.per_route = per_route
         self._window_size = window_size
         self._ema_alpha = ema_alpha
         self._min_error_status = min_error_status
+        self._max_routes = max_routes
         self._aggregate = _RouteStats(window_size, ema_alpha, min_error_status)
         self._routes: dict[str, _RouteStats] = {}
         self._routes_lock = threading.Lock()
 
     def _get_or_create(self, path: str) -> _RouteStats:
+        # Lock-free hit for known routes — the common case; dict reads are atomic.
+        stats = self._routes.get(path)
+        if stats is not None:
+            return stats
         with self._routes_lock:
-            if path not in self._routes:
-                self._routes[path] = _RouteStats(self._window_size, self._ema_alpha, self._min_error_status)
-            return self._routes[path]
+            if path not in self._routes and len(self._routes) >= self._max_routes:
+                path = OTHER_ROUTE
+            stats = self._routes.get(path)
+            if stats is None:
+                stats = self._routes[path] = _RouteStats(self._window_size, self._ema_alpha, self._min_error_status)
+            return stats
 
-    async def dispatch(self, request: Request, call_next) -> Response:
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
         start = time.perf_counter()
         # Routing grows root_path by each Mount it enters; remember the starting
         # value so the mount prefix can be recovered afterwards.
-        entry_root_path = request.scope.get("root_path", "")
+        entry_root_path = scope.get("root_path", "")
+        status_code = 500  # a response that never starts counts as a server error
+        done = False
+
+        async def send_wrapper(message: Message) -> None:
+            nonlocal status_code, done
+            message_type = message["type"]
+            if message_type == "http.response.start":
+                status_code = message["status"]
+            elif message_type == "http.response.body" and not message.get("more_body", False) and not done:
+                # The last body chunk completes the response: record it here,
+                # so background tasks that run afterwards are not timed.
+                done = True
+                try:
+                    await send(message)
+                finally:
+                    self._record(scope, status_code, start, entry_root_path)
+                return
+            await send(message)
+
         try:
-            response = await call_next(request)
+            await self.app(scope, receive, send_wrapper)
         except Exception:
             # Unhandled exceptions become a 500 in Starlette's ServerErrorMiddleware,
             # which sits outside every user middleware — so this is the only place
             # the request can be counted.  Re-raise so that response is unchanged.
-            self._record(request, 500, start, entry_root_path)
+            if not done:
+                done = True
+                self._record(scope, 500, start, entry_root_path)
             raise
-        self._record(request, response.status_code, start, entry_root_path)
-        return response
+        if not done:
+            # No final body chunk (e.g. a ``pathsend`` file response): the
+            # request ends when the app returns.
+            self._record(scope, status_code, start, entry_root_path)
 
-    def _record(self, request: Request, status_code: int, start: float, entry_root_path: str) -> None:
+    def _record(self, scope: Scope, status_code: int, start: float, entry_root_path: str) -> None:
         """Record one finished request in the aggregate and its per-route bucket."""
+        if _is_health_route(scope):
+            return
         rtt_ms = round((time.perf_counter() - start) * 1000, 2)
         self._aggregate.record(status_code, rtt_ms)
 
         if self.per_route:
-            self._get_or_create(_route_key(request.scope, entry_root_path)).record(status_code, rtt_ms)
+            self._get_or_create(_route_key(scope, entry_root_path)).record(status_code, rtt_ms)
 
 
 # ---------------------------------------------------------------------------
