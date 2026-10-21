@@ -35,6 +35,10 @@ _MIN_POLL_INTERVAL_MS = 1000
 _AUTO_HTTP_METHODS = frozenset({"HEAD", "OPTIONS"})
 # Used when the caller passed no logger= but an error must still be reported.
 _LIB_LOGGER = logging.getLogger("fastapi_watch")
+# SSE: comment-line interval between events, and the reconnect delay hinted to
+# browsers in single-fetch mode.
+_SSE_KEEPALIVE_S = 15.0
+_SINGLE_FETCH_RETRY_MS = 30_000
 
 
 def _iter_app_routes(routes, prefix: str = "") -> Iterator[tuple[Any, str]]:
@@ -1280,21 +1284,17 @@ class HealthRegistry:
     # SSE (Server-Sent Events) streaming
     # ------------------------------------------------------------------
 
-    async def _wait_for_next_poll(self, request: Request) -> bool:
-        """Sleep for poll_interval_ms, checking client disconnect every 500 ms.
+    def _stream_interval_s(self) -> float | None:
+        """Seconds between stream events: the shortest effective probe interval.
 
-        Returns True if the client disconnected or the app is shutting down
-        before the interval elapsed.
+        Using only the global interval would leave a probe polled every 5 s
+        shown at the global 60 s cadence.  ``None`` when every probe is
+        single-fetch.
         """
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + self._poll_interval_ms / 1000
-        while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                return False
-            await asyncio.sleep(min(0.5, remaining))
-            if self._shutting_down or await request.is_disconnected():
-                return True
+        intervals = [s for p, _ in self._probes if (s := self._effective_interval_s(p)) is not None]
+        if intervals:
+            return min(intervals)
+        return self._poll_interval_ms / 1000 if self._poll_interval_ms is not None else None
 
     async def _event_stream(
         self,
@@ -1303,11 +1303,19 @@ class HealthRegistry:
         filter_tags: frozenset[str] | None = None,
         filter_probes: frozenset[str] | None = None,
     ) -> AsyncGenerator[str, None]:
-        """Async generator that yields SSE (Server-Sent Events) events while the client is connected."""
+        """Async generator that yields SSE (Server-Sent Events) events while the client is connected.
+
+        Between events it sends a comment line every ``_SSE_KEEPALIVE_S`` so
+        proxies with idle timeouts (commonly 60 s) do not cut the connection.
+        In single-fetch mode it sends one event with a ``retry:`` hint, so the
+        browser waits ``_SINGLE_FETCH_RETRY_MS`` before reconnecting instead of
+        its ~3 s default — each reconnect re-runs every probe.
+        """
         task = asyncio.current_task()
         if task is not None:
             self._sse_tasks.add(task)
         await self._on_connect()
+        loop = asyncio.get_running_loop()
         try:
             while not self._shutting_down:
                 results = await self._get_results()
@@ -1315,14 +1323,24 @@ class HealthRegistry:
                     results = [r for r in results if filter_tags & set(r.tags)]
                 if filter_probes:
                     results = [r for r in results if r.name in filter_probes]
+                interval_s = self._stream_interval_s()
+                if interval_s is None:
+                    yield f"retry: {_SINGLE_FETCH_RETRY_MS}\ndata: {make_report(results)}\n\n"
+                    return
                 yield f"data: {make_report(results)}\n\n"
-                if self._poll_interval_ms is None:
-                    return
-                if await self._wait_for_next_poll(request):
-                    return
-        except asyncio.CancelledError:
-            pass
+
+                deadline = loop.time() + interval_s
+                next_keepalive = loop.time() + _SSE_KEEPALIVE_S
+                while (now := loop.time()) < deadline:
+                    await asyncio.sleep(min(0.5, deadline - now))
+                    if self._shutting_down or await request.is_disconnected():
+                        return
+                    if loop.time() >= next_keepalive:
+                        yield ": keepalive\n\n"
+                        next_keepalive += _SSE_KEEPALIVE_S
         finally:
+            # Cancellation (client gone, shutdown) propagates after cleanup;
+            # swallowing it would leave the cancelling task believing it never ran.
             self._sse_tasks.discard(task)
             await self._on_disconnect()
 

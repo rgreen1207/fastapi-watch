@@ -35,7 +35,7 @@ def test_apikey_dashboard_stream_authenticates_with_its_token():
     assert "token=" in url
     resp = client.get(url)  # no header, as from EventSource
     assert resp.status_code == 200
-    assert resp.text.startswith("data: ")
+    assert "\ndata: " in resp.text or resp.text.startswith("data: ")
 
 
 def test_stream_without_token_or_header_is_rejected():

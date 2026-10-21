@@ -70,6 +70,16 @@ Three problems with the built-in dashboard's live (SSE) updates:
 - Live updates refreshed each probe card but never the summary line ("N / M probes healthy"), and a probe that first appeared after page load never got a card. The summary now updates with every event, and when the set of probes changes the page reloads once to pick it up (guarded against reload loops).
 - The stream URL was absolute (`/health/status/stream`), so a dashboard served under a mount or a proxy `root_path` connected to the wrong URL and never updated. It now includes the request's `root_path`.
 
+#### Live streams survive proxies and no longer cause reconnect storms
+
+The SSE endpoints (`/health/status/stream`, `/health/ready/stream`, and the dashboard that uses them) had three problems:
+
+- **No keepalives.** Nothing was sent between events, and with the default 60-second interval that matched the common 60-second idle timeout of load balancers and proxies, which cut the connection. The stream now sends a `: keepalive` comment every 15 seconds.
+- **Reconnect storm in single-fetch mode.** With no polling, the stream sent one event and closed; browsers reconnected about every 3 seconds per open tab, and each reconnect ran every probe. The single event now carries `retry: 30000`, so browsers wait 30 seconds.
+- **Cadence ignored per-probe intervals.** Events went out only at the global `poll_interval_ms` (and the stream closed when it was `None`, even if probes had their own intervals). Events now follow the shortest effective probe interval.
+
+The stream also no longer swallows `asyncio.CancelledError`; cancellation propagates after cleanup.
+
 #### Dashboard live updates work with header-based `auth=`
 
 With `auth={"type": "apikey", ...}` (or a callable checking a header), the dashboard page loaded but its live updates never did: a browser `EventSource` cannot send headers, so `/health/status/stream` answered `403` to every connection.
