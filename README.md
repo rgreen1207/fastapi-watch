@@ -83,7 +83,7 @@ Every route is now monitored with real-traffic data. Health endpoints are live a
 | `GET /health/alerts` | Probe state-change log | `200` |
 | `GET /health/startup` | Startup gate; 503 until `set_started()` | `200` / `503` |
 | `GET /health/ready/stream` | SSE stream of readiness | stream |
-| `GET /health/status/stream` | SSE stream of full probe detail | stream |
+| `GET /health/status/stream` | SSE stream of full probe detail (`?view=dashboard` trims per-route data to what the dashboard charts) | stream |
 | `GET /health/maintenance` | Maintenance mode status | `200` |
 | `POST /health/maintenance` | Enable maintenance mode — mounted only when `auth=` is set | `200` / `422` |
 | `DELETE /health/maintenance` | Disable maintenance mode — mounted only when `auth=` is set | `200` |
@@ -242,7 +242,9 @@ registry = HealthRegistry(
 )
 ```
 
-It is safe to point at the Redis your app already uses: it never runs `KEYS` or `SCAN`, every write is a single `MULTI/EXEC` round trip, and all keys sit under `prefix`, so give each app its own. Storage is capped by count, by age (per entry), and by bytes:
+The four retention arguments are passed to `HealthRegistry` here, so the registry applies them to the backend through `configure()`. Leave all four out and the backend keeps its own constructor values (`RedisProbeStorage(..., max_results=..., result_ttl_seconds=..., alert_ttl_seconds=..., max_alerts=...)`, same defaults).
+
+It is safe to point at the Redis your app already uses: it never runs `KEYS` or `SCAN`, every write is a single `MULTI/EXEC` round trip, and all keys sit under `prefix`. Cleanup of removed probes (`forget()`) only deletes names the same process wrote and no longer registers, so apps and replicas sharing a prefix never delete each other's data, even during a rolling deploy. Still, give each app its own prefix: two apps that register the same probe name on one prefix share that probe's data. Storage is capped by count, by age (per entry), and by bytes:
 
 ```
 redis bytes ≤ probes × (history_size × max_entry_bytes + one latest result) + max_alerts × (~150 B + probe name)

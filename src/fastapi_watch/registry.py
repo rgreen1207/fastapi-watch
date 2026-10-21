@@ -466,11 +466,13 @@ class HealthRegistry:
             for this many ms, measured from when the registry is created
             (affects ``/health/ready`` only).
         history_size: Number of past results kept per probe (default 120).
-            With a custom *storage*, this and the other retention arguments
-            (*result_ttl_seconds*, *alert_ttl_seconds*, *max_alerts*) are
-            applied through the backend's ``configure()`` when passed
-            explicitly; a backend without ``configure()`` keeps its own limits
-            and a warning names the ignored arguments.
+            With a custom *storage*, the retention arguments (this,
+            *result_ttl_seconds*, *alert_ttl_seconds*, *max_alerts*) reach the
+            backend only when at least one is passed explicitly: then its
+            ``configure()`` receives all four effective values (defaults for
+            the ones not passed).  Otherwise the backend keeps the values it
+            was constructed with.  A backend without ``configure()`` always
+            keeps its own limits, and a warning names any ignored arguments.
         groups: :class:`~fastapi_watch.ProbeGroup` instances to merge at startup.
         dashboard: ``True`` (default) — built-in HTML dashboard.  ``False`` — omit the
             route.  Callable ``(report: HealthReport) -> str`` — custom renderer;
@@ -498,7 +500,10 @@ class HealthRegistry:
             When the cap is reached the oldest alert is dropped (regardless of TTL).
         storage: Custom storage backend implementing :class:`~fastapi_watch.ProbeStorage`.
             Defaults to :class:`~fastapi_watch.InMemoryProbeStorage`.  Pass a Redis-backed
-            or other implementation here for persistence across restarts.
+            or other implementation here for persistence across restarts.  If it
+            defines ``forget(names)``, data of probes this process wrote and no
+            longer registers is deleted at most every 10 minutes; names it never
+            wrote are never touched, so apps and replicas can share a backend.
         webhook_url: HTTP(S) URL that receives a JSON ``POST`` whenever a probe
             changes state.  The call is fire-and-forget and never blocks health checks.
             Payload: ``{"probe", "old_status", "new_status", "timestamp"}``.
