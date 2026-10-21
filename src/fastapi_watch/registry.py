@@ -13,6 +13,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, AsyncGenerator, Awaitable, Callable, Iterator
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
@@ -278,6 +279,60 @@ def _validate_auth(auth) -> None:
             raise ValueError(f"auth {field!r} must be a non-empty string, got {type(value).__name__}")
         if not value.strip():
             raise ValueError(f"auth {field!r} must not be empty or whitespace")
+
+
+def _origin_matches(origin: str, hosts: list[str]) -> bool:
+    """True if *origin* (``scheme://host[:port]``) names one of *hosts* (``host[:port]``).
+
+    A missing port means the scheme's default on both sides, so a TLS-terminating
+    proxy that forwards ``Host: example.com`` still matches ``https://example.com``.
+    """
+    try:
+        parts = urlsplit(origin)
+        origin_port = parts.port
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return False  # includes the opaque "null" origin
+    default_port = 443 if parts.scheme == "https" else 80
+    wanted = (parts.hostname.lower(), origin_port or default_port)
+    for host in hosts:
+        try:
+            candidate = urlsplit(f"//{host.strip()}")
+            candidate_port = candidate.port
+        except ValueError:
+            continue
+        if candidate.hostname and (candidate.hostname.lower(), candidate_port or default_port) == wanted:
+            return True
+    return False
+
+
+async def _reject_cross_site(request: Request) -> None:
+    """Dependency for state-changing routes: refuse browser cross-site requests.
+
+    Basic credentials are cached by the browser and sent with any request to
+    the site, so without this a page elsewhere could ``<form method=post>`` to
+    ``/health/maintenance`` and switch on indefinite maintenance.  Refused with
+    403: ``Sec-Fetch-Site: cross-site``, or an ``Origin`` that does not match
+    the request's ``Host`` (or ``X-Forwarded-Host``).  A non-empty body that is
+    not ``application/json`` is refused with 415, which also rules out every
+    body a form or no-cors fetch can send.  Requests from non-browser clients
+    (curl, scripts) carry neither header and are unaffected.
+    """
+    if request.headers.get("sec-fetch-site", "").lower() == "cross-site":
+        raise HTTPException(status_code=403, detail="cross-site request refused")
+    origin = request.headers.get("origin")
+    if origin is not None:
+        hosts = [request.headers.get("host", "")]
+        forwarded = request.headers.get("x-forwarded-host")
+        if forwarded:
+            hosts.append(forwarded.split(",")[0])
+        if not _origin_matches(origin, hosts):
+            raise HTTPException(status_code=403, detail="cross-origin request refused")
+    if await request.body():
+        media_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+        if media_type != "application/json":
+            raise HTTPException(status_code=415, detail="request body must be application/json")
 
 
 def _make_auth_checker(auth) -> Callable | None:
@@ -1856,7 +1911,9 @@ class HealthRegistry:
         # State-changing routes are mounted only behind auth: an open POST would
         # let anyone pin /ready at 200 and silence alerts.  set_maintenance() and
         # clear_maintenance() remain available to the application either way.
+        # The cross-site check runs first, before credentials are even looked at.
         if auth_checker is not None:
+            change_deps = [Depends(_reject_cross_site), *auth_deps]
 
             @self.app.post(
                 f"{prefix}/maintenance",
@@ -1867,8 +1924,9 @@ class HealthRegistry:
                     "``{\"until\": \"<ISO datetime>\"}``."
                     " Omit body (or send ``{}``) for indefinite maintenance."
                     " A naive ``until`` is read in the registry timezone; a past one is rejected with 422."
+                    " A body must be ``application/json`` (415 otherwise); browser cross-site requests get 403."
                 ),
-                dependencies=auth_deps,
+                dependencies=change_deps,
             )
             async def enable_maintenance(body: _MaintenanceRequest = Body(default=_MaintenanceRequest())) -> Response:
                 now = datetime.now(registry._tzinfo)
@@ -1892,8 +1950,8 @@ class HealthRegistry:
                 f"{prefix}/maintenance",
                 tags=tags,
                 summary="Disable maintenance mode",
-                description="Clears maintenance mode immediately.",
-                dependencies=auth_deps,
+                description="Clears maintenance mode immediately. Browser cross-site requests get 403.",
+                dependencies=change_deps,
             )
             async def disable_maintenance() -> Response:
                 registry.clear_maintenance()
