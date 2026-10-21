@@ -12,16 +12,17 @@ import signal as _signal
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, AsyncGenerator, Awaitable, Callable, Iterator
-from urllib.parse import urlsplit
+from typing import Any, AsyncGenerator, Awaitable, Callable, Iterator, Literal
+from urllib.parse import urlencode, urlsplit
 from zoneinfo import ZoneInfo
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
+from pydantic_core import to_json
 
 from .alerts import BaseAlerter, WebhookAlerter
-from .dashboard import render_dashboard
+from .dashboard import _current_probe, render_dashboard
 from .models import AlertRecord, HealthReport, ProbeResult, ProbeStatus
 from .prometheus import render_prometheus, validate_metrics_prefix
 from .probe_group import ProbeGroup
@@ -443,7 +444,8 @@ class HealthRegistry:
     - ``GET    /health/startup``       — startup check; 503 until :meth:`set_started` is called
     - ``GET    /health/dashboard``     — HTML dashboard with live SSE (Server-Sent Events) updates
     - ``GET    /health/ready/stream``  — SSE (Server-Sent Events) stream of readiness
-    - ``GET    /health/status/stream`` — SSE (Server-Sent Events) stream of full probe detail
+    - ``GET    /health/status/stream`` — SSE (Server-Sent Events) stream of full probe detail;
+      ``?view=dashboard`` slims routes to what the built-in dashboard charts
     - ``GET    /health/maintenance``   — current maintenance mode status
     - ``POST   /health/maintenance``   — enable maintenance mode (optional body: ``minutes`` or ``until``);
       mounted only when *auth* is set
@@ -2100,19 +2102,26 @@ class HealthRegistry:
 
             stream_deps = [Depends(_stream_auth)]
 
-        def _make_sse_report(results: list[ProbeResult]) -> str:
-            return HealthReport.from_results(
+        def _make_sse_report(results: list[ProbeResult], view: str | None = None) -> str:
+            report = HealthReport.from_results(
                 results,
                 checked_at=registry._last_checked_at,
                 timezone=registry._timezone_name,
-            ).model_dump_json()
+            )
+            if view != "dashboard":
+                return report.model_dump_json()
+            # The built-in dashboard's view: the same slimming as the page's
+            # embedded probes (full details, routes cut to the charted top ones).
+            data = report.model_dump(mode="json", exclude={"probes"})
+            data["probes"] = [_current_probe(r) for r in report.probes]
+            return to_json(data).decode()
 
         sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
         def _storage_unavailable() -> Response:
             return JSONResponse({"error": "storage unavailable"}, status_code=503)
 
-        def _open_stream(request: Request, tag: str | None, probe: str | None) -> Response:
+        def _open_stream(request: Request, tag: str | None, probe: str | None, view: str | None) -> Response:
             """Start an SSE response, or answer 503 once ``max_stream_connections`` are open.
 
             The slot is taken here, before the generator starts, so a burst of
@@ -2129,7 +2138,7 @@ class HealthRegistry:
             return _SlotStreamingResponse(
                 registry._event_stream(
                     request,
-                    _make_sse_report,
+                    functools.partial(_make_sse_report, view=view),
                     filter_tags=_parse_csv_filter(tag),
                     filter_probes=_parse_csv_filter(probe),
                     expires_at=getattr(request.state, "stream_token_expiry", None),
@@ -2310,22 +2319,39 @@ class HealthRegistry:
             request: Request,
             tag: str | None = Query(default=None),
             probe: str | None = Query(default=None),
+            view: Literal["dashboard"] | None = Query(
+                default=None,
+                description=(
+                    "``dashboard``: each probe's ``details.routes`` cut to the 8 busiest routes "
+                    "with only the charted fields, as the built-in dashboard needs."
+                ),
+            ),
         ) -> Response:
-            return _open_stream(request, tag, probe)
+            return _open_stream(request, tag, probe, view)
 
         @self.app.get(
             f"{prefix}/status/stream",
             tags=tags,
             summary="Health status stream",
-            description="SSE (Server-Sent Events) stream of full probe results. Poll loop stops when last client disconnects.",
+            description=(
+                "SSE (Server-Sent Events) stream of full probe results. Poll loop stops when last client disconnects. "
+                "``view=dashboard`` cuts each probe's ``details.routes`` to what the built-in dashboard charts."
+            ),
             dependencies=stream_deps,
         )
         async def status_stream(
             request: Request,
             tag: str | None = Query(default=None),
             probe: str | None = Query(default=None),
+            view: Literal["dashboard"] | None = Query(
+                default=None,
+                description=(
+                    "``dashboard``: each probe's ``details.routes`` cut to the 8 busiest routes "
+                    "with only the charted fields, as the built-in dashboard needs."
+                ),
+            ),
         ) -> Response:
-            return _open_stream(request, tag, probe)
+            return _open_stream(request, tag, probe, view)
 
         @self.app.get(
             f"{prefix}/metrics",
@@ -2439,9 +2465,10 @@ class HealthRegistry:
                     # root_path carries any mount or proxy prefix the app is served
                     # under; without it the page would stream from the wrong URL.
                     root_path = request.scope.get("root_path", "").rstrip("/")
-                    stream_url = f"{root_path}{prefix}/status/stream"
+                    params = {"view": "dashboard"}  # slimmed events: only what the page reads
                     if token_key is not None:
-                        stream_url += f"?token={_mint_stream_token(token_key)}"
+                        params["token"] = _mint_stream_token(token_key)
+                    stream_url = f"{root_path}{prefix}/status/stream?{urlencode(params)}"
                     return render_dashboard(report, stream_url=stream_url, maintenance_banner=maintenance, history=history)
 
             @self.app.get(

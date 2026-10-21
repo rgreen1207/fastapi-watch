@@ -109,7 +109,7 @@ def test_callable_auth_gets_a_working_token():
 
 def test_no_auth_means_no_token():
     html = TestClient(_app(None)).get("/health/dashboard").text
-    assert _stream_url(html) == "/health/status/stream"
+    assert _stream_url(html) == "/health/status/stream?view=dashboard"
 
 
 # ---------------------------------------------------------------------------

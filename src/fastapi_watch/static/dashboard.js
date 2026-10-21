@@ -273,6 +273,8 @@
   // ── Page ──────────────────────────────────────────────────────────────
 
   var doc = root.document;
+  // The server's URL asks for ?view=dashboard, so events arrive with routes
+  // already cut to TOP_ROUTES; pointsFor() still slims whatever it is given.
   var streamUrl = doc.body.getAttribute('data-stream-url');
   var SVGNS = 'http://www.w3.org/2000/svg';
 

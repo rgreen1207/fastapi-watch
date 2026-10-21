@@ -468,7 +468,7 @@ def test_stream_url_includes_root_path(root_path):
     app = FastAPI()
     HealthRegistry(app)
     html = TestClient(app, root_path=root_path).get("/health/dashboard").text
-    assert 'data-stream-url="/api/health/status/stream"' in html
+    assert 'data-stream-url="/api/health/status/stream?view=dashboard"' in html
 
 
 def test_stream_url_when_registry_app_is_mounted():
@@ -476,13 +476,13 @@ def test_stream_url_when_registry_app_is_mounted():
     HealthRegistry(inner)
     outer.mount("/svc", inner)
     html = TestClient(outer).get("/svc/health/dashboard").text
-    assert 'data-stream-url="/svc/health/status/stream"' in html
+    assert 'data-stream-url="/svc/health/status/stream?view=dashboard"' in html
 
 
 def test_stream_url_without_prefix_is_unchanged():
     app = FastAPI()
     HealthRegistry(app)
-    assert 'data-stream-url="/health/status/stream"' in TestClient(app).get("/health/dashboard").text
+    assert 'data-stream-url="/health/status/stream?view=dashboard"' in TestClient(app).get("/health/dashboard").text
 
 
 # ---------------------------------------------------------------------------
