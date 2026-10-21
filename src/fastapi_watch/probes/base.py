@@ -26,6 +26,25 @@ def _failure_message(probe_name: str, exc: BaseException) -> str:
     return f"probe check failed: {type(exc).__name__}"
 
 
+def _validate_stats_params(
+    *, window_size: int, ema_alpha: float, max_error_rate: float, cache_window_size: int | None = None
+) -> None:
+    """Raise ``ValueError`` for settings that would leave a probe unable to record.
+
+    A zero-length window makes every recording fail; that failure is swallowed
+    (recording must never break the call it observes), so the probe would
+    silently report nothing forever.
+    """
+    if window_size <= 0:
+        raise ValueError(f"window_size must be a positive integer, got {window_size!r}")
+    if cache_window_size is not None and cache_window_size <= 0:
+        raise ValueError(f"cache_window_size must be a positive integer or None, got {cache_window_size!r}")
+    if not 0 < ema_alpha <= 1:
+        raise ValueError(f"ema_alpha must be in (0, 1], got {ema_alpha!r}")
+    if not 0 <= max_error_rate <= 1:
+        raise ValueError(f"max_error_rate must be in [0, 1], got {max_error_rate!r}")
+
+
 def _update_ema(current: float | None, value: float, alpha: float) -> float:
     """Return an updated exponential moving average."""
     return value if current is None else alpha * value + (1 - alpha) * current
@@ -189,6 +208,12 @@ class PassiveProbe(BaseProbe):
         timeout: float | None = None,
         poll_interval_ms: int | None = None,
     ) -> None:
+        _validate_stats_params(
+            window_size=window_size,
+            ema_alpha=ema_alpha,
+            max_error_rate=max_error_rate,
+            cache_window_size=cache_window_size,
+        )
         self.name = name
         self.description = description
         self.tags = list(tags) if tags else []
