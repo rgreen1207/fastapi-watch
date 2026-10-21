@@ -4,6 +4,22 @@
 
 **Correctness and hardening release.**
 
+### Upgrading: behavior changes in this release
+
+Most fixes need no action. These change what you see or what is accepted:
+
+- **`details["last_error"]` holds the exception type only** (`"IntegrityError"`, `"HTTPException"`), not its message. Pass `expose_error_messages=True` to a passive or route probe to restore the message. See Security Fixes.
+- **`CeleryProbe(detailed=True)` drops task `args`/`kwargs`**; pass `include_task_args=True` to keep them. Task lists are capped at 50 per worker.
+- **Readiness reflects this process only.** With a shared `storage=`, each replica reports its own registered probes as it checked them; results written by other replicas or apps are no longer served.
+- **Blank credentials are rejected.** An empty or whitespace `key`, `username`, or `password` in `auth=` raises `ValueError` at startup.
+- **`POST`/`DELETE /health/maintenance` refuse cross-site browser requests (`403`) and non-JSON bodies (`415`).** curl and other non-browser clients are unaffected.
+- **Retention arguments reach custom backends.** `history_size`, `result_ttl_seconds`, `alert_ttl_seconds`, and `max_alerts` passed together with `storage=` are applied through the backend's `configure()`; a backend without one logs a warning naming the ignored arguments.
+- **Request metrics no longer count fastapi-watch's own routes**, and streaming responses are timed until their last chunk, so their RTT rises.
+- **Invalid probe and middleware settings raise `ValueError`** (`window_size <= 0`, `cache_window_size <= 0`, `ema_alpha` outside (0, 1], `max_error_rate` outside [0, 1], `max_routes < 1`) instead of silently recording nothing.
+- **Dashboard stream tokens** are signed with a new key, so tokens minted before the upgrade stop validating (they lasted at most 5 minutes; the page reloads itself). A token-authorized dashboard reloads about every 5 minutes to fetch a fresh token.
+- **`/health/history` and `/health/alerts` return `503 {"error": "storage unavailable"}`** when the storage backend fails, instead of `500`.
+- **Results are listed in registration order**, not storage insertion order.
+
 ### Bug Fixes
 
 #### `error_rate` now reflects recent traffic, not the process lifetime
@@ -166,6 +182,52 @@ Current aiohttp deprecates `aiohttp.BasicAuth` (removed in aiohttp 4.0). The man
 
 The early-shutdown hook cancelled SSE, poll, and alert tasks directly inside a `signal.signal()` handler, which can run in the middle of any event-loop callback. It now only sets the shutdown flag and schedules the cancellation on the loop with `call_soon_threadsafe()`; without a running loop the flag alone stops every stream within one 500 ms tick. A failure to install the hook (non-main thread) is logged at debug level instead of being silently ignored.
 
+#### Health checks survive storage outages
+
+Storage calls were awaited unguarded, so a storage backend that failed or hung failed or hung every health endpoint with it: with Redis down, `/health/ready` returned `500` and Kubernetes would take every pod out of rotation because the *monitoring store* was down, not the app.
+
+**Fix:** new `HealthRegistry(storage_timeout=2.0)` bounds every storage call (`None` disables the bound). Failures and timeouts are logged at most once a minute per operation and never fail a request. `/health/ready`, `/status`, `/metrics`, and the streams answer from this process's own last results; `/history` and `/alerts` return `503 {"error": "storage unavailable"}`; the dashboard renders without history. Writes run concurrently, so a hung backend costs one timeout per check rather than one per write.
+
+#### Readiness reflects this process, not whatever is in shared storage
+
+With a shared `storage=`, `_get_results` skipped any probe that already had a stored result — possibly written by another replica — and returned every entry in storage, including other apps' probes. A replica that could not reach its database could report healthy (or the reverse), and every request read storage twice.
+
+**Fix:** health endpoints report only this registry's probes, from results this process produced, and a probe that has not run in this process runs first. Requests no longer read storage at all; storage holds history, alerts, and the latest result for the circuit breaker's fallback.
+
+#### Retention settings are no longer ignored with a custom `storage=`
+
+`history_size`, `result_ttl_seconds`, `alert_ttl_seconds`, and `max_alerts` were only used to build the default in-memory backend, so `HealthRegistry(storage=X, history_size=5)` silently kept the backend's own limits.
+
+**Fix:** when any of them is passed with `storage=`, the backend's optional `configure()` receives all four effective values; a backend without `configure()` logs a warning naming the ignored arguments. Omitted arguments leave the backend's own constructor values in place.
+
+#### Failures during maintenance alert once maintenance ends
+
+Probe states kept updating while alerters were suppressed, so a dependency that failed during maintenance and was still down afterwards never alerted.
+
+**Fix:** the registry tracks the last state actually sent to alerters. After maintenance, the first check sends the difference (`healthy -> unhealthy` for an outage that is still ongoing, `unhealthy -> healthy` to resolve one that recovered inside the window); a failure that started and ended inside the window sends nothing. An alert dropped because the queue was full is retried on the next check. `on_state_change` callbacks and `/health/alerts` still record every real transition.
+
+#### Circuit-breaker results keep their original timestamp
+
+While a probe's circuit was open the registry served its cached result stamped with a fresh `checked_at`, so graphs and history showed stale data as current. The cached result now keeps its original `checked_at`.
+
+#### Timed-out blocking checks no longer pile up threads in the app's executor
+
+`CeleryProbe` inspections and `TCPProbe` DNS lookups ran in the event loop's default executor, which the app shares. A timeout cancels the coroutine but not the thread, so a hung broker or DNS server added a stuck thread on every poll (1 → 11 threads after 10 timeouts), starving the app's own `run_in_executor` work.
+
+**Fix:** blocking work — Celery inspection, TCP DNS lookups, and alerter webhook posts — runs in fastapi-watch's own pool of at most 4 daemon threads. A probe whose previous blocking call is still running reports UNHEALTHY with `"previous check still running"` instead of starting another, so each hung dependency holds at most one thread. `TCPProbe` now resolves once and connects to the resolved addresses. Alerter `timeout` now bounds the whole webhook request rather than each socket read, so a slow endpoint fails with `TimeoutError` instead of holding a thread.
+
+#### Invalid probe settings fail at startup
+
+`window_size=0` or `cache_window_size=0` made every recording raise `IndexError`, which was swallowed, so the probe silently recorded nothing forever. Passive, route, and WebSocket probes and `RequestMetricsMiddleware` now raise `ValueError` for out-of-range `window_size`, `cache_window_size`, `ema_alpha`, `max_error_rate`, and `max_routes`. `PassiveProbe.check()` also reads its state under its lock, which is safe on free-threaded Python.
+
+#### `EventLoopProbe` stops its sampler at shutdown
+
+New `BaseProbe.aclose()` (a no-op by default) is awaited for every registered and startup probe at shutdown. `EventLoopProbe` uses it to cancel its background sampler; `ThresholdProbe` forwards it to the probe it wraps.
+
+#### Data for removed probes is cleaned up
+
+Storage kept latest results and history for probes the registry no longer had. Backends that implement the new optional `forget(names)` are told, at most every 10 minutes, about probes this process wrote and has since stopped registering. Names this process never wrote are never touched, so apps and replicas can share a storage prefix safely.
+
 ### New Features
 
 #### Redesigned dashboard: a timeboard with graphs
@@ -184,6 +246,33 @@ The page remains a single self-contained HTML document: inline SVG and vanilla J
 
 To support the graphs, every `ProbeResult` now carries `checked_at` — the time the registry recorded it — in all responses, history, and stored results. Custom storage backends that serialize the model pick it up automatically.
 
+#### `RedisProbeStorage`: a bounded, first-party Redis backend
+
+`ProbeStorage`'s documentation carried a Redis "sketch" that users copied. It never applied `max_alerts` (the alert list grew for as long as alerts kept arriving — 5,000 of 5,000 kept in testing), never aged individual entries (the TTL covered whole keys and was refreshed on every write), errored or deleted data with a TTL of `0` (documented as "no expiry"), could leave keys without a TTL after a partial write, stored full `details` per history entry (3.4 MB for one 150-route probe), and used `KEYS`, which blocks a Redis the app usually shares.
+
+New `fastapi_watch.RedisProbeStorage(redis_client, prefix=..., max_results=..., result_ttl_seconds=..., alert_ttl_seconds=..., max_alerts=..., max_entry_bytes=8192)` (needs the `redis` extra) replaces it:
+
+- History and alerts are sorted sets scored by time, trimmed by count **and** age on every write and filtered on read.
+- Each write is one `MULTI/EXEC` transaction; a TTL of `0` means no expiry and never deletes data.
+- History entries are capped at `max_entry_bytes`: the largest `details` values are dropped first and the entry is marked `_truncated`. Total usage is bounded and the bound is documented.
+- No `KEYS` or `SCAN`: an index set plus pipelined reads keep each read to two round trips regardless of probe count.
+- All keys live under a configurable `prefix`; wrap it in braces (`{myapp:health}`) on Redis Cluster.
+
+Storage backends may also implement three optional methods: `configure()` (receives the registry's retention settings), `forget(names)` (deletes data for removed probes), and `claim_alert(key, ttl_seconds)` (cross-replica alert dedupe). Existing custom backends keep working unchanged. `InMemoryProbeStorage` implements all three.
+
+#### Opt-in alert flap limiting and multi-replica dedupe
+
+Every replica alerted on every transition, and a flapping probe alerted on each flip.
+
+- `alert_min_interval_s` sends at most one alert per probe per interval. The first change after a quiet interval alerts immediately; later changes are coalesced and the latest status is sent when the interval ends. The final state is never lost, and a flap that ends where it started sends nothing.
+- `alert_dedupe_window_s`, with a shared backend that implements `claim_alert()` such as `RedisProbeStorage`, has only one replica send each alert. If the claim fails, the alert is sent anyway.
+
+Both are off by default. `on_state_change` callbacks and `/health/alerts` are unaffected.
+
+#### Stream connection cap
+
+New `max_stream_connections` (default `100`) bounds concurrent SSE streams; further requests get `503` with `Retry-After: 30`. `None` removes the cap.
+
 #### `metrics_prefix` for Prometheus metric names
 
 The `/metrics` endpoint names every metric `probe_*` (`probe_healthy`, `probe_latency_ms`, …), which collides with blackbox_exporter's `probe_*` metrics when both are scraped into one Prometheus. New `HealthRegistry(metrics_prefix="fastapi_watch_")` namespaces them. The default `""` keeps the existing names, so current dashboards and alerts are unaffected; a non-empty default may come in a future minor release.
@@ -196,6 +285,10 @@ The `/metrics` endpoint names every metric `probe_*` (`probe_healthy`, `probe_la
 - `PassiveProbe(poll_interval_ms=..., timeout=...)`.
 - `circuit_breaker_enabled` parameter on `RequestMetricsProbe` and `FastAPIWebSocketProbe`.
 - `CeleryProbe.reply_timeout` (the per-broadcast wait, previously only available as `timeout`).
+- `HealthRegistry(storage_timeout=..., max_stream_connections=..., alert_min_interval_s=..., alert_dedupe_window_s=..., stream_token_secret=...)` — see above and Security Fixes.
+- `PassiveProbe(expose_error_messages=...)` and `CeleryProbe(include_task_args=...)` — opt back in to the old details (see Security Fixes).
+- `RequestMetricsMiddleware(max_routes=500)` — see Performance.
+- `BaseProbe.aclose()`.
 
 ### Performance
 
@@ -210,6 +303,18 @@ With `per_route=True`, a request that matched no route was bucketed under its co
 Each request that found a probe due ran it independently, so a burst of readiness checks, open dashboards, and the poll loop multiplied load on the very dependency being checked (20 concurrent `/health/ready` requests ran a 60-second-interval probe 20 times). Because the runs raced, a slower, older result could also land last and overwrite a newer one, producing spurious state flips and alerts.
 
 **Fix:** a probe that is already being checked is joined rather than restarted; every caller receives the same result, and storage, history, and state-change handling happen exactly once per run. A caller that disconnects mid-run no longer cancels the run for the others.
+
+#### Request metrics middleware is pure ASGI
+
+`RequestMetricsMiddleware` was a Starlette `BaseHTTPMiddleware`, which added about 155 µs to every request of the host app, broke context-variable propagation, and timed streaming responses only until their headers were sent. It is now pure ASGI middleware with the same API: about 3.5 µs per request, context variables propagate normally, streaming responses are timed until their last chunk (background tasks are not timed), WebSocket and lifespan traffic pass straight through, and fastapi-watch's own health and dashboard routes are not counted.
+
+#### Bounded per-route table
+
+A `Mount` with a path parameter (`/t/{tenant}`) produced one per-route entry per concrete tenant. New `RequestMetricsMiddleware(max_routes=500)` sends further routes to one `"<other>"` entry.
+
+#### A smaller dashboard that stays small
+
+The dashboard embedded every stored result with full `details` — about 4 MB for one 150-route `RequestMetricsProbe` — on every load and every auto-reload, and an open tab kept every live update forever. The page now embeds only the fields its graphs draw and the eight busiest routes (4 MB → 212 KB; render time ~56 ms → ~2 ms), and the browser keeps at most 2,000 points per probe, none older than the longer of 2 hours and the stored history.
 
 ### Security Fixes
 
@@ -231,8 +336,31 @@ With the default `auth=None`, anyone who could reach the service could `POST /he
 
 The `basic` auth check compared the password only when the username matched, so response timing could reveal whether a guessed username was correct. Both are now compared before the result is combined.
 
+#### Exception messages no longer appear in health responses
+
+Passive and route probes stored `"<type>: <message>"` as `details["last_error"]`, served on `/health/status`, the streams, and the dashboard — public unless `auth=` is set. Driver messages embed connection strings, credentials, and bound query parameters; in testing an unauthenticated `/health/status` exposed an email address and SSN from a failed `INSERT`. `HTTPException.detail` was exposed the same way.
+
+**Fix:** `last_error` is the exception type only (`"IntegrityError"`, `"HTTPException"`, or `"HTTP 503"` for an error status returned without raising). The full exception is logged at debug level on the `fastapi_watch` logger. `expose_error_messages=True` restores the message.
+
+#### `CeleryProbe(detailed=True)` no longer publishes task arguments
+
+Task `args` and `kwargs` — often user data or secrets — were included for every active, reserved, and scheduled task. They are dropped unless `include_task_args=True`, and each list is capped at 50 entries per worker with a `truncated` count.
+
+#### Maintenance endpoints resist cross-site requests
+
+A cross-site `<form method="post">` to `/health/maintenance` sent with the browser's cached Basic credentials switched on indefinite maintenance — `/ready` pinned at `200`, alerts muted. `POST` and `DELETE /health/maintenance` now reject `Sec-Fetch-Site: cross-site` and mismatched `Origin` headers with `403`, and non-empty non-JSON bodies with `415`. curl and other clients that send no `Origin` are unaffected.
+
+#### Blank credentials are rejected
+
+`auth={"type": "apikey", "key": ""}` admitted every request that sent no header. An empty or whitespace `key`, `username`, or `password` — or an unknown auth type — now raises `ValueError` at startup, without echoing the value.
+
+#### Dashboard stream tokens can no longer be used to guess credentials
+
+The stream token's signing key was a single SHA-256 of the password or API key, and tokens travel in URLs (and so in proxy logs and browser history), allowing fast offline guessing of weak credentials. The key is now derived with scrypt once at startup (PBKDF2 where scrypt is unavailable). New `stream_token_secret=` signs tokens with a key you provide — use it to share tokens across workers with a callable `auth`. A stream authorized only by a token now closes when the token expires; header-authenticated streams are unaffected.
+
 ### Infrastructure
 
+- **CI on every push and tag**, not only pull requests, with a `redis:7` service so `RedisProbeStorage` is tested against a real server. The concurrency group now keys on the branch for pushes so unrelated runs do not cancel each other.
 - **CI on pull requests.** A new `ci.yml` workflow runs the suite across Python 3.10–3.15 against FastAPI 0.100 (the oldest supported release) and the latest FastAPI. Previously tests only ran on Python 3.11 at publish time. Optional extras install individually so a driver without wheels for a new Python (currently `aiokafka` on 3.15) skips its own tests rather than blocking the run.
 - **Python 3.15** added to the supported classifiers.
 - **Python 3.16 readiness.** CI also runs against the 3.16 pre-release as a non-blocking job; the classifier will be added once 3.16 is final. `asyncio.iscoroutinefunction`, which 3.16 removes (and which warned on every `watch()` from 3.14), is replaced by `inspect.iscoroutinefunction`.
