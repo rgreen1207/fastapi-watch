@@ -52,7 +52,9 @@ This file contains the complete reference for fastapi-watch. For the condensed o
 
 ## Health dashboard
 
-`GET /health/dashboard` returns a timeboard: every graph shares one time axis, so a status change, a latency spike, and an error burst line up vertically. It is a single self-contained HTML page — inline SVG and vanilla JavaScript, no CDN or external assets, so it works in air-gapped clusters and under a strict CSP — and it updates live over SSE. Light and dark themes follow the viewer's OS setting.
+`GET /health/dashboard` returns a timeboard: every graph shares one time axis, so a status change, a latency spike, and an error burst line up vertically. It is a single self-contained HTML page — inline SVG and vanilla JavaScript, no CDN or external assets, so it works in air-gapped clusters — and it updates live over SSE. Light and dark themes follow the viewer's OS setting.
+
+The page's script and styles are inline `<script>` and `<style>` elements without a nonce or hash, so a Content-Security-Policy that disallows inline code (`script-src` / `style-src` without `'unsafe-inline'`) blocks them, and the page loses its styling, graphs, and live updates. If your app sets such a policy, exempt the dashboard route from it, pass your own renderer as `dashboard=`, or turn the dashboard off with `dashboard=False`.
 
 ```python
 registry = HealthRegistry(app)                  # dashboard on — GET /health/dashboard
