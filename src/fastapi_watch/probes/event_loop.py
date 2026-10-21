@@ -7,11 +7,17 @@ from .base import BaseProbe
 class EventLoopProbe(BaseProbe):
     """Measures asyncio event loop lag.
 
-    Schedules an immediate wakeup via ``await asyncio.sleep(0)`` and measures
-    how long it actually takes.  High lag means the event loop is blocked —
-    sync code running on the async path, a CPU-bound coroutine, or a
-    slow coroutine that isn't yielding.  FastAPI becomes unresponsive before
-    any infrastructure probe would detect the problem.
+    High lag means the event loop is blocked — sync code running on the async
+    path, a CPU-bound coroutine, or a slow coroutine that isn't yielding.
+    FastAPI becomes unresponsive before any infrastructure probe would detect
+    the problem.
+
+    A single measurement taken at check time only runs once the loop is free
+    again, so it cannot see a stall that happened between polls.  Instead, the
+    first check starts a lightweight background sampler that repeatedly sleeps
+    for ``sample_interval_ms`` and records how late it wakes up; each check
+    reports the worst lag seen since the previous check (``lag_ms``) alongside
+    a fresh immediate measurement (``current_lag_ms``).
 
     Args:
         name: Probe name (default ``"event_loop"``).
@@ -20,6 +26,9 @@ class EventLoopProbe(BaseProbe):
         fail_ms: Lag threshold in ms above which the probe is UNHEALTHY
             (default ``20.0``).
         poll_interval_ms: Per-probe poll interval override.
+        sample_interval_ms: How often the background sampler measures lag
+            (default ``100``).  Lower values catch shorter stalls at slightly
+            higher (still negligible) cost.
 
     Example::
 
@@ -32,17 +41,44 @@ class EventLoopProbe(BaseProbe):
         warn_ms: float = 5.0,
         fail_ms: float = 20.0,
         poll_interval_ms: int | None = None,
+        sample_interval_ms: float = 100.0,
     ) -> None:
         self.name = name
         self.warn_ms = warn_ms
         self.fail_ms = fail_ms
         self.poll_interval_ms = poll_interval_ms
+        self.sample_interval_ms = sample_interval_ms
+        self._worst_lag_ms = 0.0
+        self._sampler: asyncio.Task | None = None
+
+    async def _sample(self) -> None:
+        """Record how late each timed sleep wakes up, forever."""
+        loop = asyncio.get_running_loop()
+        interval_s = self.sample_interval_ms / 1000
+        while True:
+            start = loop.time()
+            await asyncio.sleep(interval_s)
+            lag_ms = (loop.time() - start - interval_s) * 1000
+            if lag_ms > self._worst_lag_ms:
+                self._worst_lag_ms = lag_ms
+
+    def _ensure_sampler(self) -> None:
+        """Start the sampler on the running loop if it is not already running there."""
+        loop = asyncio.get_running_loop()
+        sampler = self._sampler
+        if sampler is None or sampler.done() or sampler.get_loop() is not loop:
+            self._sampler = loop.create_task(self._sample(), name=f"fastapi-watch-{self.name}-sampler")
 
     async def check(self) -> ProbeResult:
+        self._ensure_sampler()
         loop = asyncio.get_running_loop()
         before = loop.time()
         await asyncio.sleep(0)
-        lag_ms = round((loop.time() - before) * 1000, 3)
+        current_lag_ms = round((loop.time() - before) * 1000, 3)
+
+        # Worst lag since the previous check; the window restarts with each check.
+        lag_ms = round(max(self._worst_lag_ms, current_lag_ms), 3)
+        self._worst_lag_ms = 0.0
 
         if lag_ms >= self.fail_ms:
             status = ProbeStatus.UNHEALTHY
@@ -57,6 +93,7 @@ class EventLoopProbe(BaseProbe):
             latency_ms=lag_ms,
             details={
                 "lag_ms": lag_ms,
+                "current_lag_ms": current_lag_ms,
                 "warn_ms": self.warn_ms,
                 "fail_ms": self.fail_ms,
             },

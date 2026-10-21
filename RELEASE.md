@@ -122,6 +122,12 @@ The circuit breaker was on by default for passive probes (`PassiveProbe` and its
 
 Current aiohttp deprecates `aiohttp.BasicAuth` (removed in aiohttp 4.0). The management-API request now sends a standard `Authorization: Basic` header built directly, which works across every supported aiohttp version.
 
+#### `EventLoopProbe` catches stalls between checks
+
+`EventLoopProbe` timed a single `asyncio.sleep(0)` at check time. That measurement only runs once the loop is free again, so a stall between checks — the thing the probe exists to catch — was invisible, and what it did measure was mostly the sibling probes' synchronous work in the same batch.
+
+**Fix:** the first check starts a lightweight background sampler that sleeps for `sample_interval_ms` (new, default 100) and records how late it wakes. `lag_ms` is now the worst lag since the previous check; the new `current_lag_ms` keeps the immediate measurement. `warn_ms` / `fail_ms` semantics are unchanged.
+
 #### Probe failures say what failed
 
 `TCPProbe`, `MemcachedProbe`, `RabbitMQProbe`, `KafkaProbe`, `CeleryProbe`, and the registry's handler for exceptions escaping `check()` all reported the bare string `"probe check failed"` and discarded the exception, so a refused connection, a DNS failure, and a timeout looked identical on the dashboard. They now report the exception type — `"probe check failed: ConnectionRefusedError"` — still never the message text, which can carry credentials or internal hostnames; the full exception is logged at debug level on the `fastapi_watch` logger.

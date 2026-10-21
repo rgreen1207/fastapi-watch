@@ -1066,7 +1066,7 @@ registry.add(chat_probe)
 
 ### Event loop lag
 
-`EventLoopProbe` measures asyncio event loop blocking by timing a zero-delay `asyncio.sleep(0)`.
+`EventLoopProbe` measures asyncio event loop blocking. Its first check starts a lightweight background sampler that sleeps for `sample_interval_ms` (default 100) and records how late it wakes up, so stalls that happen *between* checks are caught — a single measurement at check time only runs once the loop is free again.
 
 ```python
 from fastapi_watch.probes import EventLoopProbe
@@ -1074,7 +1074,7 @@ from fastapi_watch.probes import EventLoopProbe
 registry.add(EventLoopProbe(warn_ms=5.0, fail_ms=20.0))
 ```
 
-Details: `lag_ms`, `warn_ms`, `fail_ms`. Returns DEGRADED above `warn_ms`, UNHEALTHY above `fail_ms`.
+Details: `lag_ms` (worst lag since the previous check), `current_lag_ms` (an immediate measurement), `warn_ms`, `fail_ms`. Returns DEGRADED at `warn_ms` or above, UNHEALTHY at `fail_ms` or above.
 
 ---
 
@@ -1346,7 +1346,7 @@ registry.add(db_probe)
 | `RequestMetricsMiddleware` + `RequestMetricsProbe` | built-in | `per_route`, `max_error_rate`, `max_avg_rtt_ms` | `request_count`, `error_count`, `error_rate`, `avg_rtt_ms`, `consecutive_errors`; + `routes` when `per_route=True` |
 | `FastAPIRouteProbe` | built-in | `name`, `max_error_rate`, `max_avg_rtt_ms`, `min_error_status`, `slow_call_threshold_ms`, `cache_window_size`, `cache_time_window_s`, `cache_reporting`, `circuit_breaker_enabled` | `request_count`, `error_count`, `error_rate`, `consecutive_errors`, `last_status_code`, `last_rtt_ms`, `avg_rtt_ms`, `p50_rtt_ms`, `p95_rtt_ms`, `p99_rtt_ms`, `min_rtt_ms`, `max_rtt_ms`, `requests_per_minute`, `slow_calls`\*, `status_distribution`, `error_types`, `cache_hits`\*, `cache_misses`\*, `cache_maxsize`\*, `cache_currsize`\*, `last_error_at`\*, `last_success_at`\* |
 | `FastAPIWebSocketProbe` | built-in | `name`, `max_error_rate`, `min_active_connections` | `active_connections`, `total_connections`, `messages_received`, `messages_sent`, `error_count`, `error_rate`, `consecutive_errors`, `avg_duration_ms` |
-| `EventLoopProbe` | built-in | `warn_ms`, `fail_ms` | `lag_ms` |
+| `EventLoopProbe` | built-in | `warn_ms`, `fail_ms`, `sample_interval_ms` | `lag_ms`, `current_lag_ms` |
 | `TCPProbe` | built-in | `host`, `port`, `timeout` | `host`, `port`, `resolved_ips`, `connect_ms` |
 | `SMTPProbe` | built-in | `name`, `max_error_rate`, `max_avg_rtt_ms`, `slow_call_threshold_ms`, `cache_window_size` | `call_count`, `error_count`, `error_rate`, `avg_rtt_ms`, `p50_rtt_ms`, `p95_rtt_ms`, `p99_rtt_ms`, `error_types`, `last_error_at`\* |
 | `ThresholdProbe` | built-in | `probe`, `warn_if`, `fail_if` | delegates to inner probe |
