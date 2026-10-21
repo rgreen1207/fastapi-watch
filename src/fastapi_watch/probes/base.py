@@ -1,5 +1,6 @@
-import asyncio
 import functools
+import inspect
+import logging
 import math
 import threading
 import time
@@ -9,6 +10,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from ..models import ProbeResult, ProbeStatus
+
+_LOGGER = logging.getLogger("fastapi_watch")
 
 
 def _update_ema(current: float | None, value: float, alpha: float) -> float:
@@ -138,6 +141,7 @@ class PassiveProbe(BaseProbe):
     * ``avg_rtt_ms`` — exponential moving average RTT
     * ``p50_rtt_ms`` / ``p95_rtt_ms`` / ``p99_rtt_ms`` — percentile RTTs over the last ``window_size`` calls
     * ``min_rtt_ms`` / ``max_rtt_ms`` — all-time bounds
+    * ``requests_per_minute`` — throughput over the last ``window_size`` calls
     * ``slow_calls`` — calls exceeding ``slow_call_threshold_ms`` in the last ``window_size`` calls (when threshold is set)
     * ``error_types`` — count per exception class in the last ``cache_window_size`` errors (when errors exist)
 
@@ -145,7 +149,15 @@ class PassiveProbe(BaseProbe):
 
     * ``max_error_rate`` — default ``0.1`` (10 %)
     * ``max_avg_rtt_ms`` — default ``None`` (disabled)
+
+    The registry's circuit breaker is off by default (``circuit_breaker_enabled=False``):
+    a passive probe only reads in-memory counters, so suspending it protects no
+    dependency and would show a stale result while traffic recovers.
     """
+
+    # Overridden by FastAPIRouteProbe, which counts requests rather than calls.
+    _count_key = "call_count"
+    _empty_message = "no calls observed yet"
 
     def __init__(
         self,
@@ -157,15 +169,19 @@ class PassiveProbe(BaseProbe):
         max_avg_rtt_ms: float | None = None,
         window_size: int = 100,
         ema_alpha: float = 0.1,
-        circuit_breaker_enabled: bool = True,
+        circuit_breaker_enabled: bool = False,
         cache_window_size: int | None = None,
         slow_call_threshold_ms: float | None = None,
         cache_reporting: bool = True,
         cache_time_window_s: float = 120.0,
+        timeout: float | None = None,
+        poll_interval_ms: int | None = None,
     ) -> None:
         self.name = name
         self.description = description
         self.tags = list(tags) if tags else []
+        self.timeout = timeout
+        self.poll_interval_ms = poll_interval_ms
         self.max_error_rate = max_error_rate
         self.max_avg_rtt_ms = max_avg_rtt_ms
         self.ema_alpha = ema_alpha
@@ -176,8 +192,9 @@ class PassiveProbe(BaseProbe):
         # None = not explicitly set; auto-detected from cache maxsize in watch()
         self._cache_window_size: int | None = cache_window_size
         self._cache_window_size_explicit: bool = cache_window_size is not None
+        self._label: str | None = None
 
-        _stats_window = cache_window_size if cache_window_size is not None else window_size
+        stats_window = cache_window_size if cache_window_size is not None else window_size
 
         self._lock = threading.Lock()
         self._call_count: int = 0
@@ -192,11 +209,14 @@ class PassiveProbe(BaseProbe):
         self._outcome_window: deque[bool] = deque(maxlen=window_size)  # True=success, False=failure
         self._outcome_failure_count: int = 0
         # Cache events stored as (monotonic_timestamp, is_hit); window capped to avoid unbounded growth.
-        _cache_event_cap = max(cache_window_size or 0, 10000)
-        self._cache_timed_events: deque[tuple[float, bool]] = deque(maxlen=_cache_event_cap)
+        self._cache_timed_events: deque[tuple[float, bool]] = deque(maxlen=max(cache_window_size or 0, 10000))
         self._cache_maxsize: int | None = None
         self._cache_currsize: int | None = None
-        self._error_type_window: deque[str] = deque(maxlen=_stats_window)
+        # HTTP status tracking; only populated when outcomes carry a status code.
+        self._last_status_code: int | None = None
+        self._status_window: deque[int] = deque(maxlen=stats_window)
+        self._status_counts: dict[str, int] = {}
+        self._error_type_window: deque[str] = deque(maxlen=stats_window)
         self._error_type_counts: dict[str, int] = {}
         self._slow_call_count: int = 0
         self._last_error: str | None = None
@@ -222,11 +242,24 @@ class PassiveProbe(BaseProbe):
         with self._lock:
             self._cache_timed_events.append((time.monotonic(), False))
 
+    # ------------------------------------------------------------------
+    # Outcome classification — overridden by FastAPIRouteProbe
+    # ------------------------------------------------------------------
+
+    def _classify_result(self, result: Any) -> tuple[bool, int | None]:
+        """Return ``(is_error, status_code)`` for a call that returned *result*."""
+        return False, None
+
+    def _classify_exception(self, exc: Exception) -> tuple[bool, int | None]:
+        """Return ``(is_error, status_code)`` for a call that raised *exc*."""
+        return True, None
+
     def _record(
         self,
         rtt_ms: float,
         *,
         error: bool,
+        status: int | None = None,
         error_msg: str | None = None,
         error_type: str | None = None,
     ) -> None:
@@ -235,6 +268,16 @@ class PassiveProbe(BaseProbe):
             self._call_count += 1
             self._last_rtt_ms = rtt_ms
             self._request_timestamps.append(now.timestamp())
+            if status is not None:
+                self._last_status_code = status
+                if len(self._status_window) == self._status_window.maxlen:
+                    evicted_family = f"{self._status_window[0] // 100}xx"
+                    self._status_counts[evicted_family] -= 1
+                    if not self._status_counts[evicted_family]:
+                        del self._status_counts[evicted_family]
+                self._status_window.append(status)
+                family = f"{status // 100}xx"
+                self._status_counts[family] = self._status_counts.get(family, 0) + 1
             # outcome window — track failures incrementally
             if len(self._outcome_window) == self._outcome_window.maxlen:
                 if not self._outcome_window[0]:
@@ -247,6 +290,8 @@ class PassiveProbe(BaseProbe):
                 self._last_error_at = now
                 if error_msg is not None:
                     self._last_error = error_msg
+                elif status is not None:
+                    self._last_error = f"HTTP {status}"
                 if error_type is not None:
                     if len(self._error_type_window) == self._error_type_window.maxlen:
                         evicted = self._error_type_window[0]
@@ -269,6 +314,26 @@ class PassiveProbe(BaseProbe):
                     self._slow_call_count += 1
             self._rtt_window.append(rtt_ms)
 
+    def _record_cache_delta(self, before: Any, after: Any) -> None:
+        """Attribute one call's cache hit or miss from ``cache_info()`` before and after it.
+
+        ``cache_info()`` counts every caller, so when concurrent calls interleave
+        the deltas cover more than this call and cannot be attributed; those
+        calls are skipped rather than miscounted (the reported hit/miss counts
+        are then a sample, which keeps the ratio honest).
+        """
+        self._cache_maxsize = after.maxsize
+        self._cache_currsize = after.currsize
+        hits = after.hits - before.hits
+        misses_before, misses_after = getattr(before, "misses", None), getattr(after, "misses", None)
+        if misses_before is None or misses_after is None:
+            # No miss counter to cross-check: fall back to the hits delta alone.
+            self.record_cache_hit() if hits > 0 else self.record_cache_miss()
+            return
+        if hits + (misses_after - misses_before) != 1:
+            return
+        self.record_cache_hit() if hits else self.record_cache_miss()
+
     @property
     def _error_rate(self) -> float:
         """Failure fraction over the last ``window_size`` calls.
@@ -279,6 +344,16 @@ class PassiveProbe(BaseProbe):
         """
         window = self._outcome_window
         return self._outcome_failure_count / len(window) if window else 0.0
+
+    @property
+    def _requests_per_minute(self) -> float | None:
+        """Throughput derived from the timestamp window; ``None`` until ≥2 calls."""
+        if len(self._request_timestamps) < 2:
+            return None
+        span = self._request_timestamps[-1] - self._request_timestamps[0]
+        if span <= 0:
+            return None
+        return round((len(self._request_timestamps) - 1) / span * 60, 2)
 
     def watch(self, func: Callable) -> Callable:
         """Decorator that silently monitors a function call.
@@ -293,80 +368,71 @@ class PassiveProbe(BaseProbe):
         included in the probe details so you can monitor cache saturation.
         Set ``cache_reporting=False`` on the probe to opt out.
         """
-        _has_cache = self.cache_reporting and callable(getattr(func, "cache_info", None))
+        return self._wrap(func)
+
+    def _wrap(self, func: Callable) -> Callable:
+        has_cache = self.cache_reporting and callable(getattr(func, "cache_info", None))
 
         # Auto-detect window size from cache maxsize on first wrap (if not explicitly set).
-        if _has_cache and not self._cache_window_size_explicit:
+        if has_cache and not self._cache_window_size_explicit:
             detected_maxsize = func.cache_info().maxsize
             if detected_maxsize is not None:
                 self._cache_window_size = detected_maxsize
 
-        if asyncio.iscoroutinefunction(func):
+        def _start() -> tuple[Any, float]:
+            return (func.cache_info() if has_cache else None), time.perf_counter()
+
+        # Recording must never break the call it observes: failures are logged
+        # and the original result or exception passes through unchanged.
+        def _on_success(result: Any, started: tuple[Any, float]) -> None:
+            cache_before, start = started
+            rtt_ms = round((time.perf_counter() - start) * 1000, 2)
+            try:
+                if cache_before is not None:
+                    self._record_cache_delta(cache_before, func.cache_info())
+                is_error, status = self._classify_result(result)
+                self._record(rtt_ms, error=is_error, status=status)
+            except Exception:
+                _LOGGER.debug("fastapi-watch: failed to record a call for probe %r", self.name, exc_info=True)
+
+        def _on_error(exc: Exception, started: tuple[Any, float]) -> None:
+            rtt_ms = round((time.perf_counter() - started[1]) * 1000, 2)
+            try:
+                is_error, status = self._classify_exception(exc)
+                self._record(
+                    rtt_ms,
+                    error=is_error,
+                    status=status,
+                    error_msg=f"{type(exc).__name__}: {exc}",
+                    error_type=type(exc).__name__,
+                )
+            except Exception:
+                _LOGGER.debug("fastapi-watch: failed to record a call for probe %r", self.name, exc_info=True)
+
+        if inspect.iscoroutinefunction(func):
             @functools.wraps(func)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-                hits_before = func.cache_info().hits if _has_cache else 0
-                start = time.perf_counter()
+                started = _start()
                 try:
                     result = await func(*args, **kwargs)
-                    rtt_ms = round((time.perf_counter() - start) * 1000, 2)
-                    try:
-                        if _has_cache:
-                            info = func.cache_info()
-                            if info.hits > hits_before:
-                                self.record_cache_hit()
-                            else:
-                                self.record_cache_miss()
-                            self._cache_maxsize = info.maxsize
-                            self._cache_currsize = info.currsize
-                        self._record(rtt_ms, error=False)
-                    except Exception:
-                        pass
-                    return result
                 except Exception as exc:
-                    try:
-                        self._record(
-                            round((time.perf_counter() - start) * 1000, 2),
-                            error=True,
-                            error_msg=f"{type(exc).__name__}: {exc}",
-                            error_type=type(exc).__name__,
-                        )
-                    except Exception:
-                        pass
+                    _on_error(exc, started)
                     raise
+                _on_success(result, started)
+                return result
             return async_wrapper
-        else:
-            @functools.wraps(func)
-            def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-                hits_before = func.cache_info().hits if _has_cache else 0
-                start = time.perf_counter()
-                try:
-                    result = func(*args, **kwargs)
-                    rtt_ms = round((time.perf_counter() - start) * 1000, 2)
-                    try:
-                        if _has_cache:
-                            info = func.cache_info()
-                            if info.hits > hits_before:
-                                self.record_cache_hit()
-                            else:
-                                self.record_cache_miss()
-                            self._cache_maxsize = info.maxsize
-                            self._cache_currsize = info.currsize
-                        self._record(rtt_ms, error=False)
-                    except Exception:
-                        pass
-                    return result
-                except Exception as exc:
-                    try:
-                        self._record(
-                            round((time.perf_counter() - start) * 1000, 2),
-                            error=True,
-                            error_msg=f"{type(exc).__name__}: {exc}",
-                            error_type=type(exc).__name__,
-                        )
-                    except Exception:
-                        pass
-                    raise
-            return sync_wrapper
+
+        @functools.wraps(func)
+        def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+            started = _start()
+            try:
+                result = func(*args, **kwargs)
+            except Exception as exc:
+                _on_error(exc, started)
+                raise
+            _on_success(result, started)
+            return result
+        return sync_wrapper
 
     async def check(self) -> ProbeResult:
         if self._call_count == 0:
@@ -374,7 +440,7 @@ class PassiveProbe(BaseProbe):
                 name=self.name,
                 status=ProbeStatus.HEALTHY,
                 latency_ms=0.0,
-                details={"message": "no calls observed yet"},
+                details={"message": self._empty_message},
             )
 
         error_rate = self._error_rate
@@ -392,11 +458,18 @@ class PassiveProbe(BaseProbe):
 
         p50, p95, p99 = _calc_percentiles(self._rtt_window, 0.5, 0.95, 0.99)
 
-        details: dict[str, Any] = {
-            "call_count": self._call_count,
+        details: dict[str, Any] = {}
+        if self._label is not None:
+            details["description"] = self._label
+        details.update({
+            self._count_key: self._call_count,
             "error_count": self._error_count,
             "error_rate": round(error_rate, 4),
             "consecutive_errors": self._consecutive_errors,
+        })
+        if self._last_status_code is not None:
+            details["last_status_code"] = self._last_status_code
+        details.update({
             "last_rtt_ms": self._last_rtt_ms,
             "avg_rtt_ms": round(avg_rtt, 2),
             "p50_rtt_ms": p50,
@@ -404,11 +477,16 @@ class PassiveProbe(BaseProbe):
             "p99_rtt_ms": p99,
             "min_rtt_ms": self._min_rtt_ms,
             "max_rtt_ms": self._max_rtt_ms,
-        }
+        })
+        requests_per_minute = self._requests_per_minute
+        if requests_per_minute is not None:
+            details["requests_per_minute"] = requests_per_minute
         if self.slow_call_threshold_ms is not None and self._rtt_window:
             details["slow_calls"] = self._slow_call_count
         if self._last_error is not None:
             details["last_error"] = self._last_error
+        if self._status_counts:
+            details["status_distribution"] = dict(self._status_counts)
         if self._error_type_counts:
             details["error_types"] = dict(self._error_type_counts)
         if self._cache_timed_events:

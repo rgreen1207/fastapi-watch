@@ -524,3 +524,27 @@ def test_basic_auth_compares_password_even_when_username_is_wrong(monkeypatch):
 
     assert TestClient(app).get("/health/live", headers={"Authorization": f"Basic {creds}"}).status_code == 401
     assert compared == [b"ops", b"pw"]
+
+
+@pytest.mark.asyncio
+async def test_rabbitmq_management_api_sends_basic_auth_header_without_deprecated_api():
+    """aiohttp.BasicAuth is deprecated (removed in aiohttp 4.0); the header is built directly."""
+    pytest.importorskip("aiohttp")
+    from unittest.mock import patch, AsyncMock
+    from fastapi_watch.probes.rabbitmq import RabbitMQProbe
+    import aiohttp
+
+    probe = RabbitMQProbe(url="amqp://admin:hunter2@rabbitmq.internal/", management_url="http://rabbitmq.internal:15672")
+    mock_session = MagicMock()
+    mock_session.get.side_effect = RuntimeError("stop after capturing the call")
+    mock_cm = MagicMock()
+    mock_cm.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+    with patch.object(aiohttp, "ClientSession", return_value=mock_cm), \
+         patch.object(aiohttp, "BasicAuth", side_effect=AssertionError("deprecated API used")):
+        await probe._enrich_from_management_api({})
+
+    kwargs = mock_session.get.call_args.kwargs
+    assert "auth" not in kwargs
+    assert kwargs["headers"] == {"Authorization": "Basic " + base64.b64encode(b"admin:hunter2").decode()}

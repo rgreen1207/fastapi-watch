@@ -70,3 +70,6 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 timeout = 30
+# A deprecation raised from this package fails the suite, so a removal in an
+# upcoming Python (asyncio.iscoroutinefunction in 3.16) is caught in CI first.
+filterwarnings = ["error::DeprecationWarning:fastapi_watch"]

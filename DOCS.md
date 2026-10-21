@@ -188,6 +188,8 @@ DEGRADED counts as passing for the circuit breaker — a probe oscillating betwe
 
 After a probe fails a configurable number of consecutive times, the circuit opens and the probe is suspended — it returns the last known result until the cooldown expires.
 
+The breaker applies to **active** probes, which call a real dependency on every check. Passive probes (`PassiveProbe` and its subclasses, `FastAPIRouteProbe`, `FastAPIWebSocketProbe`, `RequestMetricsProbe`) default to `circuit_breaker_enabled=False`: they only read in-memory stats, so suspending them protects nothing and would keep showing a stale failure after traffic recovers. Pass `circuit_breaker_enabled=True` to opt one in.
+
 ```python
 # Defaults: opens after 5 consecutive failures, cooldown 10 minutes
 registry = HealthRegistry(app)
@@ -995,7 +997,7 @@ Before the first request, `check()` returns `HEALTHY` with `"no requests observe
 | `tags` | `[]` | Tags for filtering `/health/ready?tag=...` and `/health/status?tag=...` |
 | `max_error_rate` | `0.1` | Error-rate threshold |
 | `max_avg_rtt_ms` | `None` | RTT threshold |
-| `window_size` | `100` | Window for RTT percentiles, throughput, slow-call counts, and outcome tracking |
+| `window_size` | `100` | Recent requests used for `error_rate`, RTT percentiles, throughput, and slow-call counts (a count, not a time span) |
 | `ema_alpha` | `0.1` | EMA smoothing factor |
 | `timeout` | `None` | Passed to registry for `check()` |
 | `min_error_status` | `500` | Minimum status code counted as an error |
@@ -1003,7 +1005,7 @@ Before the first request, `check()` returns `HEALTHY` with `"no requests observe
 | `cache_window_size` | `None` | Override the cache hit/miss window to the last N lookups; auto-detected from the LRU cache's `maxsize` when not set |
 | `cache_time_window_s` | `120.0` | When `cache_window_size` is not set, count hits/misses over the last T seconds (default 120 s) |
 | `cache_reporting` | `True` | Set to `False` to disable automatic cache tracking even when wrapping `@lru_cache` / `@alru_cache` functions |
-| `circuit_breaker_enabled` | `True` | Set to `False` to disable the circuit breaker for this probe regardless of the registry setting |
+| `circuit_breaker_enabled` | `False` | Passive probes only read in-memory stats, so the circuit breaker is off by default; set `True` to opt in |
 
 **With ProbeGroup:**
 

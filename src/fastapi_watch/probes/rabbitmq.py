@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import time
 from urllib.parse import urlparse
 
@@ -106,13 +107,16 @@ class RabbitMQProbe(BaseProbe):
             return
 
         base = self.management_url.rstrip("/") + "/api"
-        auth = aiohttp.BasicAuth(self._mgmt_user, self._mgmt_password)
+        # Built by hand rather than with aiohttp.BasicAuth, which current aiohttp
+        # deprecates (removed in 4.0); the header itself is plain RFC 7617.
+        credentials = base64.b64encode(f"{self._mgmt_user}:{self._mgmt_password}".encode()).decode()
+        headers = {"Authorization": f"Basic {credentials}"}
 
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5.0)) as session:
 
                 async def _get_json(path: str) -> dict | list:
-                    async with session.get(f"{base}/{path}", auth=auth) as resp:
+                    async with session.get(f"{base}/{path}", headers=headers) as resp:
                         resp.raise_for_status()
                         return await resp.json()
 

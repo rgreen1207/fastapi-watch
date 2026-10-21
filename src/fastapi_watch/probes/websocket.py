@@ -145,6 +145,8 @@ class FastAPIWebSocketProbe(BaseProbe):
         ema_alpha: Smoothing factor for the exponential moving average (0–1).
             Higher values make ``avg_duration_ms`` react faster to changes.
         timeout: Passed to the registry; not used internally.
+        circuit_breaker_enabled: Whether the registry's circuit breaker may
+            suspend this probe (default ``False``: it only reads in-memory stats).
     """
 
     def __init__(
@@ -159,12 +161,16 @@ class FastAPIWebSocketProbe(BaseProbe):
         ema_alpha: float = 0.1,
         timeout: float | None = None,
         poll_interval_ms: int | None = None,
+        circuit_breaker_enabled: bool = False,
     ) -> None:
         self.name = name
         self.description = description
         self.tags = list(tags) if tags else []
         self.timeout = timeout
         self.poll_interval_ms = poll_interval_ms
+        # Off by default: the probe reads in-memory counters, so suspending it
+        # protects nothing and would show a stale result while traffic recovers.
+        self.circuit_breaker_enabled = circuit_breaker_enabled
         self.max_error_rate = max_error_rate
         self.min_active_connections = min_active_connections
         self.ema_alpha = ema_alpha

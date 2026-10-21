@@ -104,6 +104,28 @@ State changes were only recognised from a probe's second result onward, so a dep
 
 A probe with its own `poll_interval_ms` is meant to poll in the background, and polling did continue after the last stream client left — but it only ever *started* when the first SSE client connected. Whether background polling happened at all depended on someone having opened the dashboard. It now starts at `set_started()`, or at the first health request when `set_started()` ran outside an event loop.
 
+#### Passive probes no longer get stuck behind the circuit breaker
+
+The circuit breaker was on by default for passive probes (`PassiveProbe` and its subclasses, `FastAPIRouteProbe`, `FastAPIWebSocketProbe`, `RequestMetricsProbe`). They only read in-memory stats, so tripping protected no dependency — it froze the probe on its failing result for the full cooldown (10 minutes by default) after the underlying traffic had already recovered.
+
+**Behavior change:** passive probes now default to `circuit_breaker_enabled=False`; pass `True` to opt back in. Active probes (anything calling a real dependency in `check()`) keep the breaker on.
+
+#### Cache hit/miss counts are no longer misattributed under concurrency
+
+`watch()` decided whether a call on an `@lru_cache` / `@alru_cache` function was a hit by comparing the shared `cache_info().hits` before and after the call, so a concurrent call's hit was credited to every call that overlapped it. A call is now attributed only when its before/after window shows exactly one cache event; overlapping calls are skipped rather than miscounted, so `cache_hits` / `cache_misses` are a fair sample under load.
+
+#### A non-integer `status_code` no longer drops the request record
+
+`FastAPIRouteProbe` read `status_code` from any returned object; a route returning a model with a non-integer `status_code` field (a string, `None`) raised inside the recorder, and the request silently went uncounted. Non-integer values now fall back to 200 (or 500 for exceptions).
+
+#### `RabbitMQProbe` no longer uses the deprecated `aiohttp.BasicAuth`
+
+Current aiohttp deprecates `aiohttp.BasicAuth` (removed in aiohttp 4.0). The management-API request now sends a standard `Authorization: Basic` header built directly, which works across every supported aiohttp version.
+
+#### Passive probes accept `poll_interval_ms` and `timeout`
+
+`HttpProbe`, `RedisProbe`, and the other `PassiveProbe` subclasses documented a `poll_interval_ms` argument but raised `TypeError` when given one. `PassiveProbe` now accepts `poll_interval_ms` and `timeout`, like the other probes.
+
 #### Startup probes are guarded like every other probe
 
 `/health/startup` ran `startup_probes` directly, with no timeout and no exception handling: a hung startup probe hung the Kubernetes `startupProbe` request, and one that raised turned it into a `500`. Startup probes now run through the same guarded path as regular probes (bounded by `probe_timeout` or their own `timeout`), so either case answers `503` with the probe's error.
@@ -144,7 +166,9 @@ The `basic` auth check compared the password only when the username matched, so 
 
 - **CI on pull requests.** A new `ci.yml` workflow runs the suite across Python 3.10–3.15 against FastAPI 0.100 (the oldest supported release) and the latest FastAPI. Previously tests only ran on Python 3.11 at publish time. Optional extras install individually so a driver without wheels for a new Python (currently `aiokafka` on 3.15) skips its own tests rather than blocking the run.
 - **Python 3.15** added to the supported classifiers.
-- **Python 3.16 readiness.** CI also runs against the 3.16 pre-release as a non-blocking job; the classifier will be added once 3.16 is final. `asyncio.iscoroutinefunction`, which 3.16 removes, is no longer used.
+- **Python 3.16 readiness.** CI also runs against the 3.16 pre-release as a non-blocking job; the classifier will be added once 3.16 is final. `asyncio.iscoroutinefunction`, which 3.16 removes (and which warned on every `watch()` from 3.14), is replaced by `inspect.iscoroutinefunction`.
+- **Deprecations fail the suite.** A `DeprecationWarning` raised from `fastapi_watch` code is now a test error, so APIs slated for removal are caught in CI before a Python or dependency release removes them. It immediately caught the `aiohttp.BasicAuth` use above.
+- **One passive-probe implementation.** `FastAPIRouteProbe` now subclasses `PassiveProbe` instead of duplicating ~200 lines of recording and reporting logic; public constructors and details keys are unchanged (passive probes additionally report `requests_per_minute`).
 - `fastapi_watch.__version__` reported `1.7.0` in the 1.7.1 release; it now matches the package version.
 
 ---
