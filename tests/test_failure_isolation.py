@@ -303,3 +303,74 @@ async def test_first_failure_during_maintenance_is_recorded_but_not_sent():
     assert alerter.alerts == []
     assert len(await registry._storage.get_alerts()) == 1
     await registry._shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Failure messages name the exception type, never its text
+# ---------------------------------------------------------------------------
+
+class _LeakyProbe(BaseProbe):
+    name = "leaky"
+
+    async def check(self):
+        raise ValueError("password=hunter2 at db.internal")
+
+
+@pytest.mark.asyncio
+async def test_unhandled_probe_error_reports_type_not_message(caplog):
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=None)
+    registry.add(_LeakyProbe())
+    with caplog.at_level("DEBUG", logger="fastapi_watch"):
+        [result] = await registry.run_all()
+    assert result.error == "probe check failed: ValueError"
+    assert "hunter2" not in result.error
+    assert any(r.exc_info and "hunter2" in str(r.exc_info[1]) for r in caplog.records)  # detail kept in the log
+
+
+@pytest.mark.asyncio
+async def test_tcp_probe_names_the_failure():
+    from fastapi_watch.probes import TCPProbe
+
+    result = await TCPProbe("127.0.0.1", 1, timeout=2).check()  # nothing listens on port 1
+    assert result.status == ProbeStatus.UNHEALTHY
+    assert result.error.startswith("probe check failed: ")
+    assert result.error != "probe check failed: "
+
+
+# ---------------------------------------------------------------------------
+# ThresholdProbe reports broken thresholds and keeps the inner probe's metadata
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_raising_threshold_is_reported_not_hidden(caplog):
+    from fastapi_watch.probes import NoOpProbe, ThresholdProbe
+
+    probe = ThresholdProbe(
+        NoOpProbe(name="inner"),
+        fail_if=lambda d: d["missing_key"] > 1,  # typo'd key
+        warn_if=lambda d: True,
+    )
+    with caplog.at_level("WARNING", logger="fastapi_watch"):
+        result = await probe.check()
+    assert result.status == ProbeStatus.DEGRADED  # warn_if still evaluated
+    assert result.details["threshold_errors"] == {"fail_if": "KeyError"}
+    assert any("threshold" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_threshold_without_errors_adds_no_detail():
+    from fastapi_watch.probes import NoOpProbe, ThresholdProbe
+
+    result = await ThresholdProbe(NoOpProbe(name="inner"), fail_if=lambda d: False).check()
+    assert result.status == ProbeStatus.HEALTHY
+    assert "threshold_errors" not in (result.details or {})
+
+
+def test_threshold_probe_carries_inner_metadata():
+    from fastapi_watch import PassiveProbe
+    from fastapi_watch.probes import ThresholdProbe
+
+    inner = PassiveProbe("cache", description="session cache", tags=["redis"])
+    wrapped = ThresholdProbe(inner, warn_if=lambda d: False)
+    assert (wrapped.description, wrapped.tags) == ("session cache", ["redis"])
+    assert wrapped.circuit_breaker_enabled is False  # passive inner keeps the breaker off

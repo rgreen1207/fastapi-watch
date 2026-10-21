@@ -1634,7 +1634,7 @@ Rejected ranges: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`,
 
 ### Probe error messages
 
-Exceptions raised inside a probe's `check()` method return the generic string `"probe check failed"` to HTTP clients. Full exception details (which may contain connection strings, passwords, or internal hostnames from third-party libraries) are forwarded only to the configured logger.
+When a probe's check fails with an exception, HTTP clients see only the exception *type* — e.g. `"probe check failed: ConnectionRefusedError"` — so the failure is diagnosable from the dashboard without exposing the message. Full exception details (which may contain connection strings, passwords, or internal hostnames from third-party libraries) go only to logs: the configured `logger=` for exceptions escaping `check()`, and the `fastapi_watch` logger at debug level for failures the built-in probes catch themselves.
 
 ### Probe names
 

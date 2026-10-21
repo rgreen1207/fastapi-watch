@@ -147,7 +147,7 @@ async def test_probe_exception_error_is_generic():
     results = await registry.run_all()
     assert results[0].status == ProbeStatus.UNHEALTHY
     assert "hunter2" not in results[0].error
-    assert results[0].error == "probe check failed"
+    assert results[0].error.startswith("probe check failed: ")
 
 
 @pytest.mark.asyncio
@@ -310,7 +310,7 @@ async def test_tcp_probe_error_is_generic():
     result = await probe.check()
     from fastapi_watch.models import ProbeStatus
     assert result.status == ProbeStatus.UNHEALTHY
-    assert result.error == "probe check failed"
+    assert result.error.startswith("probe check failed: ")
 
 
 # ---------------------------------------------------------------------------

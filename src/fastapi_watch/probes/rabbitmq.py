@@ -4,7 +4,7 @@ import time
 from urllib.parse import urlparse
 
 from ..models import ProbeResult, ProbeStatus
-from .base import BaseProbe
+from .base import BaseProbe, _failure_message
 
 
 class RabbitMQProbe(BaseProbe):
@@ -89,7 +89,7 @@ class RabbitMQProbe(BaseProbe):
                 name=self.name,
                 status=ProbeStatus.UNHEALTHY,
                 latency_ms=round(latency, 2),
-                error="probe check failed",
+                error=_failure_message(self.name, exc),
                 details={"connected": False},
             )
         finally:

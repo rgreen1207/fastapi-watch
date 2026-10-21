@@ -1,15 +1,24 @@
+import logging
 from typing import Callable
 
 from ..models import ProbeResult, ProbeStatus
 from .base import BaseProbe
 
+_LOGGER = logging.getLogger("fastapi_watch")
 
-def _safe_eval(fn: Callable[[dict], bool], details: dict) -> bool:
-    """Call *fn(details)*, returning False if it raises."""
+
+def _safe_eval(fn: Callable[[dict], bool], details: dict) -> tuple[bool, str | None]:
+    """Call *fn(details)*; return ``(met, error_type)``.
+
+    A threshold that raises counts as not met, but is reported (logged, and
+    surfaced in the result's details by the caller) rather than silently
+    ignored — a typo'd key in a lambda would otherwise disable it unnoticed.
+    """
     try:
-        return bool(fn(details))
-    except Exception:
-        return False
+        return bool(fn(details)), None
+    except Exception as exc:
+        _LOGGER.warning("fastapi-watch: threshold %r raised %s", fn, type(exc).__name__, exc_info=True)
+        return False, type(exc).__name__
 
 
 class ThresholdProbe(BaseProbe):
@@ -71,7 +80,11 @@ class ThresholdProbe(BaseProbe):
         self.warn_if = warn_if
         self.fail_if = fail_if
         self.name = name if name is not None else inner_probe.name
+        self.description = inner_probe.description
+        self.tags = inner_probe.tags
         self.timeout = inner_probe.timeout
+        # A passive inner probe keeps its breaker off; wrapping must not re-enable it.
+        self.circuit_breaker_enabled = inner_probe.circuit_breaker_enabled
         self.poll_interval_ms = (
             poll_interval_ms
             if poll_interval_ms is not None
@@ -86,11 +99,19 @@ class ThresholdProbe(BaseProbe):
             return result.model_copy(update={"name": self.name})
 
         details = result.details or {}
+        errors: dict[str, str] = {}
+        update: dict = {"name": self.name}
 
-        if self.fail_if is not None and _safe_eval(self.fail_if, details):
-            return result.model_copy(update={"name": self.name, "status": ProbeStatus.UNHEALTHY})
+        for label, fn, status in (("fail_if", self.fail_if, ProbeStatus.UNHEALTHY), ("warn_if", self.warn_if, ProbeStatus.DEGRADED)):
+            if fn is None:
+                continue
+            met, error = _safe_eval(fn, details)
+            if error is not None:
+                errors[label] = error
+            if met:
+                update["status"] = status
+                break
 
-        if self.warn_if is not None and _safe_eval(self.warn_if, details):
-            return result.model_copy(update={"name": self.name, "status": ProbeStatus.DEGRADED})
-
-        return result.model_copy(update={"name": self.name})
+        if errors:
+            update["details"] = {**details, "threshold_errors": errors}
+        return result.model_copy(update=update)

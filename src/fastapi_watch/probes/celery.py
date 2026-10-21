@@ -3,7 +3,7 @@ import time
 from typing import Any
 
 from ..models import ProbeResult, ProbeStatus
-from .base import BaseProbe
+from .base import BaseProbe, _failure_message
 
 # Fields kept from each task dict returned by inspect.active() / reserved()
 _TASK_FIELDS = ("id", "name", "args", "kwargs", "time_start", "worker_pid")
@@ -206,5 +206,5 @@ class CeleryProbe(BaseProbe):
                 name=self.name,
                 status=ProbeStatus.UNHEALTHY,
                 latency_ms=round(latency, 2),
-                error="probe check failed",
+                error=_failure_message(self.name, exc),
             )

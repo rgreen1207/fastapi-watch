@@ -14,6 +14,18 @@ from ..models import ProbeResult, ProbeStatus
 _LOGGER = logging.getLogger("fastapi_watch")
 
 
+def _failure_message(probe_name: str, exc: BaseException) -> str:
+    """Error text for a failed check: the exception *type* only.
+
+    Driver messages can embed credentials, DSNs, or internal hostnames, and
+    health responses are often public, so the message itself is never exposed;
+    it is logged at debug level (with the traceback) instead.  The type still
+    says *what* failed.
+    """
+    _LOGGER.debug("fastapi-watch: probe %r check failed", probe_name, exc_info=exc)
+    return f"probe check failed: {type(exc).__name__}"
+
+
 def _update_ema(current: float | None, value: float, alpha: float) -> float:
     """Return an updated exponential moving average."""
     return value if current is None else alpha * value + (1 - alpha) * current

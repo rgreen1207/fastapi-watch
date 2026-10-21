@@ -38,7 +38,7 @@ async def test_tcp_unhealthy_on_connection_refused():
         result = await probe.check()
 
     assert result.status == ProbeStatus.UNHEALTHY
-    assert result.error == "probe check failed"
+    assert result.error.startswith("probe check failed: ")
 
 
 @pytest.mark.asyncio

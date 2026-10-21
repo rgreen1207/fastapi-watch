@@ -28,7 +28,7 @@ from .dashboard import render_dashboard
 from .models import AlertRecord, HealthReport, ProbeResult, ProbeStatus
 from .prometheus import render_prometheus
 from .probe_group import ProbeGroup
-from .probes.base import BaseProbe
+from .probes.base import BaseProbe, _failure_message
 from .storage import InMemoryProbeStorage, ProbeStorage
 
 _MIN_POLL_INTERVAL_MS = 1000
@@ -1036,7 +1036,7 @@ class HealthRegistry:
                 name=probe.name,
                 status=ProbeStatus.UNHEALTHY,
                 critical=critical,
-                error="probe check failed",
+                error=_failure_message(probe.name, exc),
             )
         return result if result.critical == critical else result.model_copy(update={"critical": critical})
 

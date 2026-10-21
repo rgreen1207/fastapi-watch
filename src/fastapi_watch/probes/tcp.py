@@ -3,7 +3,7 @@ import socket
 import time
 
 from ..models import ProbeResult, ProbeStatus
-from .base import BaseProbe
+from .base import BaseProbe, _failure_message
 
 
 class TCPProbe(BaseProbe):
@@ -81,6 +81,6 @@ class TCPProbe(BaseProbe):
                 name=self.name,
                 status=ProbeStatus.UNHEALTHY,
                 latency_ms=latency,
-                error="probe check failed",
+                error=_failure_message(self.name, exc),
                 details={"host": self.host, "port": self.port},
             )

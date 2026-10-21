@@ -147,7 +147,7 @@ async def test_probe_exception_becomes_unhealthy_result():
     registry.add(BombProbe())
     results = await registry.run_all()
     assert results[0].status == ProbeStatus.UNHEALTHY
-    assert results[0].error == "probe check failed"
+    assert results[0].error.startswith("probe check failed: ")
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +297,7 @@ async def test_no_log_on_probe_exception_without_logger():
     registry.add(BombProbe())
     results = await registry.run_all()
     assert results[0].status == ProbeStatus.UNHEALTHY
-    assert results[0].error == "probe check failed"
+    assert results[0].error.startswith("probe check failed: ")
 
 
 # ---------------------------------------------------------------------------

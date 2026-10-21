@@ -122,6 +122,12 @@ The circuit breaker was on by default for passive probes (`PassiveProbe` and its
 
 Current aiohttp deprecates `aiohttp.BasicAuth` (removed in aiohttp 4.0). The management-API request now sends a standard `Authorization: Basic` header built directly, which works across every supported aiohttp version.
 
+#### Probe failures say what failed
+
+`TCPProbe`, `MemcachedProbe`, `RabbitMQProbe`, `KafkaProbe`, `CeleryProbe`, and the registry's handler for exceptions escaping `check()` all reported the bare string `"probe check failed"` and discarded the exception, so a refused connection, a DNS failure, and a timeout looked identical on the dashboard. They now report the exception type — `"probe check failed: ConnectionRefusedError"` — still never the message text, which can carry credentials or internal hostnames; the full exception is logged at debug level on the `fastapi_watch` logger.
+
+`ThresholdProbe` silently treated a raising `warn_if` / `fail_if` (a typo'd key, say) as "not met", disabling the threshold unnoticed. The error is now logged and reported in the result as `details["threshold_errors"]`. `ThresholdProbe` also now carries the inner probe's `description`, `tags`, and circuit-breaker setting instead of dropping them.
+
 #### WebSocket handlers receive the real `WebSocket`
 
 `FastAPIWebSocketProbe.watch()` replaced the handler's `WebSocket` argument with a proxy object, so `isinstance(websocket, WebSocket)` was false inside watched handlers (breaking code and libraries that type-check it), the proxy's connection state was separate from the socket any dependency held, and messages read through `iter_text()` / `iter_bytes()` / `iter_json()` were not counted.

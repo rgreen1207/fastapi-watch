@@ -328,7 +328,7 @@ async def test_inspect_exception_returns_unhealthy():
     result = await probe.check()
 
     assert result.status == ProbeStatus.UNHEALTHY
-    assert result.error == "probe check failed"
+    assert result.error.startswith("probe check failed: ")
 
 
 # ---------------------------------------------------------------------------

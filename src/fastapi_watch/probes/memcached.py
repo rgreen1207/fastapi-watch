@@ -1,7 +1,7 @@
 import time
 
 from ..models import ProbeResult, ProbeStatus
-from .base import BaseProbe
+from .base import BaseProbe, _failure_message
 
 
 class MemcachedProbe(BaseProbe):
@@ -68,7 +68,7 @@ class MemcachedProbe(BaseProbe):
                 name=self.name,
                 status=ProbeStatus.UNHEALTHY,
                 latency_ms=round(latency, 2),
-                error="probe check failed",
+                error=_failure_message(self.name, exc),
             )
         finally:
             if client is not None:
