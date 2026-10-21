@@ -59,6 +59,22 @@ _STORAGE_LOG_INTERVAL_S = 60.0
 _PRUNE_INTERVAL_S = 600.0
 # Shutdown: how long each probe's aclose() may take.
 _ACLOSE_TIMEOUT_S = 5.0
+# Retry-After (seconds) sent when max_stream_connections streams are open.
+_STREAM_RETRY_AFTER_S = 30
+
+
+class _SlotStreamingResponse(StreamingResponse):
+    """A StreamingResponse that calls *release* once it has finished, however it ends."""
+
+    def __init__(self, content, *, release: Callable[[], None], **kwargs) -> None:
+        super().__init__(content, **kwargs)
+        self._release = release
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._release()
 
 
 def _iter_app_routes(routes, prefix: str = "") -> Iterator[tuple[Any, str]]:
@@ -506,6 +522,9 @@ class HealthRegistry:
             ``/metrics`` and the streams are served from this process's last
             results, ``/history`` and ``/alerts`` return 503, and the
             dashboard renders without history.
+        max_stream_connections: Most SSE stream connections open at once
+            (keyword-only, default ``100``; ``None`` = unlimited).  Further
+            stream requests get ``503`` with a ``Retry-After`` header.
         stream_token_secret: Key that signs the dashboard's short-lived stream
             tokens (keyword-only).  By default the key is derived from the
             *auth* credentials with scrypt, or is random per process for a
@@ -553,11 +572,14 @@ class HealthRegistry:
         *,
         stream_token_secret: str | bytes | None = None,
         storage_timeout: float | None = 2.0,
+        max_stream_connections: int | None = 100,
     ) -> None:
         if probe_timeout is not None and probe_timeout <= 0:
             raise ValueError(f"probe_timeout must be positive or None, got {probe_timeout!r}")
         if storage_timeout is not None and storage_timeout <= 0:
             raise ValueError(f"storage_timeout must be positive or None, got {storage_timeout!r}")
+        if max_stream_connections is not None and max_stream_connections < 1:
+            raise ValueError(f"max_stream_connections must be at least 1 or None, got {max_stream_connections!r}")
         _validate_auth(auth)
         if stream_token_secret is not None and not stream_token_secret:
             raise ValueError("stream_token_secret must not be empty")
@@ -643,6 +665,9 @@ class HealthRegistry:
         ] = []
         self._poll_task: asyncio.Task | None = None
         self._active_connections: int = 0
+        # Open SSE responses, counted from the request (not the generator start).
+        self._max_stream_connections: int | None = max_stream_connections
+        self._stream_slots: int = 0
         self._shutting_down: bool = False
         self._sse_tasks: set[asyncio.Task] = set()
         self._signal_handler_installed: bool = False
@@ -1671,6 +1696,27 @@ class HealthRegistry:
     # SSE (Server-Sent Events) streaming
     # ------------------------------------------------------------------
 
+    def _reserve_stream_slot(self) -> Callable[[], None] | None:
+        """Take one of ``max_stream_connections`` stream slots.
+
+        Returns a release function (safe to call more than once), or ``None``
+        when every slot is taken.  Each open stream wakes every 0.5 s, so an
+        uncapped count — reachable by anyone when *auth* is ``None`` — would
+        let clients load the app's event loop at will.
+        """
+        if self._max_stream_connections is not None and self._stream_slots >= self._max_stream_connections:
+            return None
+        self._stream_slots += 1
+        released = False
+
+        def _release() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                self._stream_slots -= 1
+
+        return _release
+
     def _stream_interval_s(self) -> float | None:
         """Seconds between stream events: the shortest effective probe interval.
 
@@ -1926,6 +1972,33 @@ class HealthRegistry:
         def _storage_unavailable() -> Response:
             return JSONResponse({"error": "storage unavailable"}, status_code=503)
 
+        def _open_stream(request: Request, tag: str | None, probe: str | None) -> Response:
+            """Start an SSE response, or answer 503 once ``max_stream_connections`` are open.
+
+            The slot is taken here, before the generator starts, so a burst of
+            connections cannot all pass the check; it is released when the
+            response finishes, even if the generator never ran.
+            """
+            release = registry._reserve_stream_slot()
+            if release is None:
+                return JSONResponse(
+                    {"error": "too many stream connections"},
+                    status_code=503,
+                    headers={"Retry-After": str(_STREAM_RETRY_AFTER_S)},
+                )
+            return _SlotStreamingResponse(
+                registry._event_stream(
+                    request,
+                    _make_sse_report,
+                    filter_tags=_parse_csv_filter(tag),
+                    filter_probes=_parse_csv_filter(probe),
+                    expires_at=getattr(request.state, "stream_token_expiry", None),
+                ),
+                release=release,
+                media_type="text/event-stream",
+                headers=sse_headers,
+            )
+
         @self.app.get(
             f"{prefix}/live",
             tags=tags,
@@ -2097,18 +2170,8 @@ class HealthRegistry:
             request: Request,
             tag: str | None = Query(default=None),
             probe: str | None = Query(default=None),
-        ) -> StreamingResponse:
-            return StreamingResponse(
-                registry._event_stream(
-                    request,
-                    _make_sse_report,
-                    filter_tags=_parse_csv_filter(tag),
-                    filter_probes=_parse_csv_filter(probe),
-                    expires_at=getattr(request.state, "stream_token_expiry", None),
-                ),
-                media_type="text/event-stream",
-                headers=sse_headers,
-            )
+        ) -> Response:
+            return _open_stream(request, tag, probe)
 
         @self.app.get(
             f"{prefix}/status/stream",
@@ -2121,18 +2184,8 @@ class HealthRegistry:
             request: Request,
             tag: str | None = Query(default=None),
             probe: str | None = Query(default=None),
-        ) -> StreamingResponse:
-            return StreamingResponse(
-                registry._event_stream(
-                    request,
-                    _make_sse_report,
-                    filter_tags=_parse_csv_filter(tag),
-                    filter_probes=_parse_csv_filter(probe),
-                    expires_at=getattr(request.state, "stream_token_expiry", None),
-                ),
-                media_type="text/event-stream",
-                headers=sse_headers,
-            )
+        ) -> Response:
+            return _open_stream(request, tag, probe)
 
         @self.app.get(
             f"{prefix}/metrics",
