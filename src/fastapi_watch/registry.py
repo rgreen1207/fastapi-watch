@@ -35,6 +35,14 @@ class _MaintenanceRequest(BaseModel):
     minutes: float | None = Field(None, gt=0, le=525600)  # max 1 year
     until: datetime | None = None
 
+class _DefaultInt(int):
+    """An ``int`` parameter default, distinguishable from the same value passed explicitly."""
+
+
+class _DefaultFloat(float):
+    """A ``float`` parameter default, distinguishable from the same value passed explicitly."""
+
+
 _MIN_POLL_INTERVAL_MS = 1000
 _AUTO_HTTP_METHODS = frozenset({"HEAD", "OPTIONS"})
 # Used when the caller passed no logger= but an error must still be reported.
@@ -432,6 +440,11 @@ class HealthRegistry:
             for this many ms, measured from when the registry is created
             (affects ``/health/ready`` only).
         history_size: Number of past results kept per probe (default 120).
+            With a custom *storage*, this and the other retention arguments
+            (*result_ttl_seconds*, *alert_ttl_seconds*, *max_alerts*) are
+            applied through the backend's ``configure()`` when passed
+            explicitly; a backend without ``configure()`` keeps its own limits
+            and a warning names the ignored arguments.
         groups: :class:`~fastapi_watch.ProbeGroup` instances to merge at startup.
         dashboard: ``True`` (default) — built-in HTML dashboard.  ``False`` — omit the
             route.  Callable ``(report: HealthReport) -> str`` — custom renderer;
@@ -504,7 +517,7 @@ class HealthRegistry:
         poll_interval_ms: int | None = 60_000,
         logger: logging.Logger | None = None,
         grace_period_ms: int = 0,
-        history_size: int = 120,
+        history_size: int = _DefaultInt(120),
         timezone: str = "UTC",
         groups: list[ProbeGroup] | None = None,
         dashboard: bool | Callable[..., str] | str | Path = True,
@@ -516,9 +529,9 @@ class HealthRegistry:
         alerters: list[BaseAlerter] | None = None,
         auth: dict | Callable | None = None,
         startup_probes: list[BaseProbe] | None = None,
-        result_ttl_seconds: float = 7200.0,
-        alert_ttl_seconds: float = 259200.0,
-        max_alerts: int = 120,
+        result_ttl_seconds: float = _DefaultFloat(7200.0),
+        alert_ttl_seconds: float = _DefaultFloat(259200.0),
+        max_alerts: int = _DefaultInt(120),
         storage: ProbeStorage | None = None,
         probe_timeout: float | None = 30.0,
         metrics_prefix: str = "",
@@ -539,13 +552,23 @@ class HealthRegistry:
         self._timezone_name: str = timezone
         self._tzinfo: ZoneInfo = ZoneInfo(timezone)
         self._start_time: datetime = datetime.now(self._tzinfo)
-        self._history_size: int = max(1, history_size)
-        self._storage: ProbeStorage = storage or InMemoryProbeStorage(
-            max_results=self._history_size,
-            result_ttl_seconds=result_ttl_seconds,
-            alert_ttl_seconds=alert_ttl_seconds,
-            max_alerts=max(1, max_alerts),
-        )
+        self._history_size: int = int(max(1, history_size))
+        retention = {
+            "max_results": self._history_size,
+            "result_ttl_seconds": float(result_ttl_seconds),
+            "alert_ttl_seconds": float(alert_ttl_seconds),
+            "max_alerts": int(max(1, max_alerts)),
+        }
+        if storage is None:
+            self._storage: ProbeStorage = InMemoryProbeStorage(**retention)
+        else:
+            self._storage = storage
+            self._configure_storage(retention, {
+                "history_size": history_size,
+                "result_ttl_seconds": result_ttl_seconds,
+                "alert_ttl_seconds": alert_ttl_seconds,
+                "max_alerts": max_alerts,
+            })
         self._probes: list[tuple[BaseProbe, bool]] = []
         self._poll_interval_ms: int | None = self._set_interval(poll_interval_ms)
 
@@ -616,6 +639,31 @@ class HealthRegistry:
                 "set_maintenance()/clear_maintenance() or pass auth= to HealthRegistry.",
                 prefix,
             )
+
+    def _configure_storage(self, retention: dict, passed: dict) -> None:
+        """Apply explicitly passed retention arguments to a caller-supplied *storage*.
+
+        Without this, ``HealthRegistry(storage=s, history_size=5)`` silently
+        kept the backend's own limits.  A backend with ``configure()`` gets all
+        four effective values; one without it keeps its settings, and the
+        ignored arguments are named in a warning.  Nothing happens when no
+        retention argument was passed, so a backend configured in its own
+        constructor is left alone.
+        """
+        explicit = [name for name, value in passed.items() if not isinstance(value, (_DefaultInt, _DefaultFloat))]
+        if not explicit:
+            return
+        configure = getattr(self._storage, "configure", None)
+        if callable(configure):
+            configure(**retention)
+            return
+        (self._logger or _LIB_LOGGER).warning(
+            "fastapi-watch: %s has no configure() method, so %s %s ignored; set retention "
+            "on the storage backend itself.",
+            type(self._storage).__name__,
+            ", ".join(explicit),
+            "is" if len(explicit) == 1 else "are",
+        )
 
     # ------------------------------------------------------------------
     # Public API — probe registration
