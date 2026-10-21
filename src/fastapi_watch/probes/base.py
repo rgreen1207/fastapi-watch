@@ -7,7 +7,7 @@ import time
 from abc import ABC, abstractmethod
 from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from ..models import ProbeResult, ProbeStatus
 
@@ -26,12 +26,31 @@ def _failure_message(probe_name: str, exc: BaseException) -> str:
     return f"probe check failed: {type(exc).__name__}"
 
 
+def _validate_stats_params(
+    *, window_size: int, ema_alpha: float, max_error_rate: float, cache_window_size: int | None = None
+) -> None:
+    """Raise ``ValueError`` for settings that would leave a probe unable to record.
+
+    A zero-length window makes every recording fail; that failure is swallowed
+    (recording must never break the call it observes), so the probe would
+    silently report nothing forever.
+    """
+    if window_size <= 0:
+        raise ValueError(f"window_size must be a positive integer, got {window_size!r}")
+    if cache_window_size is not None and cache_window_size <= 0:
+        raise ValueError(f"cache_window_size must be a positive integer or None, got {cache_window_size!r}")
+    if not 0 < ema_alpha <= 1:
+        raise ValueError(f"ema_alpha must be in (0, 1], got {ema_alpha!r}")
+    if not 0 <= max_error_rate <= 1:
+        raise ValueError(f"max_error_rate must be in [0, 1], got {max_error_rate!r}")
+
+
 def _update_ema(current: float | None, value: float, alpha: float) -> float:
     """Return an updated exponential moving average."""
     return value if current is None else alpha * value + (1 - alpha) * current
 
 
-def _calc_percentile(window: deque, p: float) -> float | None:
+def _calc_percentile(window: Sequence[float], p: float) -> float | None:
     """Return a single percentile from *window*, or ``None`` if empty."""
     if not window:
         return None
@@ -39,7 +58,7 @@ def _calc_percentile(window: deque, p: float) -> float | None:
     return round(sorted_window[max(0, math.ceil(len(sorted_window) * p) - 1)], 2)
 
 
-def _calc_percentiles(window: deque, *percentiles: float) -> tuple[float | None, ...]:
+def _calc_percentiles(window: Sequence[float], *percentiles: float) -> tuple[float | None, ...]:
     """Return multiple percentiles from *window* in a single sort pass."""
     if not window:
         return tuple(None for _ in percentiles)
@@ -110,6 +129,13 @@ class BaseProbe(ABC):
     async def check(self) -> ProbeResult:
         """Execute the health check and return a :class:`~fastapi_watch.models.ProbeResult`."""
 
+    async def aclose(self) -> None:
+        """Release anything the probe started (background tasks, connections).
+
+        Called once when the registry shuts down.  The default does nothing;
+        override it in probes that hold resources.
+        """
+
 
 class PassiveProbe(BaseProbe):
     """Base class for custom **passive** health probes.
@@ -165,6 +191,13 @@ class PassiveProbe(BaseProbe):
     The registry's circuit breaker is off by default (``circuit_breaker_enabled=False``):
     a passive probe only reads in-memory counters, so suspending it protects no
     dependency and would show a stale result while traffic recovers.
+
+    ``last_error`` names only the exception type (``"IntegrityError"``), or
+    ``"HTTP <status>"`` for a status-code-only error.  Exception messages often
+    carry DSNs, credentials, or the bound parameters of a failed query, and
+    health endpoints are often public, so the message is logged at debug level
+    instead.  Pass ``expose_error_messages=True`` to report it as
+    ``"<type>: <message>"`` — only where the health endpoints are protected.
     """
 
     # Overridden by FastAPIRouteProbe, which counts requests rather than calls.
@@ -188,7 +221,14 @@ class PassiveProbe(BaseProbe):
         cache_time_window_s: float = 120.0,
         timeout: float | None = None,
         poll_interval_ms: int | None = None,
+        expose_error_messages: bool = False,
     ) -> None:
+        _validate_stats_params(
+            window_size=window_size,
+            ema_alpha=ema_alpha,
+            max_error_rate=max_error_rate,
+            cache_window_size=cache_window_size,
+        )
         self.name = name
         self.description = description
         self.tags = list(tags) if tags else []
@@ -201,6 +241,7 @@ class PassiveProbe(BaseProbe):
         self.slow_call_threshold_ms = slow_call_threshold_ms
         self.cache_reporting = cache_reporting
         self.cache_time_window_s = cache_time_window_s
+        self.expose_error_messages = expose_error_messages
         # None = not explicitly set; auto-detected from cache maxsize in watch()
         self._cache_window_size: int | None = cache_window_size
         self._cache_window_size_explicit: bool = cache_window_size is not None
@@ -334,8 +375,9 @@ class PassiveProbe(BaseProbe):
         calls are skipped rather than miscounted (the reported hit/miss counts
         are then a sample, which keeps the ratio honest).
         """
-        self._cache_maxsize = after.maxsize
-        self._cache_currsize = after.currsize
+        with self._lock:
+            self._cache_maxsize = after.maxsize
+            self._cache_currsize = after.currsize
         hits = after.hits - before.hits
         misses_before, misses_after = getattr(before, "misses", None), getattr(after, "misses", None)
         if misses_before is None or misses_after is None:
@@ -348,7 +390,7 @@ class PassiveProbe(BaseProbe):
 
     @property
     def _error_rate(self) -> float:
-        """Failure fraction over the last ``window_size`` calls.
+        """Failure fraction over the last ``window_size`` calls (read it under ``_lock``).
 
         Lifetime counts would let a long healthy history mask a fresh outage
         (and an old burst of errors linger forever), so health is judged on
@@ -359,7 +401,7 @@ class PassiveProbe(BaseProbe):
 
     @property
     def _requests_per_minute(self) -> float | None:
-        """Throughput derived from the timestamp window; ``None`` until ≥2 calls."""
+        """Throughput derived from the timestamp window; ``None`` until ≥2 calls (read it under ``_lock``)."""
         if len(self._request_timestamps) < 2:
             return None
         span = self._request_timestamps[-1] - self._request_timestamps[0]
@@ -381,6 +423,17 @@ class PassiveProbe(BaseProbe):
         Set ``cache_reporting=False`` on the probe to opt out.
         """
         return self._wrap(func)
+
+    def _error_message(self, exc: Exception) -> str:
+        """``last_error`` text for *exc*: its type, plus its message only when opted in.
+
+        The message (an ``HTTPException``'s ``detail`` included) is logged at
+        debug level instead; see the class docstring.
+        """
+        if self.expose_error_messages:
+            return f"{type(exc).__name__}: {exc}"
+        _LOGGER.debug("fastapi-watch: probe %r observed a failed call", self.name, exc_info=exc)
+        return type(exc).__name__
 
     def _wrap(self, func: Callable) -> Callable:
         has_cache = self.cache_reporting and callable(getattr(func, "cache_info", None))
@@ -415,7 +468,7 @@ class PassiveProbe(BaseProbe):
                     rtt_ms,
                     error=is_error,
                     status=status,
-                    error_msg=f"{type(exc).__name__}: {exc}",
+                    error_msg=self._error_message(exc),
                     error_type=type(exc).__name__,
                 )
             except Exception:
@@ -447,16 +500,36 @@ class PassiveProbe(BaseProbe):
         return sync_wrapper
 
     async def check(self) -> ProbeResult:
-        if self._call_count == 0:
-            return ProbeResult(
-                name=self.name,
-                status=ProbeStatus.HEALTHY,
-                latency_ms=0.0,
-                details={"message": self._empty_message},
-            )
-
-        error_rate = self._error_rate
-        avg_rtt = self._avg_rtt_ms or 0.0
+        # Sync callables record from threadpool threads, so copy one consistent
+        # snapshot under the lock and do the sorting and formatting outside it.
+        with self._lock:
+            call_count = self._call_count
+            if call_count == 0:
+                return ProbeResult(
+                    name=self.name,
+                    status=ProbeStatus.HEALTHY,
+                    latency_ms=0.0,
+                    details={"message": self._empty_message},
+                )
+            error_count = self._error_count
+            error_rate = self._error_rate
+            consecutive_errors = self._consecutive_errors
+            last_status_code = self._last_status_code
+            last_rtt_ms = self._last_rtt_ms
+            avg_rtt = self._avg_rtt_ms or 0.0
+            min_rtt_ms = self._min_rtt_ms
+            max_rtt_ms = self._max_rtt_ms
+            rtt_window = list(self._rtt_window)
+            requests_per_minute = self._requests_per_minute
+            slow_call_count = self._slow_call_count
+            last_error = self._last_error
+            status_counts = dict(self._status_counts)
+            error_type_counts = dict(self._error_type_counts)
+            cache_events = list(self._cache_timed_events)
+            cache_maxsize = self._cache_maxsize
+            cache_currsize = self._cache_currsize
+            last_error_at = self._last_error_at
+            last_success_at = self._last_success_at
 
         reasons: list[str] = []
         if error_rate > self.max_error_rate:
@@ -468,59 +541,56 @@ class PassiveProbe(BaseProbe):
                 f"avg RTT {avg_rtt:.1f} ms exceeds threshold {self.max_avg_rtt_ms:.1f} ms"
             )
 
-        p50, p95, p99 = _calc_percentiles(self._rtt_window, 0.5, 0.95, 0.99)
+        p50, p95, p99 = _calc_percentiles(rtt_window, 0.5, 0.95, 0.99)
 
         details: dict[str, Any] = {}
         if self._label is not None:
             details["description"] = self._label
         details.update({
-            self._count_key: self._call_count,
-            "error_count": self._error_count,
+            self._count_key: call_count,
+            "error_count": error_count,
             "error_rate": round(error_rate, 4),
-            "consecutive_errors": self._consecutive_errors,
+            "consecutive_errors": consecutive_errors,
         })
-        if self._last_status_code is not None:
-            details["last_status_code"] = self._last_status_code
+        if last_status_code is not None:
+            details["last_status_code"] = last_status_code
         details.update({
-            "last_rtt_ms": self._last_rtt_ms,
+            "last_rtt_ms": last_rtt_ms,
             "avg_rtt_ms": round(avg_rtt, 2),
             "p50_rtt_ms": p50,
             "p95_rtt_ms": p95,
             "p99_rtt_ms": p99,
-            "min_rtt_ms": self._min_rtt_ms,
-            "max_rtt_ms": self._max_rtt_ms,
+            "min_rtt_ms": min_rtt_ms,
+            "max_rtt_ms": max_rtt_ms,
         })
-        requests_per_minute = self._requests_per_minute
         if requests_per_minute is not None:
             details["requests_per_minute"] = requests_per_minute
-        if self.slow_call_threshold_ms is not None and self._rtt_window:
-            details["slow_calls"] = self._slow_call_count
-        if self._last_error is not None:
-            details["last_error"] = self._last_error
-        if self._status_counts:
-            details["status_distribution"] = dict(self._status_counts)
-        if self._error_type_counts:
-            details["error_types"] = dict(self._error_type_counts)
-        if self._cache_timed_events:
-            events = list(self._cache_timed_events)
+        if self.slow_call_threshold_ms is not None and rtt_window:
+            details["slow_calls"] = slow_call_count
+        if last_error is not None:
+            details["last_error"] = last_error
+        if status_counts:
+            details["status_distribution"] = status_counts
+        if error_type_counts:
+            details["error_types"] = error_type_counts
+        if cache_events:
             if self._cache_window_size is not None:
-                window = events[-self._cache_window_size:]
+                window = cache_events[-self._cache_window_size:]
             else:
                 cutoff = time.monotonic() - self.cache_time_window_s
-                window = [entry for entry in events if entry[0] >= cutoff]
+                window = [entry for entry in cache_events if entry[0] >= cutoff]
             if window:
                 cache_hits = sum(1 for _, is_hit in window if is_hit)
                 details["cache_hits"] = cache_hits
                 details["cache_misses"] = len(window) - cache_hits
-                if self._cache_maxsize is not None:
-                    details["cache_maxsize"] = self._cache_maxsize
-                if self._cache_currsize is not None:
-                    details["cache_currsize"] = self._cache_currsize
-        if self._last_error_at is not None:
-            details["last_error_at"] = self._last_error_at.isoformat()
-        outcome_window = self._outcome_window
-        if outcome_window and self._outcome_failure_count / len(outcome_window) >= 0.99 and self._last_success_at is not None:
-            details["last_success_at"] = self._last_success_at.isoformat()
+                if cache_maxsize is not None:
+                    details["cache_maxsize"] = cache_maxsize
+                if cache_currsize is not None:
+                    details["cache_currsize"] = cache_currsize
+        if last_error_at is not None:
+            details["last_error_at"] = last_error_at.isoformat()
+        if error_rate >= 0.99 and last_success_at is not None:
+            details["last_success_at"] = last_success_at.isoformat()
 
         return ProbeResult(
             name=self.name,

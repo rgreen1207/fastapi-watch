@@ -17,7 +17,8 @@ class EventLoopProbe(BaseProbe):
     first check starts a lightweight background sampler that repeatedly sleeps
     for ``sample_interval_ms`` and records how late it wakes up; each check
     reports the worst lag seen since the previous check (``lag_ms``) alongside
-    a fresh immediate measurement (``current_lag_ms``).
+    a fresh immediate measurement (``current_lag_ms``).  :meth:`aclose` (called
+    by the registry at shutdown) stops the sampler.
 
     Args:
         name: Probe name (default ``"event_loop"``).
@@ -68,6 +69,23 @@ class EventLoopProbe(BaseProbe):
         sampler = self._sampler
         if sampler is None or sampler.done() or sampler.get_loop() is not loop:
             self._sampler = loop.create_task(self._sample(), name=f"fastapi-watch-{self.name}-sampler")
+
+    async def aclose(self) -> None:
+        """Stop the background sampler.  A later :meth:`check` starts a new one."""
+        sampler, self._sampler = self._sampler, None
+        if sampler is None or sampler.done():
+            return
+        sampler_loop = sampler.get_loop()
+        if sampler_loop is asyncio.get_running_loop():
+            sampler.cancel()
+            # wait() rather than awaiting the task: the sampler's CancelledError
+            # stays inside it, while a cancellation of aclose() itself still propagates.
+            await asyncio.wait({sampler})
+            return
+        try:
+            sampler_loop.call_soon_threadsafe(sampler.cancel)
+        except RuntimeError:
+            pass  # that loop is closed, and the sampler with it
 
     async def check(self) -> ProbeResult:
         self._ensure_sampler()

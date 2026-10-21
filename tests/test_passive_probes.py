@@ -2,6 +2,7 @@
 import asyncio
 import functools
 import pathlib
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +11,7 @@ from fastapi import FastAPI
 from fastapi_watch import FastAPIRouteProbe, FastAPIWebSocketProbe, HealthRegistry, PassiveProbe
 from fastapi_watch.models import ProbeStatus
 from fastapi_watch.probes import HttpProbe, NoOpProbe, RedisProbe, TCPProbe
+from fastapi_watch.probes import base as base_module
 
 
 # ---------------------------------------------------------------------------
@@ -194,3 +196,81 @@ async def test_non_int_status_code_on_exception_counts_as_500():
     details = (await probe.check()).details
     assert details["last_status_code"] == 500
     assert details["error_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# check() reads a consistent snapshot under the lock
+# ---------------------------------------------------------------------------
+
+class _TrackingLock:
+    """A lock that records whether it is held, to see what check() does under it."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.held = False
+        self.acquisitions = 0
+
+    def __enter__(self):
+        self._lock.acquire()
+        self.held = True
+        self.acquisitions += 1
+        return self
+
+    def __exit__(self, *exc):
+        self.held = False
+        self._lock.release()
+
+
+async def test_check_copies_state_under_the_lock_and_sorts_outside_it(monkeypatch):
+    probe = PassiveProbe("p", slow_call_threshold_ms=0.0)
+
+    @probe.watch
+    def call():
+        return 1
+
+    for _ in range(5):
+        call()
+    lock = probe._lock = _TrackingLock()
+    sorted_under_lock = []
+    real = base_module._calc_percentiles
+    monkeypatch.setattr(
+        base_module, "_calc_percentiles",
+        lambda window, *ps: sorted_under_lock.append(lock.held) or real(window, *ps),
+    )
+
+    result = await probe.check()
+
+    assert lock.acquisitions == 1
+    assert sorted_under_lock == [False]
+    assert result.details["call_count"] == 5
+
+
+async def test_concurrent_recording_from_threads_gives_consistent_checks():
+    probe = PassiveProbe("p", window_size=50, max_error_rate=1.0)
+
+    @probe.watch
+    def call(i):
+        if i % 4 == 0:
+            raise ValueError
+        return i
+
+    def worker():
+        for i in range(2000):
+            try:
+                call(i)
+            except ValueError:
+                pass
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    while any(t.is_alive() for t in threads):
+        details = (await probe.check()).details
+        assert details["error_count"] <= details["call_count"]
+        assert sum(details.get("error_types", {}).values()) <= 50
+    for t in threads:
+        t.join()
+
+    details = (await probe.check()).details
+    assert details["call_count"] == 8000
+    assert details["error_count"] == 2000

@@ -5,7 +5,7 @@ from collections import deque
 from typing import Any, Callable
 
 from ..models import ProbeResult, ProbeStatus
-from .base import BaseProbe, _update_ema
+from .base import BaseProbe, _update_ema, _validate_stats_params
 
 
 def _find_ws_param(func: Callable) -> str | None:
@@ -152,6 +152,7 @@ class FastAPIWebSocketProbe(BaseProbe):
         poll_interval_ms: int | None = None,
         circuit_breaker_enabled: bool = False,
     ) -> None:
+        _validate_stats_params(window_size=window_size, ema_alpha=ema_alpha, max_error_rate=max_error_rate)
         self.name = name
         self.description = description
         self.tags = list(tags) if tags else []

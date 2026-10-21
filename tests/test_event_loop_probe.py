@@ -103,3 +103,61 @@ async def test_one_sampler_is_reused_across_checks():
     await probe.check()
     assert probe._sampler is sampler and not sampler.done()
     sampler.cancel()
+
+
+# ---------------------------------------------------------------------------
+# aclose() stops the background sampler
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_aclose_cancels_and_awaits_the_sampler():
+    probe = EventLoopProbe(sample_interval_ms=10)
+    await probe.check()
+    sampler = probe._sampler
+    assert sampler is not None and not sampler.done()
+
+    await probe.aclose()
+
+    assert sampler.cancelled()
+    assert probe._sampler is None
+
+
+@pytest.mark.asyncio
+async def test_aclose_is_a_no_op_before_the_first_check_and_when_repeated():
+    probe = EventLoopProbe()
+    await probe.aclose()
+    await probe.check()
+    await probe.aclose()
+    await probe.aclose()
+    assert probe._sampler is None
+
+
+@pytest.mark.asyncio
+async def test_check_after_aclose_starts_a_new_sampler():
+    probe = EventLoopProbe(sample_interval_ms=10)
+    await probe.check()
+    await probe.aclose()
+    await probe.check()
+    assert probe._sampler is not None and not probe._sampler.done()
+    await probe.aclose()
+
+
+@pytest.mark.asyncio
+async def test_threshold_probe_closes_the_probe_it_wraps():
+    from fastapi_watch.probes import ThresholdProbe
+
+    inner = EventLoopProbe(sample_interval_ms=10)
+    probe = ThresholdProbe(inner, warn_if=lambda d: False)
+    await probe.check()
+    sampler = inner._sampler
+
+    await probe.aclose()
+
+    assert sampler.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_base_probe_aclose_defaults_to_a_no_op():
+    from fastapi_watch.probes import NoOpProbe
+
+    assert await NoOpProbe().aclose() is None

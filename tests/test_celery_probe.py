@@ -420,3 +420,75 @@ def test_overall_deadline_covers_every_broadcast():
     assert CeleryProbe(MagicMock(), timeout=1.0).timeout == pytest.approx(1.0 + 2.0)
     assert CeleryProbe(MagicMock(), timeout=1.0, detailed=True).timeout == pytest.approx(7.0 + 2.0)
     assert CeleryProbe(MagicMock(), timeout=1.0).reply_timeout == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Task arguments and list sizes (detailed=True)
+# ---------------------------------------------------------------------------
+
+def _detailed_app(active=(), reserved=(), scheduled=()):
+    return _make_app(
+        ping={_WORKER: {"ok": "pong"}},
+        active={_WORKER: list(active)},
+        reserved={_WORKER: list(reserved)},
+        scheduled={_WORKER: list(scheduled)},
+        registered={_WORKER: []},
+        stats={_WORKER: _STATS},
+        active_queues={_WORKER: _QUEUES},
+    )
+
+
+def test_clean_task_drops_args_and_kwargs_by_default():
+    result = _clean_task(_ACTIVE_TASK)
+    assert "args" not in result
+    assert "kwargs" not in result
+    assert _clean_task(_ACTIVE_TASK, include_args=True)["args"] == ["user@example.com"]
+
+
+@pytest.mark.asyncio
+async def test_detailed_does_not_publish_task_arguments_by_default():
+    probe = CeleryProbe(
+        _detailed_app(active=[_ACTIVE_TASK], reserved=[_ACTIVE_TASK], scheduled=[_SCHEDULED_ENTRY]),
+        detailed=True,
+    )
+    worker = (await probe.check()).details["workers"][_WORKER]
+
+    for task in worker["active"] + worker["reserved"] + [worker["scheduled"][0]["request"]]:
+        assert "args" not in task and "kwargs" not in task
+    assert "user@example.com" not in repr(worker)
+
+
+@pytest.mark.asyncio
+async def test_include_task_args_opts_in():
+    probe = CeleryProbe(
+        _detailed_app(active=[_ACTIVE_TASK], scheduled=[_SCHEDULED_ENTRY]),
+        detailed=True,
+        include_task_args=True,
+    )
+    worker = (await probe.check()).details["workers"][_WORKER]
+
+    assert worker["active"][0]["args"] == ["user@example.com"]
+    assert worker["active"][0]["kwargs"] == {"subject": "Hello"}
+    assert worker["scheduled"][0]["request"]["args"] == []
+
+
+@pytest.mark.asyncio
+async def test_task_lists_are_capped_with_a_truncated_count():
+    many = [{**_ACTIVE_TASK, "id": str(i)} for i in range(120)]
+    probe = CeleryProbe(_detailed_app(active=many, reserved=many[:50], scheduled=[_SCHEDULED_ENTRY] * 51), detailed=True)
+    worker = (await probe.check()).details["workers"][_WORKER]
+
+    assert len(worker["active"]) == 50
+    assert worker["active"][0]["id"] == "0"
+    assert len(worker["reserved"]) == 50
+    assert len(worker["scheduled"]) == 50
+    assert worker["truncated"] == {"active": 70, "scheduled": 1}
+    # The counts are the full totals, not the listed ones.
+    assert worker["active_tasks"] == 120
+    assert worker["scheduled_tasks"] == 51
+
+
+@pytest.mark.asyncio
+async def test_no_truncated_key_when_nothing_was_cut():
+    worker = (await CeleryProbe(_detailed_app(active=[_ACTIVE_TASK]), detailed=True).check()).details["workers"][_WORKER]
+    assert "truncated" not in worker

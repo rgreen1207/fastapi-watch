@@ -1,14 +1,20 @@
-import asyncio
 import time
-from typing import Any
+from typing import Any, Callable
 
+from .._executor import SingleFlight, StillRunning
 from ..models import ProbeResult, ProbeStatus
 from .base import BaseProbe, _failure_message
 
 # Fields kept from each task dict returned by inspect.active() / reserved()
-_TASK_FIELDS = ("id", "name", "args", "kwargs", "time_start", "worker_pid")
+_TASK_FIELDS = ("id", "name", "time_start", "worker_pid")
+# Task arguments are application data (emails, tokens, personal data), so they
+# are only kept when the probe is created with include_task_args=True.
+_TASK_ARG_FIELDS = ("args", "kwargs")
 # Fields kept from each task dict returned by inspect.scheduled()
 _SCHEDULED_FIELDS = ("eta", "priority", "request")
+# Most tasks listed per worker for each of active / reserved / scheduled.  The
+# history keeps many copies of every result, so details must stay bounded.
+_MAX_TASKS_LISTED = 50
 
 # Slack on top of the broadcast waits for broker connect/teardown.
 _DEADLINE_MARGIN_S = 2.0
@@ -18,14 +24,14 @@ def _pluck(d: dict, keys: tuple) -> dict:
     return {k: d[k] for k in keys if k in d}
 
 
-def _clean_task(task: dict) -> dict:
-    return _pluck(task, _TASK_FIELDS)
+def _clean_task(task: dict, include_args: bool = False) -> dict:
+    return _pluck(task, _TASK_FIELDS + _TASK_ARG_FIELDS if include_args else _TASK_FIELDS)
 
 
-def _clean_scheduled(entry: dict) -> dict:
+def _clean_scheduled(entry: dict, include_args: bool = False) -> dict:
     out = _pluck(entry, _SCHEDULED_FIELDS)
     if "request" in out:
-        out["request"] = _pluck(out["request"], _TASK_FIELDS)
+        out["request"] = _clean_task(out["request"], include_args)
     return out
 
 
@@ -66,6 +72,18 @@ class CeleryProbe(BaseProbe):
         detailed: When ``True``, collects per-worker active/reserved/scheduled
             tasks, registered task names, queue bindings, and pool stats.
             Disabled by default to minimise broadcast traffic in production.
+            Each task list is capped at 50 entries; when a list is cut, the
+            worker's ``truncated`` dict says how many entries were left out
+            (the ``*_tasks`` counts are always the full totals).
+        include_task_args: When ``True`` (and *detailed*), each listed task
+            also carries its ``args`` and ``kwargs``.  Off by default: task
+            arguments are application data — email addresses, tokens,
+            personal data — and health endpoints are often public.
+
+    The inspect calls are blocking, so they run in fastapi-watch's own small
+    thread pool rather than the event loop's default executor.  If a broker
+    hangs past the probe's deadline, the next check reports
+    ``"previous check still running"`` instead of starting another call.
 
     Example::
 
@@ -84,6 +102,7 @@ class CeleryProbe(BaseProbe):
         min_workers: int = 0,
         detailed: bool = False,
         poll_interval_ms: int | None = None,
+        include_task_args: bool = False,
     ) -> None:
         self.app = app
         self.name = name
@@ -95,11 +114,19 @@ class CeleryProbe(BaseProbe):
         self.timeout = timeout * broadcasts + _DEADLINE_MARGIN_S
         self.min_workers = min_workers
         self.detailed = detailed
+        self.include_task_args = include_task_args
         self.poll_interval_ms = poll_interval_ms
+        self._inspect_call = SingleFlight()
 
     # ------------------------------------------------------------------
-    # Synchronous inspect — called via run_in_executor
+    # Synchronous inspect — run in fastapi-watch's thread pool
     # ------------------------------------------------------------------
+
+    def _task_list(self, tasks: list, clean: Callable[[dict, bool], dict], truncated: dict[str, int], key: str) -> list[dict]:
+        """Clean at most ``_MAX_TASKS_LISTED`` of *tasks*, noting any left out under *key*."""
+        if len(tasks) > _MAX_TASKS_LISTED:
+            truncated[key] = len(tasks) - _MAX_TASKS_LISTED
+        return [clean(t, self.include_task_args) for t in tasks[:_MAX_TASKS_LISTED]]
 
     def _inspect(self) -> dict[str, Any]:
         inspector = self.app.control.inspect(timeout=self.reply_timeout)
@@ -123,12 +150,13 @@ class CeleryProbe(BaseProbe):
 
         worker_details: dict[str, Any] = {}
         for worker in workers:
-            worker_active = [_clean_task(t) for t in (active.get(worker) or [])]
-            worker_reserved = [_clean_task(t) for t in (reserved.get(worker) or [])]
-            worker_scheduled = [_clean_scheduled(e) for e in (scheduled.get(worker) or [])]
+            worker_active = list(active.get(worker) or [])
+            worker_reserved = list(reserved.get(worker) or [])
+            worker_scheduled = list(scheduled.get(worker) or [])
             worker_registered = sorted(registered.get(worker) or [])
             worker_stats = stats.get(worker) or {}
             worker_queues = [q["name"] for q in (active_queues.get(worker) or [])]
+            truncated: dict[str, int] = {}
 
             worker_details[worker] = {
                 "status": "online",
@@ -139,10 +167,12 @@ class CeleryProbe(BaseProbe):
                 "pool": _pool_info(worker_stats),
                 "total_tasks_executed": worker_stats.get("total", {}),
                 "registered_tasks": worker_registered,
-                "active": worker_active,
-                "reserved": worker_reserved,
-                "scheduled": worker_scheduled,
+                "active": self._task_list(worker_active, _clean_task, truncated, "active"),
+                "reserved": self._task_list(worker_reserved, _clean_task, truncated, "reserved"),
+                "scheduled": self._task_list(worker_scheduled, _clean_scheduled, truncated, "scheduled"),
             }
+            if truncated:
+                worker_details[worker]["truncated"] = truncated
 
         return {"workers_online": len(workers), "workers": worker_details}
 
@@ -153,8 +183,7 @@ class CeleryProbe(BaseProbe):
     async def check(self) -> ProbeResult:
         start = time.perf_counter()
         try:
-            loop = asyncio.get_running_loop()
-            data = await loop.run_in_executor(None, self._inspect)
+            data = await self._inspect_call.run(self._inspect)
             latency = (time.perf_counter() - start) * 1000
 
             workers_online: int = data["workers_online"]
@@ -200,6 +229,13 @@ class CeleryProbe(BaseProbe):
                 details=data,
             )
 
+        except StillRunning:
+            return ProbeResult(
+                name=self.name,
+                status=ProbeStatus.UNHEALTHY,
+                latency_ms=0.0,
+                error="previous check still running",
+            )
         except Exception as exc:
             latency = (time.perf_counter() - start) * 1000
             return ProbeResult(
