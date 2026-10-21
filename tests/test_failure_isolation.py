@@ -1,5 +1,6 @@
 """User callbacks and storage errors must not break health checks or polling."""
 import asyncio
+import signal
 
 import pytest
 from fastapi import FastAPI
@@ -99,3 +100,47 @@ async def test_on_connect_restarts_a_dead_poll_task():
     finally:
         registry._cancel_poll_task()
         await registry._on_disconnect()
+
+
+# ---------------------------------------------------------------------------
+# Early shutdown hook: signal handler defers task cancellation to the loop
+# ---------------------------------------------------------------------------
+
+def _capture_signal_handlers(monkeypatch):
+    installed, chained_to = {}, []
+    monkeypatch.setattr(signal, "getsignal", lambda sig: (lambda signum, frame: chained_to.append(signum)))
+    monkeypatch.setattr(signal, "signal", lambda sig, handler: installed.__setitem__(sig, handler))
+    return installed, chained_to
+
+
+@pytest.mark.asyncio
+async def test_signal_handler_defers_cancellation_to_the_loop(monkeypatch):
+    class _RecordingTask:
+        cancel_calls = 0
+
+        def cancel(self):
+            self.cancel_calls += 1
+
+    installed, chained_to = _capture_signal_handlers(monkeypatch)
+    registry = HealthRegistry(FastAPI())
+    registry._install_early_shutdown_hook()
+    stream_task = _RecordingTask()
+    registry._sse_tasks.add(stream_task)
+
+    installed[signal.SIGTERM](signal.SIGTERM, None)
+    assert registry._shutting_down is True
+    assert chained_to == [signal.SIGTERM]  # the previous handler still runs
+    assert stream_task.cancel_calls == 0  # nothing cancelled from inside the handler
+
+    await asyncio.sleep(0)  # let the loop run the scheduled cancellation
+    assert stream_task.cancel_calls == 1
+
+
+def test_signal_handler_without_a_running_loop_only_sets_the_flag(monkeypatch):
+    installed, chained_to = _capture_signal_handlers(monkeypatch)
+    registry = HealthRegistry(FastAPI())
+    registry._install_early_shutdown_hook()  # called from sync code: no running loop
+
+    installed[signal.SIGINT](signal.SIGINT, None)
+    assert registry._shutting_down is True
+    assert chained_to == [signal.SIGINT]

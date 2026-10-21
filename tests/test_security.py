@@ -1,5 +1,6 @@
 """Security hardening tests."""
 import ast
+import base64
 import logging
 import re
 import pytest
@@ -8,6 +9,7 @@ from unittest.mock import MagicMock
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from fastapi_watch import HealthRegistry
+import fastapi_watch.registry as registry_module
 from fastapi_watch.alerts import (
     WebhookAlerter,
     SlackAlerter,
@@ -509,3 +511,16 @@ def _documented_auth_dicts():
 @pytest.mark.parametrize("auth", _documented_auth_dicts())
 def test_documented_auth_examples_construct(auth):
     HealthRegistry(FastAPI(), auth=auth)
+
+
+def test_basic_auth_compares_password_even_when_username_is_wrong(monkeypatch):
+    """No short-circuit on the username, so timing cannot reveal it."""
+    compared = []
+    real = registry_module.secrets.compare_digest
+    monkeypatch.setattr(registry_module.secrets, "compare_digest", lambda a, b: compared.append(b) or real(a, b))
+    app = FastAPI()
+    HealthRegistry(app, auth={"type": "basic", "username": "ops", "password": "pw"})
+    creds = base64.b64encode(b"wrong:pw").decode()
+
+    assert TestClient(app).get("/health/live", headers={"Authorization": f"Basic {creds}"}).status_code == 401
+    assert compared == [b"ops", b"pw"]

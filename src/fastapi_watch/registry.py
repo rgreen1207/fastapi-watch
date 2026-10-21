@@ -267,10 +267,11 @@ def _make_auth_checker(auth) -> Callable | None:
                 user, _, pwd = decoded.partition(":")
             except Exception:
                 raise HTTPException(status_code=401, headers=_challenge)
-            if not (
-                secrets.compare_digest(user.encode(), expected_user)
-                and secrets.compare_digest(pwd.encode(), expected_pass)
-            ):
+            # Compare both before combining: short-circuiting on the username
+            # would let response timing reveal whether it was correct.
+            user_ok = secrets.compare_digest(user.encode(), expected_user)
+            pass_ok = secrets.compare_digest(pwd.encode(), expected_pass)
+            if not (user_ok and pass_ok):
                 raise HTTPException(status_code=401, headers=_challenge, detail="Unauthorized")
         return _basic
 
@@ -1202,18 +1203,26 @@ class HealthRegistry:
 
         uvicorn registers its own handlers via signal.signal() (not
         loop.add_signal_handler()), so we chain at the Python signal level.
+
+        A signal.signal() handler can run between any two bytecodes — including
+        in the middle of an event-loop callback — so it only sets a flag and
+        hands the task cancellation to the loop with call_soon_threadsafe().
+        Without a running loop (hook installed from sync code) the flag alone
+        still stops every stream within one 500 ms tick.
         """
+        try:
+            loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
         for sig in (_signal.SIGTERM, _signal.SIGINT):
             existing_handler = _signal.getsignal(sig)
 
             def _make_handler(existing):
                 def _chained(signum, frame):
                     self._shutting_down = True
-                    for task in list(self._sse_tasks):
-                        task.cancel()
-                    self._cancel_poll_task()
-                    if self._alert_worker is not None and not self._alert_worker.done():
-                        self._alert_worker.cancel()
+                    if loop is not None and not loop.is_closed():
+                        loop.call_soon_threadsafe(self._cancel_background_tasks)
                     # Delegate to uvicorn's handler so it still shuts down.
                     if callable(existing):
                         existing(signum, frame)
@@ -1222,7 +1231,19 @@ class HealthRegistry:
             try:
                 _signal.signal(sig, _make_handler(existing_handler))
             except (OSError, ValueError):
-                pass  # Not in main thread or signal not supported
+                # Not the main thread, or the platform lacks the signal: streams
+                # still stop via the lifespan teardown (_shutdown).
+                (self._logger or _LIB_LOGGER).debug(
+                    "fastapi-watch: could not install the early shutdown hook for %s", sig
+                )
+
+    def _cancel_background_tasks(self) -> None:
+        """Cancel SSE streams, the poll loop, and the alert worker (on the loop thread)."""
+        for task in list(self._sse_tasks):
+            task.cancel()
+        self._cancel_poll_task()
+        if self._alert_worker is not None and not self._alert_worker.done():
+            self._alert_worker.cancel()
 
     async def _shutdown(self) -> None:
         """Signal SSE streams to stop and cancel the poll task.

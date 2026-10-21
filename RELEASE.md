@@ -96,6 +96,10 @@ README.md and DOCS.md showed `auth={"username": ..., "password": ...}` (missing 
 
 **Fix:** the renderer's signature is inspected once at startup: one-argument renderers are called with the report, and renderers taking a second positional argument (as 1.7.1 required) still receive the maintenance flag.
 
+#### Shutdown signal hook no longer cancels tasks from inside the signal handler
+
+The early-shutdown hook cancelled SSE, poll, and alert tasks directly inside a `signal.signal()` handler, which can run in the middle of any event-loop callback. It now only sets the shutdown flag and schedules the cancellation on the loop with `call_soon_threadsafe()`; without a running loop the flag alone stops every stream within one 500 ms tick. A failure to install the hook (non-main thread) is logged at debug level instead of being silently ignored.
+
 ### Performance
 
 #### Per-route request metrics no longer grow without bound
@@ -119,6 +123,10 @@ With the default `auth=None`, anyone who could reach the service could `POST /he
 **Fix:** `POST` and `DELETE /health/maintenance` are mounted only when `auth=` is configured. `GET /health/maintenance` and the `set_maintenance()` / `clear_maintenance()` methods are unaffected. The "health endpoints are publicly accessible" startup warning now always logs (through the `fastapi_watch` logger when no `logger=` is passed — previously it only appeared when one was) and names the routes that were left out.
 
 **Upgrading:** if you toggle maintenance over HTTP without `auth=`, those calls now return `405`. Pass `auth=` to `HealthRegistry`, or call `registry.set_maintenance()` / `registry.clear_maintenance()` from your own authenticated endpoint.
+
+#### Basic auth no longer short-circuits on the username
+
+The `basic` auth check compared the password only when the username matched, so response timing could reveal whether a guessed username was correct. Both are now compared before the result is combined.
 
 ### Infrastructure
 
