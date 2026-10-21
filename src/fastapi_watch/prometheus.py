@@ -22,8 +22,29 @@ Exposed metrics (all carry ``name`` and ``critical`` labels):
 * ``probe_circuit_open`` — 1 if the circuit breaker is currently open
 * ``probe_circuit_consecutive_failures`` — current consecutive failure count
 * ``probe_circuit_trips_total`` — lifetime circuit-breaker trip count
+
+These names collide with blackbox_exporter's ``probe_*`` metrics when both are
+scraped into one Prometheus.  Pass ``HealthRegistry(metrics_prefix=...)`` (for
+example ``"fastapi_watch_"``) to namespace them; the default ``""`` keeps the
+names above so existing dashboards and alerts continue to work.
 """
+import re
+from typing import Callable
+
 from .models import ProbeResult, ProbeStatus
+
+# Valid start of a Prometheus metric name; the prefix is prepended to "probe_...".
+_METRIC_PREFIX_RE = re.compile(r"[a-zA-Z_:][a-zA-Z0-9_:]*")
+
+
+def validate_metrics_prefix(prefix: str) -> str:
+    """Return *prefix* if it can begin a Prometheus metric name, else raise ``ValueError``."""
+    if prefix and not _METRIC_PREFIX_RE.fullmatch(prefix):
+        raise ValueError(
+            f"metrics_prefix {prefix!r} is not a valid Prometheus metric name prefix "
+            "(letters, digits, '_' and ':', not starting with a digit)"
+        )
+    return prefix
 
 
 def _escape_label(value: str) -> str:
@@ -36,9 +57,14 @@ def _lbl(name: str, critical: bool) -> str:
     return f'{{name="{_escape_label(name)}",critical="{crit}"}}'
 
 
+def _circuit(result: ProbeResult) -> dict:
+    return (result.details or {}).get("circuit_breaker", {})
+
+
 def render_prometheus(
     results: list[ProbeResult],
     trips: dict[str, int] | None = None,
+    prefix: str = "",
 ) -> str:
     """Render *results* as a Prometheus text-format metrics page.
 
@@ -47,64 +73,29 @@ def render_prometheus(
         trips: Optional dict mapping probe name → lifetime circuit-breaker trip
             count.  Pass an empty dict or ``None`` if the circuit breaker is
             disabled.
+        prefix: Prepended to every metric name (default ``""``).
     """
     trips = trips or {}
+    metrics: list[tuple[str, str, str, Callable[[ProbeResult], object]]] = [
+        ("probe_healthy", "gauge", "1 if probe status is healthy, 0 otherwise",
+         lambda r: 1 if r.status == ProbeStatus.HEALTHY else 0),
+        ("probe_degraded", "gauge", "1 if probe status is degraded (warning), 0 otherwise",
+         lambda r: 1 if r.status == ProbeStatus.DEGRADED else 0),
+        ("probe_latency_ms", "gauge", "Last observed probe check latency in milliseconds",
+         lambda r: r.latency_ms),
+        ("probe_circuit_open", "gauge", "1 if the circuit breaker is currently open for this probe",
+         lambda r: 1 if _circuit(r).get("open", False) else 0),
+        ("probe_circuit_consecutive_failures", "gauge", "Current consecutive failure count for this probe",
+         lambda r: _circuit(r).get("consecutive_failures", 0)),
+        ("probe_circuit_trips_total", "counter", "Total lifetime circuit breaker trips for this probe",
+         lambda r: trips.get(r.name, 0)),
+    ]
+
     lines: list[str] = []
-
-    # ── probe_healthy ────────────────────────────────────────────────────────
-    lines += [
-        "# HELP probe_healthy 1 if probe status is healthy, 0 otherwise",
-        "# TYPE probe_healthy gauge",
-    ]
-    for r in results:
-        val = 1 if r.status == ProbeStatus.HEALTHY else 0
-        lines.append(f"probe_healthy{_lbl(r.name, r.critical)} {val}")
-
-    # ── probe_degraded ───────────────────────────────────────────────────────
-    lines += [
-        "# HELP probe_degraded 1 if probe status is degraded (warning), 0 otherwise",
-        "# TYPE probe_degraded gauge",
-    ]
-    for r in results:
-        val = 1 if r.status == ProbeStatus.DEGRADED else 0
-        lines.append(f"probe_degraded{_lbl(r.name, r.critical)} {val}")
-
-    # ── probe_latency_ms ─────────────────────────────────────────────────────
-    lines += [
-        "# HELP probe_latency_ms Last observed probe check latency in milliseconds",
-        "# TYPE probe_latency_ms gauge",
-    ]
-    for r in results:
-        lines.append(f"probe_latency_ms{_lbl(r.name, r.critical)} {r.latency_ms}")
-
-    # ── probe_circuit_open ───────────────────────────────────────────────────
-    lines += [
-        "# HELP probe_circuit_open 1 if the circuit breaker is currently open for this probe",
-        "# TYPE probe_circuit_open gauge",
-    ]
-    for r in results:
-        cb = (r.details or {}).get("circuit_breaker", {})
-        val = 1 if cb.get("open", False) else 0
-        lines.append(f"probe_circuit_open{_lbl(r.name, r.critical)} {val}")
-
-    # ── probe_circuit_consecutive_failures ───────────────────────────────────
-    lines += [
-        "# HELP probe_circuit_consecutive_failures Current consecutive failure count for this probe",
-        "# TYPE probe_circuit_consecutive_failures gauge",
-    ]
-    for r in results:
-        cb = (r.details or {}).get("circuit_breaker", {})
-        val = cb.get("consecutive_failures", 0)
-        lines.append(f"probe_circuit_consecutive_failures{_lbl(r.name, r.critical)} {val}")
-
-    # ── probe_circuit_trips_total ────────────────────────────────────────────
-    lines += [
-        "# HELP probe_circuit_trips_total Total lifetime circuit breaker trips for this probe",
-        "# TYPE probe_circuit_trips_total counter",
-    ]
-    for r in results:
-        val = trips.get(r.name, 0)
-        lines.append(f"probe_circuit_trips_total{_lbl(r.name, r.critical)} {val}")
+    for name, kind, help_text, value in metrics:
+        metric = f"{prefix}{name}"
+        lines += [f"# HELP {metric} {help_text}", f"# TYPE {metric} {kind}"]
+        lines += [f"{metric}{_lbl(r.name, r.critical)} {value(r)}" for r in results]
 
     lines.append("")  # trailing newline required by spec
     return "\n".join(lines)

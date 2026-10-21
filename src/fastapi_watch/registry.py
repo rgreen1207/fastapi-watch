@@ -26,7 +26,7 @@ class _MaintenanceRequest(BaseModel):
 from .alerts import BaseAlerter, WebhookAlerter
 from .dashboard import render_dashboard
 from .models import AlertRecord, HealthReport, ProbeResult, ProbeStatus
-from .prometheus import render_prometheus
+from .prometheus import render_prometheus, validate_metrics_prefix
 from .probe_group import ProbeGroup
 from .probes.base import BaseProbe, _failure_message
 from .storage import InMemoryProbeStorage, ProbeStorage
@@ -362,6 +362,10 @@ class HealthRegistry:
             this bound is what keeps one hung dependency from hanging them all.
             ``None`` disables the default (probes without a ``timeout`` may then
             run indefinitely).
+        metrics_prefix: Prepended to every metric name on ``/metrics``
+            (default ``""``, keeping ``probe_healthy`` etc.).  Those names
+            collide with blackbox_exporter's ``probe_*`` metrics; set e.g.
+            ``"fastapi_watch_"`` to namespace them.
 
     Example::
 
@@ -400,6 +404,7 @@ class HealthRegistry:
         max_alerts: int = 120,
         storage: ProbeStorage | None = None,
         probe_timeout: float | None = 30.0,
+        metrics_prefix: str = "",
     ) -> None:
         if probe_timeout is not None and probe_timeout <= 0:
             raise ValueError(f"probe_timeout must be positive or None, got {probe_timeout!r}")
@@ -407,6 +412,7 @@ class HealthRegistry:
         self.prefix = prefix
         self._logger = logger
         self._probe_timeout = probe_timeout
+        self._metrics_prefix = validate_metrics_prefix(metrics_prefix)
         self._grace_period_ms: int = max(0, grace_period_ms)
         self._timezone_name: str = timezone
         self._tzinfo: ZoneInfo = ZoneInfo(timezone)
@@ -1743,7 +1749,7 @@ class HealthRegistry:
             results = await registry._get_results()
             trips = registry._circuit_trips if registry._circuit_breaker_enabled else {}
             return Response(
-                content=render_prometheus(results, trips),
+                content=render_prometheus(results, trips, prefix=registry._metrics_prefix),
                 media_type="text/plain; version=0.0.4; charset=utf-8",
             )
 

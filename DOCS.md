@@ -246,6 +246,8 @@ Dashboard display:
 
 Also exported as Prometheus gauges: `probe_circuit_open`, `probe_circuit_consecutive_failures`, `probe_circuit_trips_total`.
 
+All `/metrics` names start with `probe_`, which collides with blackbox_exporter's metrics if both are scraped into one Prometheus. Pass `HealthRegistry(app, metrics_prefix="fastapi_watch_")` to get `fastapi_watch_probe_healthy` and so on; the default keeps the existing names so current dashboards and alerts keep working.
+
 ---
 
 ## Maintenance mode
@@ -1530,6 +1532,7 @@ The endpoint is subject to the same `auth` as all other health endpoints.
 | `max_alerts` | `int` | `120` | Hard cap on stored alerts |
 | `storage` | `ProbeStorage \| None` | `None` | Custom storage backend |
 | `probe_timeout` | `float \| None` | `30.0` | Seconds before a probe without its own `timeout` is reported UNHEALTHY. `None` disables the default |
+| `metrics_prefix` | `str` | `""` | Prepended to every `/metrics` name. The default `probe_*` names collide with blackbox_exporter's; `"fastapi_watch_"` namespaces them |
 | `timezone` | `str` | `"UTC"` | IANA timezone for `checked_at` timestamps |
 | `groups` | `list[ProbeGroup] \| None` | `None` | ProbeGroups to include at startup |
 | `dashboard` | `bool \| Callable \| Path` | `True` | `True` = built-in dashboard; `False` = disabled; Callable = custom renderer `(report) -> str` (or `(report, maintenance) -> str` to also receive the maintenance flag); `.html`/`.htm` file path = served as-is. `.py` files are rejected. |

@@ -159,6 +159,21 @@ Current aiohttp deprecates `aiohttp.BasicAuth` (removed in aiohttp 4.0). The man
 
 The early-shutdown hook cancelled SSE, poll, and alert tasks directly inside a `signal.signal()` handler, which can run in the middle of any event-loop callback. It now only sets the shutdown flag and schedules the cancellation on the loop with `call_soon_threadsafe()`; without a running loop the flag alone stops every stream within one 500 ms tick. A failure to install the hook (non-main thread) is logged at debug level instead of being silently ignored.
 
+### New Features
+
+#### `metrics_prefix` for Prometheus metric names
+
+The `/metrics` endpoint names every metric `probe_*` (`probe_healthy`, `probe_latency_ms`, …), which collides with blackbox_exporter's `probe_*` metrics when both are scraped into one Prometheus. New `HealthRegistry(metrics_prefix="fastapi_watch_")` namespaces them. The default `""` keeps the existing names, so current dashboards and alerts are unaffected; a non-empty default may come in a future minor release.
+
+#### Other additions
+
+- `HealthRegistry(probe_timeout=...)` — registry-wide probe deadline (see Bug Fixes).
+- `RequestMetricsProbe(app)` — resolves the live middleware from the app (see Bug Fixes).
+- `EventLoopProbe(sample_interval_ms=...)` and the `current_lag_ms` detail.
+- `PassiveProbe(poll_interval_ms=..., timeout=...)`.
+- `circuit_breaker_enabled` parameter on `RequestMetricsProbe` and `FastAPIWebSocketProbe`.
+- `CeleryProbe.reply_timeout` (the per-broadcast wait, previously only available as `timeout`).
+
 ### Performance
 
 #### Per-route request metrics no longer grow without bound

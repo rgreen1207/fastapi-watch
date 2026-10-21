@@ -105,3 +105,31 @@ def test_metrics_endpoint_in_endpoint_list():
     # Endpoint must be reachable (not 404)
     resp = client.get("/health/metrics")
     assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# metrics_prefix
+# ---------------------------------------------------------------------------
+
+def test_default_metric_names_are_unchanged():
+    app = FastAPI()
+    HealthRegistry(app, poll_interval_ms=None).add(NoOpProbe(name="db"))
+    body = TestClient(app).get("/health/metrics").text
+    assert 'probe_healthy{name="db",critical="true"} 1' in body
+    assert "# TYPE probe_circuit_trips_total counter" in body
+
+
+def test_metrics_prefix_namespaces_every_metric():
+    app = FastAPI()
+    HealthRegistry(app, poll_interval_ms=None, metrics_prefix="fastapi_watch_").add(NoOpProbe(name="db"))
+    body = TestClient(app).get("/health/metrics").text
+    metric_lines = [line for line in body.splitlines() if line and not line.startswith("#")]
+    assert metric_lines and all(line.startswith("fastapi_watch_probe_") for line in metric_lines)
+    assert "# HELP fastapi_watch_probe_healthy " in body
+    assert "\nprobe_healthy" not in body
+
+
+@pytest.mark.parametrize("bad", ["1abc", "has-dash", "sp ace", "dot."])
+def test_invalid_metrics_prefix_rejected(bad):
+    with pytest.raises(ValueError, match="metrics_prefix"):
+        HealthRegistry(FastAPI(), metrics_prefix=bad)
