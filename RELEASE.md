@@ -96,6 +96,10 @@ README.md and DOCS.md showed `auth={"username": ..., "password": ...}` (missing 
 
 **Fix:** the renderer's signature is inspected once at startup: one-argument renderers are called with the report, and renderers taking a second positional argument (as 1.7.1 required) still receive the maintenance flag.
 
+#### Probes with their own interval poll from startup, not from the first dashboard visit
+
+A probe with its own `poll_interval_ms` is meant to poll in the background, and polling did continue after the last stream client left — but it only ever *started* when the first SSE client connected. Whether background polling happened at all depended on someone having opened the dashboard. It now starts at `set_started()`, or at the first health request when `set_started()` ran outside an event loop.
+
 #### Startup probes are guarded like every other probe
 
 `/health/startup` ran `startup_probes` directly, with no timeout and no exception handling: a hung startup probe hung the Kubernetes `startupProbe` request, and one that raised turned it into a `500`. Startup probes now run through the same guarded path as regular probes (bounded by `probe_timeout` or their own `timeout`), so either case answers `503` with the probe's error.

@@ -71,7 +71,7 @@ registry = HealthRegistry(app, dashboard=False) # dashboard off
 
 `/health/ready/stream` and `/health/status/stream` use SSE to push probe results to connected clients.
 
-The poll loop starts when the first SSE client connects and stops when the last disconnects. No background work runs when nobody is watching.
+Probes on the registry-wide `poll_interval_ms` are polled while at least one SSE client is connected; the loop stops when the last one disconnects. Probes with their own `poll_interval_ms` poll in the background regardless, starting at `set_started()` (or at the first health request, if `set_started()` was called outside a running event loop).
 
 Each event is a JSON-encoded health report on a `data:` line:
 

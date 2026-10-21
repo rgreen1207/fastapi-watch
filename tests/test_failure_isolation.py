@@ -181,3 +181,63 @@ async def test_hung_startup_probe_is_bounded_by_probe_timeout():
         resp = await asyncio.wait_for(client.get("/health/startup"), 2)
     assert resp.status_code == 503
     assert resp.json()["probes"][0]["error"] == "probe timed out after 0.05 s"
+
+
+# ---------------------------------------------------------------------------
+# Custom-interval probes poll in the background without a stream client
+# ---------------------------------------------------------------------------
+
+class _Counting(BaseProbe):
+    def __init__(self, name="counted", poll_interval_ms=None):
+        self.name = name
+        self.poll_interval_ms = poll_interval_ms
+        self.calls = 0
+
+    async def check(self):
+        self.calls += 1
+        return ProbeResult(name=self.name, status=ProbeStatus.HEALTHY)
+
+
+@pytest.mark.asyncio
+async def test_set_started_starts_background_polling_for_custom_intervals():
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=None)
+    probe = _Counting(poll_interval_ms=1000)
+    registry.add(probe)
+    registry.set_started()
+    try:
+        assert registry._poll_task is not None and not registry._poll_task.done()
+        await asyncio.sleep(1.2)  # no stream client, no requests
+        assert probe.calls >= 2
+    finally:
+        await registry._shutdown()
+
+
+@pytest.mark.asyncio
+async def test_first_request_starts_polling_when_set_started_had_no_loop():
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=None)
+    registry.add(_Counting(poll_interval_ms=1000))
+    await asyncio.to_thread(registry.set_started)  # sync context: no running loop there
+    assert registry._poll_task is None
+    try:
+        await registry.get_report()
+        assert registry._poll_task is not None and not registry._poll_task.done()
+    finally:
+        await registry._shutdown()
+
+
+@pytest.mark.asyncio
+async def test_no_background_polling_without_custom_intervals():
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=60_000)
+    registry.add(_Counting())
+    registry.set_started()
+    await registry.get_report()
+    assert registry._poll_task is None
+
+
+@pytest.mark.asyncio
+async def test_background_polling_not_restarted_after_shutdown():
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=None)
+    registry.add(_Counting(poll_interval_ms=1000))
+    await registry._shutdown()
+    registry.set_started()
+    assert registry._poll_task is None

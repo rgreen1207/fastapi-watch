@@ -847,6 +847,7 @@ class HealthRegistry:
         if not self._signal_handler_installed:
             self._signal_handler_installed = True
             self._install_early_shutdown_hook()
+        self._ensure_background_polling()
         return self
 
     def set_maintenance(self, until: datetime | None = None) -> "HealthRegistry":
@@ -1125,6 +1126,24 @@ class HealthRegistry:
     def _has_custom_intervals(self) -> bool:
         return any(p.poll_interval_ms is not None for p, _ in self._probes)
 
+    def _ensure_background_polling(self) -> None:
+        """Start the poll loop for probes with their own ``poll_interval_ms``.
+
+        Those probes poll in the background whether or not a stream client is
+        connected.  This runs from ``set_started()`` and from every health
+        request, so polling starts at the first of those that has a running
+        loop — previously it waited for the first SSE client, so background
+        polling depended on whether anyone had opened the dashboard.
+        """
+        if not self._has_custom_intervals() or self._shutting_down:
+            return
+        if self._poll_task is not None and not self._poll_task.done():
+            return
+        try:
+            self._poll_task = asyncio.get_running_loop().create_task(self._poll_loop())
+        except RuntimeError:
+            pass  # no running loop yet (sync set_started); the first request starts it
+
     # ------------------------------------------------------------------
     # Caching / result retrieval
     # ------------------------------------------------------------------
@@ -1135,6 +1154,7 @@ class HealthRegistry:
         Single-fetch probes always run fresh.  Polled probes run when their
         interval has elapsed or their result is absent from cache.
         """
+        self._ensure_background_polling()
         cached = await self._storage.get_all_latest()
         now = asyncio.get_running_loop().time()
         to_run = [
