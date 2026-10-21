@@ -1199,16 +1199,15 @@ class HealthRegistry:
     def set_poll_interval(self, ms: int | None) -> None:
         """Update the polling interval at runtime.
 
-        ``0`` / ``None`` switches to single-fetch mode and clears the cache.
-        Values 1–999 are clamped to 1000 ms.
+        ``0`` / ``None`` switches to single-fetch mode and clears this process's
+        cached results.  Values 1–999 are clamped to 1000 ms.
         """
         self._poll_interval_ms = self._set_interval(ms)
         if self._poll_interval_ms is None:
+            # Requests are served from these in-process results, so clearing them
+            # is enough.  Storage is left alone: storage.clear_latest() would also
+            # delete the latest results of other apps and replicas sharing it.
             self._last_results.clear()
-            try:
-                self._storage.clear_latest()
-            except Exception as exc:
-                self._log_storage_failure("clear_latest", exc)
             if not self._has_custom_intervals():
                 self._cancel_poll_task()
         elif self._active_connections > 0:

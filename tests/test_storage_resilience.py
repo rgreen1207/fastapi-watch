@@ -277,10 +277,23 @@ async def test_circuit_open_with_storage_down_and_no_local_result():
     assert probe.calls == 0
 
 
-def test_set_poll_interval_survives_a_failing_clear_latest():
+def test_set_poll_interval_survives_a_failing_storage():
     registry = HealthRegistry(FastAPI(), storage=_BrokenStorage())
     registry.set_poll_interval(0)  # must not raise
     assert registry._poll_interval_ms is None
+
+
+@pytest.mark.asyncio
+async def test_set_poll_interval_leaves_shared_storage_alone():
+    shared = InMemoryProbeStorage()
+    # Another app sharing the store has its own latest result.
+    await shared.set_latest(ProbeResult(name="billing", status=ProbeStatus.HEALTHY))
+    registry = HealthRegistry(FastAPI(), storage=shared)
+    registry.add(NoOpProbe(name="db"))
+    await registry.get_report()
+    registry.set_poll_interval(0)
+    assert registry._last_results == {}
+    assert set(await shared.get_all_latest()) == {"billing", "db"}
 
 
 # ---------------------------------------------------------------------------

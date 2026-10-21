@@ -110,8 +110,12 @@ README.md and DOCS.md showed `auth={"username": ..., "password": ...}` (missing 
 
 - The `grace_period_ms` docstring said failures are "ignored" during the grace window; it actually holds `/health/ready` at `503 {"status": "starting"}` (as `DOCS.md` already said). The docs now also state that the window starts when the registry is created.
 - The `ProbeGroup` docstring referred to a `ProbeRouter` class and imported `PostgreSQLProbe` / `RedisProbe` from the package root (they live in `fastapi_watch.probes`), constructing them with a `url=` they do not accept. The example is corrected.
-- The `RedisProbeStorage` sketch in the `ProbeStorage` docstring called `run_until_complete()` inside the running event loop (which raises) and used an undefined `self._max_results`. It now works, and a test executes it.
+- The `RedisProbeStorage` sketch in the `ProbeStorage` docstring is gone, replaced by the real `RedisProbeStorage` (see New Features). The docstring now holds a short outline for writing your own backend, and a test checks it against the protocol.
 - New tests check that every `from fastapi_watch… import …` in README.md, DOCS.md, and the docstrings resolves, alongside the existing check that every documented `auth=` example constructs.
+- **Retention precedence:** `HealthRegistry`'s `history_size`, `result_ttl_seconds`, `alert_ttl_seconds`, and `max_alerts` apply to a custom backend only when at least one is passed explicitly; otherwise the backend keeps its own constructor values.
+- **Known limit:** `KafkaProbe`, `RabbitMQProbe`, and `MemcachedProbe` connect by hostname through their client libraries, so their DNS lookups still use the event loop's default executor; pre-resolving would break TLS hostname checks. See "Blocking checks and the thread pool" in DOCS.md.
+- **Custom-probe examples** report the exception type rather than `str(exc)`, and the "Testing a custom probe" example now goes through `registry.run_all()` (it called `check()` on a probe that raises, so it could never pass).
+- The missing README "Custom storage backend" section that DOCS.md linked to now exists, and the strict-CSP claim for the dashboard is corrected (its inline script and styles need `'unsafe-inline'`).
 
 #### Custom dashboard renderers with the documented signature
 
@@ -224,9 +228,11 @@ While a probe's circuit was open the registry served its cached result stamped w
 
 New `BaseProbe.aclose()` (a no-op by default) is awaited for every registered and startup probe at shutdown. `EventLoopProbe` uses it to cancel its background sampler; `ThresholdProbe` forwards it to the probe it wraps.
 
-#### Data for removed probes is cleaned up
+#### Data for removed probes is cleaned up — without touching anyone else's
 
-Storage kept latest results and history for probes the registry no longer had. Backends that implement the new optional `forget(names)` are told, at most every 10 minutes, about probes this process wrote and has since stopped registering. Names this process never wrote are never touched, so apps and replicas can share a storage prefix safely.
+Storage kept latest results and history for probes the registry no longer had. Backends that implement the new optional `forget(names)` are told, at most every 10 minutes, about probes this process wrote and has since stopped registering (for example after `discover_routes(refresh=True)` renames one). Names this process never wrote are never touched, so two apps on the same storage prefix, or old and new pods during a rolling deploy, keep each other's data. A failed `forget()` is retried on the next pass.
+
+`set_poll_interval(0)` likewise clears only this process's cached results. It no longer calls `storage.clear_latest()`, which deleted the latest results of every app and replica sharing the backend. `clear_latest()` stays in the `ProbeStorage` protocol, so existing backends still satisfy it.
 
 ### New Features
 
@@ -315,6 +321,10 @@ A `Mount` with a path parameter (`/t/{tenant}`) produced one per-route entry per
 #### A smaller dashboard that stays small
 
 The dashboard embedded every stored result with full `details` — about 4 MB for one 150-route `RequestMetricsProbe` — on every load and every auto-reload, and an open tab kept every live update forever. The page now embeds only the fields its graphs draw and the eight busiest routes (4 MB → 212 KB; render time ~56 ms → ~2 ms), and the browser keeps at most 2,000 points per probe, none older than the longer of 2 hours and the stored history.
+
+#### A lighter stream for the dashboard
+
+`/health/status/stream` sent every probe's full `details` on every event, including every route from `RequestMetricsProbe` with all its fields, although the dashboard draws only the busiest eight. Both streams now accept `?view=dashboard`, which trims `details.routes` to the eight busiest routes and their charted fields (about 42 KB → 1.4 KB per event with 150 routes). The built-in dashboard uses it; clients that don't pass `view` get exactly the previous payload.
 
 ### Security Fixes
 

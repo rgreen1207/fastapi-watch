@@ -212,11 +212,11 @@ def test_set_poll_interval_updates_value():
 def test_set_poll_interval_to_zero_clears_cache():
     app = FastAPI()
     registry = HealthRegistry(app)
-    registry._storage._cache["x"] = ProbeResult(name="x", status=ProbeStatus.HEALTHY)
-    registry._storage._cache_times["x"] = 0.0
+    registry._last_results["x"] = ProbeResult(name="x", status=ProbeStatus.HEALTHY)
     registry.set_poll_interval(0)
     assert registry._poll_interval_ms is None
-    assert len(registry._storage._cache) == 0
+    # Requests are served from in-process results; storage may be shared, so it is left alone.
+    assert registry._last_results == {}
 
 
 def test_set_poll_interval_below_minimum_is_clamped():

@@ -45,7 +45,10 @@ class ProbeStorage(Protocol):
     Pass your implementation to ``HealthRegistry(app, storage=my_storage)``.
 
     All methods except ``clear_latest`` are async to support I/O-bound backends.
-    ``clear_latest`` is sync because it is called from a sync context.
+    ``clear_latest`` is sync so it can be called from a sync context.  The
+    registry no longer calls it — it would also clear the latest results of
+    other apps and replicas sharing the backend — but it remains part of the
+    protocol so existing backends keep satisfying it.
 
     Optional methods, called by the registry only when a backend defines them
     (backends without them keep working)::
