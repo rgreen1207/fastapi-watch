@@ -2,7 +2,6 @@ import pytest
 from fastapi import FastAPI
 from fastapi_watch import HealthRegistry, ProbeGroup
 from fastapi_watch.probes import NoOpProbe
-from fastapi_watch.models import ProbeStatus
 
 
 # ---------------------------------------------------------------------------

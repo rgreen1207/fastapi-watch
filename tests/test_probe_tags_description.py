@@ -1,5 +1,4 @@
 """Tests for probe tags, descriptions, endpoint tag-filtering, and dashboard rendering."""
-import pytest
 from datetime import datetime, timezone
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -7,7 +6,6 @@ from fastapi_watch import HealthRegistry, FastAPIRouteProbe, FastAPIWebSocketPro
 from fastapi_watch._dashboard import render_dashboard
 from fastapi_watch.models import HealthReport, ProbeResult, ProbeStatus
 from fastapi_watch.probes.noop import NoOpProbe
-from fastapi_watch.probes.base import PassiveProbe
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,5 @@
 """Tests for ?probe= name filtering on /health/status, /health/ready, and streams."""
 import json
-import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from fastapi_watch import HealthRegistry

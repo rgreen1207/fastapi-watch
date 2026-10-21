@@ -1,4 +1,3 @@
-import asyncio
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient

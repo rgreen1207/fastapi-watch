@@ -1,10 +1,8 @@
 """Tests for registry.discover_routes() and registry.watch_router()."""
-import pytest
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket
 from fastapi.routing import APIRouter
 from fastapi.testclient import TestClient
 from fastapi_watch import HealthRegistry, FastAPIRouteProbe, FastAPIWebSocketProbe
-from fastapi_watch.models import ProbeStatus
 from fastapi_watch.probes.noop import NoOpProbe
 
 

@@ -1,6 +1,6 @@
 """Tests for MemcachedProbe — mocked so no real Memcached needed."""
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 from fastapi_watch.models import ProbeStatus
 
 try:

@@ -1,5 +1,4 @@
 import json
-import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from fastapi_watch import HealthRegistry
