@@ -26,6 +26,12 @@ When a route raised an exception that no exception handler caught, `call_next` r
 
 **Fix:** a naive `until` is interpreted in the registry's `timezone`. Over HTTP, an `until` that has already passed is rejected with `422` before any state changes, instead of reporting `active: true` and silently expiring (or ending a maintenance window that was already running).
 
+#### A hung probe no longer hangs every health endpoint
+
+`BaseProbe.timeout` defaults to `None`, and several built-in probes (`RabbitMQProbe`, `MemcachedProbe`, and every custom probe that didn't set one) had no bound of their own. Every health endpoint waits on the probes it runs, so a single blackholed dependency left `/health/ready`, `/health/status`, `/health/metrics`, and the dashboard pending forever — and Kubernetes readiness checks with them.
+
+**Fix:** new `HealthRegistry(probe_timeout=30.0)` bounds every probe that does not set its own `timeout`; a per-probe `timeout` still takes precedence. `probe_timeout=None` restores unbounded checks. Timeouts now report `"probe timed out after N s"` and log a warning, instead of the generic `"probe check failed"` with a full traceback.
+
 ### Security Fixes
 
 #### Maintenance write endpoints require `auth=`
