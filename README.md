@@ -222,6 +222,38 @@ Webhook URLs are validated at construction time — private/loopback/link-local 
 
 ---
 
+## Custom storage backend
+
+Results, history, and alerts live in process memory by default. To share them across workers or keep them across restarts, use the bundled Redis backend (`pip install "fastapi-watch[redis]"`):
+
+```python
+import redis.asyncio as redis
+from fastapi_watch import HealthRegistry, RedisProbeStorage
+
+client = redis.from_url("redis://localhost:6379/0")  # decode_responses=True also works
+
+registry = HealthRegistry(
+    app,
+    storage=RedisProbeStorage(client, prefix="myapp:health", max_entry_bytes=8192),
+    history_size=120,            # entries kept per probe
+    result_ttl_seconds=7200,     # per-entry age limit (0 = no age limit)
+    max_alerts=120,
+    alert_ttl_seconds=259200,
+)
+```
+
+It is safe to point at the Redis your app already uses: it never runs `KEYS` or `SCAN`, every write is a single `MULTI/EXEC` round trip, and all keys sit under `prefix`, so give each app its own. Storage is capped by count, by age (per entry), and by bytes:
+
+```
+redis bytes ≤ probes × (history_size × max_entry_bytes + one latest result) + max_alerts × (~150 B + probe name)
+```
+
+History entries larger than `max_entry_bytes` drop their largest `details` values first and are marked `details["_truncated"] = true`; the latest result is always stored in full. With the defaults, 20 probes take at most about 19 MB of history, and typically far less.
+
+To write your own backend (PostgreSQL, Memcached, ...), implement the `ProbeStorage` protocol. See [DOCS.md — Custom storage backends](https://github.com/rgreen1207/fastapi-watch/blob/main/DOCS.md#custom-storage-backends).
+
+---
+
 ## Security
 
 Health endpoints are **publicly accessible by default** — set `auth` in production:
