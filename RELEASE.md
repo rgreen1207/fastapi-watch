@@ -122,6 +122,12 @@ The circuit breaker was on by default for passive probes (`PassiveProbe` and its
 
 Current aiohttp deprecates `aiohttp.BasicAuth` (removed in aiohttp 4.0). The management-API request now sends a standard `Authorization: Basic` header built directly, which works across every supported aiohttp version.
 
+#### WebSocket handlers receive the real `WebSocket`
+
+`FastAPIWebSocketProbe.watch()` replaced the handler's `WebSocket` argument with a proxy object, so `isinstance(websocket, WebSocket)` was false inside watched handlers (breaking code and libraries that type-check it), the proxy's connection state was separate from the socket any dependency held, and messages read through `iter_text()` / `iter_bytes()` / `iter_json()` were not counted.
+
+**Fix:** the handler now receives the very socket FastAPI created, instrumented in place to count application messages at the `receive()` / `send()` level (handshake messages excluded) — so every helper, including the `iter_*` generators, is counted exactly once.
+
 #### Passive probes accept `poll_interval_ms` and `timeout`
 
 `HttpProbe`, `RedisProbe`, and the other `PassiveProbe` subclasses documented a `poll_interval_ms` argument but raised `TypeError` when given one. `PassiveProbe` now accepts `poll_interval_ms` and `timeout`, like the other probes.

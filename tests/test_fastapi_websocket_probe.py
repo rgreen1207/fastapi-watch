@@ -14,7 +14,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.testclient import TestClient
 from fastapi_watch import HealthRegistry, FastAPIWebSocketProbe
 from fastapi_watch.models import ProbeStatus
-from fastapi_watch.probes.websocket import _WebSocketWrapper, _find_ws_param
+from fastapi_watch.probes.websocket import _find_ws_param
 
 
 # ---------------------------------------------------------------------------
@@ -72,109 +72,87 @@ def test_find_ws_param_prefers_annotation_over_name():
 
 
 # ---------------------------------------------------------------------------
-# _WebSocketWrapper — message counting
+# Message counting on the real WebSocket
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_wrapper_counts_receive_text():
-    probe = FastAPIWebSocketProbe(name="chat")
-    ws = _make_mock_ws()
-    wrapper = _WebSocketWrapper(ws, probe)
+def _echo_app(probe: FastAPIWebSocketProbe, handler) -> TestClient:
+    app = FastAPI()
+    app.websocket("/ws")(probe.watch(handler))
+    return TestClient(app)
 
-    await wrapper.receive_text()
-    await wrapper.receive_text()
+
+def test_counts_messages_in_both_directions_but_not_the_handshake():
+    probe = FastAPIWebSocketProbe(name="chat")
+
+    async def handler(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.send_text(await websocket.receive_text())
+        await websocket.send_bytes(await websocket.receive_bytes())
+        await websocket.send_json(await websocket.receive_json())
+        await websocket.close()
+
+    with _echo_app(probe, handler).websocket_connect("/ws") as ws:
+        ws.send_text("hi")
+        assert ws.receive_text() == "hi"
+        ws.send_bytes(b"b")
+        assert ws.receive_bytes() == b"b"
+        ws.send_json({"k": 1})
+        assert ws.receive_json() == {"k": 1}
+
+    assert (probe._messages_received, probe._messages_sent) == (3, 3)
+
+
+def test_counts_messages_read_through_iter_text():
+    probe = FastAPIWebSocketProbe(name="chat")
+
+    async def handler(websocket: WebSocket):
+        await websocket.accept()
+        async for _ in websocket.iter_text():
+            pass
+
+    with _echo_app(probe, handler).websocket_connect("/ws") as ws:
+        ws.send_text("a")
+        ws.send_text("b")
     assert probe._messages_received == 2
 
 
-@pytest.mark.asyncio
-async def test_wrapper_counts_receive_bytes():
+def test_handler_receives_a_real_websocket_shared_with_dependencies():
+    from fastapi import Depends
+
     probe = FastAPIWebSocketProbe(name="chat")
-    ws = _make_mock_ws()
-    wrapper = _WebSocketWrapper(ws, probe)
+    seen = {}
 
-    await wrapper.receive_bytes()
-    assert probe._messages_received == 1
+    def dep(websocket: WebSocket):
+        seen["dep"] = websocket
+        return websocket
 
+    async def handler(websocket: WebSocket, other=Depends(dep)):  # FastAPI 0.100 rejects Depends on a WebSocket annotation
+        seen["handler"] = websocket
+        seen["is_websocket"] = isinstance(websocket, WebSocket)
+        await websocket.accept()
+        await websocket.send_text("x")
+        await websocket.close()
 
-@pytest.mark.asyncio
-async def test_wrapper_counts_receive_json():
-    probe = FastAPIWebSocketProbe(name="chat")
-    ws = _make_mock_ws()
-    wrapper = _WebSocketWrapper(ws, probe)
-
-    await wrapper.receive_json()
-    assert probe._messages_received == 1
-
-
-@pytest.mark.asyncio
-async def test_wrapper_counts_receive():
-    probe = FastAPIWebSocketProbe(name="chat")
-    ws = _make_mock_ws()
-    wrapper = _WebSocketWrapper(ws, probe)
-
-    await wrapper.receive()
-    assert probe._messages_received == 1
-
-
-@pytest.mark.asyncio
-async def test_wrapper_counts_send_text():
-    probe = FastAPIWebSocketProbe(name="chat")
-    ws = _make_mock_ws()
-    wrapper = _WebSocketWrapper(ws, probe)
-
-    await wrapper.send_text("hello")
-    await wrapper.send_text("world")
-    assert probe._messages_sent == 2
-
-
-@pytest.mark.asyncio
-async def test_wrapper_counts_send_bytes():
-    probe = FastAPIWebSocketProbe(name="chat")
-    ws = _make_mock_ws()
-    wrapper = _WebSocketWrapper(ws, probe)
-
-    await wrapper.send_bytes(b"data")
+    with _echo_app(probe, handler).websocket_connect("/ws") as ws:
+        ws.receive_text()
+    assert seen["is_websocket"] is True
+    assert seen["handler"] is seen["dep"]
     assert probe._messages_sent == 1
 
 
 @pytest.mark.asyncio
-async def test_wrapper_counts_send_json():
+async def test_non_websocket_object_records_connection_without_messages():
     probe = FastAPIWebSocketProbe(name="chat")
     ws = _make_mock_ws()
-    wrapper = _WebSocketWrapper(ws, probe)
 
-    await wrapper.send_json({"key": "value"})
-    assert probe._messages_sent == 1
+    @probe.watch
+    async def handler(websocket: WebSocket):
+        await websocket.send_text("x")
 
-
-@pytest.mark.asyncio
-async def test_wrapper_counts_send():
-    probe = FastAPIWebSocketProbe(name="chat")
-    ws = _make_mock_ws()
-    wrapper = _WebSocketWrapper(ws, probe)
-
-    await wrapper.send({"type": "websocket.send", "text": "hello"})
-    assert probe._messages_sent == 1
-
-
-@pytest.mark.asyncio
-async def test_wrapper_forwards_receive_return_value():
-    probe = FastAPIWebSocketProbe(name="chat")
-    ws = _make_mock_ws()
-    wrapper = _WebSocketWrapper(ws, probe)
-
-    result = await wrapper.receive_text()
-    assert result == "hi"
-
-
-@pytest.mark.asyncio
-async def test_wrapper_forwards_unknown_attributes():
-    probe = FastAPIWebSocketProbe(name="chat")
-    ws = _make_mock_ws()
-    ws.url = "ws://localhost/chat"
-    wrapper = _WebSocketWrapper(ws, probe)
-
-    assert wrapper.url == "ws://localhost/chat"
+    await handler(websocket=ws)
+    assert probe._total_connections == 1
+    assert probe._messages_sent == 0
+    ws.send_text.assert_awaited_once_with("x")
 
 
 # ---------------------------------------------------------------------------
@@ -508,51 +486,25 @@ async def test_min_active_connections_zero_disabled():
 # Message counting via WebSocket proxy
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_messages_received_via_watch():
+def test_messages_reported_in_details_and_accumulate_across_connections():
     probe = FastAPIWebSocketProbe(name="chat")
-    ws = _make_mock_ws()
 
-    @probe.watch
     async def handler(websocket: WebSocket):
-        await websocket.receive_text()
-        await websocket.receive_text()
-
-    await handler(websocket=ws)
-    result = await probe.check()
-    assert result.details["messages_received"] == 2
-
-
-@pytest.mark.asyncio
-async def test_messages_sent_via_watch():
-    probe = FastAPIWebSocketProbe(name="chat")
-    ws = _make_mock_ws()
-
-    @probe.watch
-    async def handler(websocket: WebSocket):
-        await websocket.send_text("hello")
-        await websocket.send_text("world")
-
-    await handler(websocket=ws)
-    result = await probe.check()
-    assert result.details["messages_sent"] == 2
-
-
-@pytest.mark.asyncio
-async def test_messages_accumulate_across_connections():
-    probe = FastAPIWebSocketProbe(name="chat")
-    ws = _make_mock_ws()
-
-    @probe.watch
-    async def handler(websocket: WebSocket):
+        await websocket.accept()
         await websocket.receive_text()
         await websocket.send_text("reply")
+        await websocket.close()
 
-    await handler(websocket=ws)
-    await handler(websocket=ws)
-    result = await probe.check()
-    assert result.details["messages_received"] == 2
-    assert result.details["messages_sent"] == 2
+    client = _echo_app(probe, handler)
+    for _ in range(2):
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text("hi")
+            ws.receive_text()
+
+    details = asyncio.run(probe.check()).details
+    assert details["messages_received"] == 2
+    assert details["messages_sent"] == 2
+    assert details["total_connections"] == 2
 
 
 # ---------------------------------------------------------------------------

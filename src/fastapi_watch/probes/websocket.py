@@ -26,68 +26,57 @@ def _find_ws_param(func: Callable) -> str | None:
     return None
 
 
-class _WebSocketWrapper:
-    """Transparent proxy around a FastAPI WebSocket that counts messages.
+_COUNTING_CLASSES: dict[type, type] = {}
 
-    All attributes and methods not explicitly defined here are forwarded to
-    the underlying WebSocket via ``__getattr__``, so the handler sees a
-    fully-functional WebSocket object.
 
-    The ``iter_text()``, ``iter_bytes()``, and ``iter_json()`` async
-    generators are not intercepted; use the discrete ``receive_*`` methods
-    if per-message counting matters.
+def _counting_class(base: type) -> type:
+    """Return (and cache) a subclass of *base* that counts application messages.
+
+    Every Starlette ``receive_*`` / ``send_*`` / ``iter_*`` helper goes through
+    ``receive()`` and ``send()``, so counting there — by message type, so the
+    connect/accept/close handshake is not counted — covers them all exactly once.
+    It must be a direct subclass with no extra bases: a mixin base changes the
+    object layout, and ``__class__`` assignment refuses that.
     """
-
-    def __init__(self, ws: Any, probe: "FastAPIWebSocketProbe") -> None:
-        self._ws = ws
-        self._probe = probe
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._ws, name)
-
-    # ------------------------------------------------------------------
-    # Receive — increment messages_received on each call
-    # ------------------------------------------------------------------
+    counting = _COUNTING_CLASSES.get(base)
+    if counting is not None:
+        return counting
 
     async def receive(self) -> dict:
-        data = await self._ws.receive()
-        self._probe._messages_received += 1
-        return data
+        message = await super(counting, self).receive()
+        if message.get("type") == "websocket.receive":
+            self._fastapi_watch_probe._messages_received += 1
+        return message
 
-    async def receive_text(self) -> str:
-        data = await self._ws.receive_text()
-        self._probe._messages_received += 1
-        return data
+    async def send(self, message: dict) -> None:
+        await super(counting, self).send(message)
+        if message.get("type") == "websocket.send":
+            self._fastapi_watch_probe._messages_sent += 1
 
-    async def receive_bytes(self) -> bytes:
-        data = await self._ws.receive_bytes()
-        self._probe._messages_received += 1
-        return data
+    counting = type(f"Counting{base.__name__}", (base,), {"receive": receive, "send": send, "_fastapi_watch_counting": True})
+    _COUNTING_CLASSES[base] = counting
+    return counting
 
-    async def receive_json(self, mode: str = "text") -> Any:
-        data = await self._ws.receive_json(mode=mode)
-        self._probe._messages_received += 1
-        return data
 
-    # ------------------------------------------------------------------
-    # Send — increment messages_sent on each call
-    # ------------------------------------------------------------------
+def _attach_counter(ws: Any, probe: "FastAPIWebSocketProbe") -> None:
+    """Make *ws* count its messages for *probe*, keeping it the same object.
 
-    async def send(self, data: dict) -> None:
-        await self._ws.send(data)
-        self._probe._messages_sent += 1
-
-    async def send_text(self, data: str) -> None:
-        await self._ws.send_text(data)
-        self._probe._messages_sent += 1
-
-    async def send_bytes(self, data: bytes) -> None:
-        await self._ws.send_bytes(data)
-        self._probe._messages_sent += 1
-
-    async def send_json(self, data: Any, mode: str = "text") -> None:
-        await self._ws.send_json(data, mode=mode)
-        self._probe._messages_sent += 1
+    The instance's class is swapped for a cached counting subclass of its own
+    class, rather than wrapping it in a proxy: the handler keeps the very
+    socket FastAPI created (``isinstance(ws, WebSocket)`` holds, and state is
+    shared with anything else holding it, such as dependencies).  Objects that
+    are not real Starlette WebSockets are left alone — connection stats are
+    still recorded, message counts are not.
+    """
+    try:
+        from starlette.websockets import WebSocket
+    except ImportError:
+        return
+    cls = type(ws)
+    if not issubclass(cls, WebSocket) or getattr(cls, "_fastapi_watch_counting", False):
+        return
+    ws.__class__ = _counting_class(cls)
+    ws._fastapi_watch_probe = probe
 
 
 class FastAPIWebSocketProbe(BaseProbe):
@@ -97,10 +86,10 @@ class FastAPIWebSocketProbe(BaseProbe):
     :class:`~fastapi_watch.models.ProbeResult`.  The probe is passive — it observes
     actual connections rather than making synthetic ones.
 
-    The decorated handler receives a transparent proxy around the real WebSocket
-    object.  The proxy counts every ``receive_*`` and ``send_*`` call; all other
-    WebSocket behaviour (``accept``, ``close``, headers, state, etc.) is forwarded
-    to the underlying socket unchanged.
+    The decorated handler receives the real WebSocket object (``isinstance``
+    checks hold), instrumented to count every application message it sends or
+    receives — including through ``iter_text()`` / ``iter_json()``.  Handshake
+    messages (connect, accept, close) are not counted.
 
     Stats collected:
 
@@ -231,9 +220,9 @@ class FastAPIWebSocketProbe(BaseProbe):
     def watch(self, func: Callable) -> Callable:
         """Decorator that monitors a WebSocket handler.
 
-        Injects a transparent :class:`_WebSocketWrapper` in place of the real
-        ``WebSocket`` object so that message counts are collected without any
-        changes to the handler body.
+        Instruments the ``WebSocket`` argument in place (see
+        :func:`_attach_counter`) so message counts are collected without any
+        change to the handler body or to the object the handler receives.
 
         ``WebSocketDisconnect`` is treated as a normal close and is always
         re-raised.  Any other exception increments ``error_count`` and is
@@ -245,23 +234,15 @@ class FastAPIWebSocketProbe(BaseProbe):
 
         @functools.wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:  # type: ignore[return]
-            # Locate and wrap the WebSocket argument.
             ws_instance = kwargs.get(ws_param) if ws_param else None
             if ws_instance is None:
                 try:
                     from fastapi import WebSocket
-                    ws_instance = next(
-                        (a for a in args if isinstance(a, WebSocket)), None
-                    )
+                    ws_instance = next((a for a in args if isinstance(a, WebSocket)), None)
                 except ImportError:
                     pass
-
             if ws_instance is not None:
-                wrapped_ws = _WebSocketWrapper(ws_instance, self)
-                if ws_param and ws_param in kwargs:
-                    kwargs = {**kwargs, ws_param: wrapped_ws}
-                else:
-                    args = tuple(wrapped_ws if a is ws_instance else a for a in args)
+                _attach_counter(ws_instance, self)
 
             start = time.perf_counter()
             self._active_connections += 1
