@@ -26,7 +26,7 @@ class FastAPIRouteProbe(BaseProbe):
     * ``last_status_code`` — HTTP status of the most recent request
     * ``request_count`` — total requests observed
     * ``error_count`` — requests at or above ``min_error_status``
-    * ``error_rate`` — ``error_count / request_count``
+    * ``error_rate`` — fraction of the last ``window_size`` requests that were errors
     * ``consecutive_errors`` — unbroken run of failures (resets on any success)
     * ``requests_per_minute`` — throughput computed from the request timestamp window
     * ``slow_calls`` — requests exceeding ``slow_call_threshold_ms`` in the last ``window_size`` requests (when threshold is set)
@@ -217,9 +217,14 @@ class FastAPIRouteProbe(BaseProbe):
 
     @property
     def _error_rate(self) -> float:
-        if self._request_count == 0:
-            return 0.0
-        return self._error_count / self._request_count
+        """Failure fraction over the last ``window_size`` requests.
+
+        Lifetime counts would let a long healthy history mask a fresh outage
+        (and an old burst of errors linger forever), so health is judged on
+        recent requests only.  ``error_count`` still reports the lifetime total.
+        """
+        window = self._outcome_window
+        return self._outcome_failure_count / len(window) if window else 0.0
 
     @property
     def _requests_per_minute(self) -> float | None:

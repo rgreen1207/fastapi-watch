@@ -950,8 +950,8 @@ Works with both `async def` and `def`. Preserves function signature — FastAPI 
 | Metric | Description |
 |--------|-------------|
 | `request_count` | Total requests observed |
-| `error_count` | Requests at or above `min_error_status` |
-| `error_rate` | `error_count / request_count` |
+| `error_count` | Requests at or above `min_error_status` (lifetime total) |
+| `error_rate` | Fraction of the last `window_size` requests that were errors — health is judged on this rolling window, not the lifetime count |
 | `consecutive_errors` | Unbroken run of failures |
 | `last_status_code` | HTTP status of the most recent request |
 | `last_rtt_ms` | RTT for the most recent request |

@@ -32,6 +32,8 @@ class _RouteStats:
         "_avg_rtt_ms",
         "_rtt_window",
         "_request_timestamps",
+        "_error_window",
+        "_window_error_count",
         "_ema_alpha",
         "_min_error_status",
     )
@@ -44,6 +46,9 @@ class _RouteStats:
         self._avg_rtt_ms: float | None = None
         self._rtt_window: deque[float] = deque(maxlen=window_size)
         self._request_timestamps: deque[float] = deque(maxlen=window_size)
+        # True = error; drives error_rate so health reflects recent traffic only.
+        self._error_window: deque[bool] = deque(maxlen=window_size)
+        self._window_error_count: int = 0
         self._ema_alpha = ema_alpha
         self._min_error_status = min_error_status
 
@@ -52,6 +57,10 @@ class _RouteStats:
             self._request_count += 1
             self._request_timestamps.append(time.monotonic())
             is_error = status_code >= self._min_error_status
+            if len(self._error_window) == self._error_window.maxlen and self._error_window[0]:
+                self._window_error_count -= 1
+            self._error_window.append(is_error)
+            self._window_error_count += is_error
             if is_error:
                 self._error_count += 1
                 self._consecutive_errors += 1
@@ -64,7 +73,8 @@ class _RouteStats:
         with self._lock:
             request_count = self._request_count
             error_count = self._error_count
-            error_rate = error_count / request_count if request_count > 0 else 0.0
+            window_len = len(self._error_window)
+            error_rate = self._window_error_count / window_len if window_len else 0.0
             avg_rtt_ms = round(self._avg_rtt_ms or 0.0, 2)
             consecutive_errors = self._consecutive_errors
             rtt_copy = list(self._rtt_window)
@@ -105,8 +115,8 @@ class RequestMetricsMiddleware(BaseHTTPMiddleware):
             route path template (e.g. ``/users/{id}``), available in the probe's
             ``details["routes"]``.  When ``False``, only aggregate stats are
             tracked.
-        window_size: Number of recent requests used for p95 and
-            requests-per-minute calculations (default ``200``).
+        window_size: Number of recent requests used for the error rate,
+            percentiles, and requests-per-minute (default ``200``).
         ema_alpha: Smoothing factor for the exponential moving average RTT
             (default ``0.1``; higher = reacts faster to changes).
         min_error_status: HTTP status codes at or above this value are counted

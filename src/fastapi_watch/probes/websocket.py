@@ -110,7 +110,7 @@ class FastAPIWebSocketProbe(BaseProbe):
     * ``messages_sent`` — total messages sent across all connections
     * ``error_count`` — connections that closed due to an unhandled exception
       (``WebSocketDisconnect`` is **not** counted as an error)
-    * ``error_rate`` — ``error_count / total_connections``
+    * ``error_rate`` — fraction of the last ``window_size`` closed connections that errored
     * ``consecutive_errors`` — unbroken run of error closes; resets on any clean close
     * ``avg_duration_ms`` — exponential moving average of connection lifetimes
     * ``min_duration_ms`` / ``max_duration_ms`` — all-time bounds
@@ -141,7 +141,7 @@ class FastAPIWebSocketProbe(BaseProbe):
         max_error_rate: Error-rate threshold above which the probe is UNHEALTHY (0–1).
         min_active_connections: Minimum number of open sockets required for the probe
             to be HEALTHY.  ``0`` (default) disables this check.
-        window_size: Number of recent connection durations kept for EMA calculations.
+        window_size: Number of recently closed connections used for the error rate.
         ema_alpha: Smoothing factor for the exponential moving average (0–1).
             Higher values make ``avg_duration_ms`` react faster to changes.
         timeout: Passed to the registry; not used internally.
@@ -178,7 +178,9 @@ class FastAPIWebSocketProbe(BaseProbe):
         self._avg_duration_ms: float | None = None
         self._min_duration_ms: float | None = None
         self._max_duration_ms: float | None = None
-        self._duration_window: deque[float] = deque(maxlen=window_size)
+        # True = errored close; drives error_rate so health reflects recent connections only.
+        self._outcome_window: deque[bool] = deque(maxlen=window_size)
+        self._window_error_count: int = 0
 
     # ------------------------------------------------------------------
     # Internal recording
@@ -196,7 +198,10 @@ class FastAPIWebSocketProbe(BaseProbe):
         self._min_duration_ms = duration_ms if self._min_duration_ms is None else min(self._min_duration_ms, duration_ms)
         self._max_duration_ms = duration_ms if self._max_duration_ms is None else max(self._max_duration_ms, duration_ms)
 
-        self._duration_window.append(duration_ms)
+        if len(self._outcome_window) == self._outcome_window.maxlen and self._outcome_window[0]:
+            self._window_error_count -= 1
+        self._outcome_window.append(errored)
+        self._window_error_count += errored
 
     # ------------------------------------------------------------------
     # Computed properties
@@ -204,9 +209,14 @@ class FastAPIWebSocketProbe(BaseProbe):
 
     @property
     def _error_rate(self) -> float:
-        if self._total_connections == 0:
-            return 0.0
-        return self._error_count / self._total_connections
+        """Errored fraction of the last ``window_size`` closed connections.
+
+        Open connections are excluded: they have not had the chance to error
+        yet, so counting them would understate the rate.  ``error_count``
+        still reports the lifetime total.
+        """
+        window = self._outcome_window
+        return self._window_error_count / len(window) if window else 0.0
 
     # ------------------------------------------------------------------
     # Decorator

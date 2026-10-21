@@ -132,7 +132,7 @@ class PassiveProbe(BaseProbe):
 
     * ``call_count`` — total calls observed
     * ``error_count`` — calls that raised an exception
-    * ``error_rate`` — ``error_count / call_count``
+    * ``error_rate`` — fraction of the last ``window_size`` calls that raised
     * ``consecutive_errors`` — unbroken run of failures; resets on any success
     * ``last_rtt_ms`` — execution time of the most recent call
     * ``avg_rtt_ms`` — exponential moving average RTT
@@ -271,7 +271,14 @@ class PassiveProbe(BaseProbe):
 
     @property
     def _error_rate(self) -> float:
-        return 0.0 if self._call_count == 0 else self._error_count / self._call_count
+        """Failure fraction over the last ``window_size`` calls.
+
+        Lifetime counts would let a long healthy history mask a fresh outage
+        (and an old burst of errors linger forever), so health is judged on
+        recent calls only.  ``error_count`` still reports the lifetime total.
+        """
+        window = self._outcome_window
+        return self._outcome_failure_count / len(window) if window else 0.0
 
     def watch(self, func: Callable) -> Callable:
         """Decorator that silently monitors a function call.

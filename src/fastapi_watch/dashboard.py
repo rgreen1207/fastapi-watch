@@ -28,7 +28,7 @@ _FIELD_GLOSSARY: list[tuple[str, str]] = [
     ("request_count",        "Total requests observed by this probe since startup."),
     ("call_count",           "Total calls monitored by this probe since startup (passive probes)."),
     ("error_count",          "Requests or calls that returned a status code at or above the error threshold (default: 500). Click to reveal the last recorded error."),
-    ("error_rate",           "Fraction of requests counted as errors (error_count ÷ request_count)."),
+    ("error_rate",           "Fraction of recent requests or calls (the last window_size) counted as errors."),
     ("consecutive_errors",   "Unbroken run of error responses since the last success; resets to 0 on any success."),
     ("last_status_code",     "HTTP status code returned by the most recent request."),
     ("requests_per_minute",  "Estimated throughput computed from recent request timestamps."),

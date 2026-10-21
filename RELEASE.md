@@ -1,5 +1,27 @@
 # Release Notes
 
+## v1.7.2
+
+**Correctness and hardening release.**
+
+### Bug Fixes
+
+#### `error_rate` now reflects recent traffic, not the process lifetime
+
+`PassiveProbe` (and every probe built on it: `HttpProbe`, `RedisProbe`, `SqlAlchemyProbe`, `PostgreSQLProbe`, `MySQLProbe`, `MongoProbe`, `SMTPProbe`), `FastAPIRouteProbe`, `FastAPIWebSocketProbe`, and `RequestMetricsMiddleware` / `RequestMetricsProbe` computed `error_rate` as `error_count / total_count` over the whole life of the process. A service with a long healthy history could fail every request for hours without crossing `max_error_rate` (1,000 successes followed by 100 straight failures still reported 9% and `healthy`), and an early burst of errors kept a probe unhealthy long after it recovered.
+
+**Fix:** `error_rate` — and therefore the `max_error_rate` health check — is now computed over the last `window_size` outcomes (default 100; 200 for `RequestMetricsMiddleware`). For `FastAPIWebSocketProbe` the window covers closed connections only, since open ones have not had a chance to error. `error_count`, `request_count`, `call_count`, and `total_connections` still report lifetime totals.
+
+**Behavior change:** probes now go unhealthy promptly during an outage and recover once the window clears. If you tuned `max_error_rate` around the old lifetime figure, revisit it.
+
+### Infrastructure
+
+- **CI on pull requests.** A new `ci.yml` workflow runs the suite across Python 3.10–3.15 against FastAPI 0.100 (the oldest supported release) and the latest FastAPI. Previously tests only ran on Python 3.11 at publish time. Optional extras install individually so a driver without wheels for a new Python (currently `aiokafka` on 3.15) skips its own tests rather than blocking the run.
+- **Python 3.15** added to the supported classifiers.
+- `fastapi_watch.__version__` reported `1.7.0` in the 1.7.1 release; it now matches the package version.
+
+---
+
 ## v1.7.1
 
 **FastAPI 0.137.0 compatibility fix.**
