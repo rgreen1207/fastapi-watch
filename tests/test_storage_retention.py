@@ -31,6 +31,8 @@ class _Configurable(InMemoryProbeStorage):
 class _Plain(InMemoryProbeStorage):
     """A backend without configure()."""
 
+    configure = None  # InMemoryProbeStorage implements it; hide it
+
 
 def test_explicit_retention_is_passed_to_configure_with_all_four_values():
     storage = _Configurable()

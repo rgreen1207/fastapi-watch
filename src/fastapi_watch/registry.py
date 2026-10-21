@@ -705,14 +705,17 @@ class HealthRegistry:
         self._alert_pending: dict[str, float] = {}
 
         # Cross-replica dedupe through the storage's optional claim_alert().
+        # InMemoryProbeStorage implements it, but its claims are process-local,
+        # so it cannot stop other replicas from sending the same alert.
         self._alert_dedupe_window_s: float | None = alert_dedupe_window_s
+        process_local = getattr(type(self._storage), "claim_alert", None) is InMemoryProbeStorage.claim_alert
         if alert_dedupe_window_s is not None and (
-            storage is None or not callable(getattr(self._storage, "claim_alert", None))
+            process_local or not callable(getattr(self._storage, "claim_alert", None))
         ):
             (self._logger or _LIB_LOGGER).warning(
                 "fastapi-watch: alert_dedupe_window_s needs a shared storage backend that implements "
                 "claim_alert(); %s does not, so every replica sends its own alerts.",
-                "the default in-process storage" if storage is None else type(self._storage).__name__,
+                "in-process storage" if process_local else type(self._storage).__name__,
             )
             self._alert_dedupe_window_s = None
 
