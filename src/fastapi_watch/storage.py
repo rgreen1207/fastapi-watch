@@ -19,9 +19,10 @@ TTL to ``0`` disables time-based expiry for that collection.
 :class:`ProbeStorage` is the protocol every backend must satisfy.
 :class:`InMemoryProbeStorage` is the default in-process implementation.
 
-Pass a custom backend to ``HealthRegistry(app, storage=my_storage)`` to
-persist results and alerts in an external system (e.g. Redis, PostgreSQL)
-so they survive process restarts or are shared across multiple instances.
+Pass a backend to ``HealthRegistry(app, storage=my_storage)`` to persist
+results and alerts outside the process so they survive restarts or are shared
+across instances.  :class:`~fastapi_watch.RedisProbeStorage` (in
+``redis_storage.py``) is the bundled Redis backend.
 """
 import time
 from collections import deque
@@ -40,78 +41,36 @@ class ProbeStorage(Protocol):
     All methods except ``clear_latest`` are async to support I/O-bound backends.
     ``clear_latest`` is sync because it is called from a sync context.
 
-    Example Redis implementation sketch::
+    Optional methods, called by the registry only when a backend defines them
+    (backends without them keep working)::
 
-        class RedisProbeStorage:
-            def __init__(self, redis, max_results=120, result_ttl_seconds=7200, alert_ttl_seconds=259200):
-                self._redis = redis  # a redis.asyncio client created with decode_responses=True
-                self._max_results = max_results
-                self._result_ttl = int(result_ttl_seconds)
-                self._alert_ttl = int(alert_ttl_seconds)
-                self._pending = set()  # strong refs so scheduled tasks are not garbage-collected
+        # Apply the registry's history_size / TTL / max_alerts settings.
+        def configure(self, *, max_results: int, result_ttl_seconds: float,
+                      alert_ttl_seconds: float, max_alerts: int) -> None: ...
 
-            async def get_latest(self, name):
-                raw = await self._redis.get(f"fw:latest:{name}")
-                return ProbeResult.model_validate_json(raw) if raw else None
+        # Delete the latest result and history of every probe not in keep.
+        async def prune(self, keep: set[str]) -> None: ...
 
-            async def get_all_latest(self):
-                keys = await self._redis.keys("fw:latest:*")
-                if not keys:
-                    return {}
-                values = await self._redis.mget(*keys)
-                return {
-                    k.split(":", 2)[2]: ProbeResult.model_validate_json(v)
-                    for k, v in zip(keys, values) if v
-                }
+        # Return True if this caller is the first to claim key within
+        # ttl_seconds (and record the claim), False if another caller holds it.
+        # Lets only one replica send each alert.  ttl_seconds <= 0: always True.
+        async def claim_alert(self, key: str, ttl_seconds: float) -> bool: ...
 
-            async def set_latest(self, result):
-                await self._redis.setex(
-                    f"fw:latest:{result.name}", self._result_ttl,
-                    result.model_dump_json()
-                )
+    For Redis use the bundled :class:`~fastapi_watch.RedisProbeStorage`.  A
+    custom backend outline::
 
-            def clear_latest(self):
-                # Called from sync code while the event loop is running, so the
-                # deletion is scheduled on it rather than run to completion here
-                # (run_until_complete would raise "event loop is already running").
-                import asyncio
+        class MyStorage:
+            async def get_latest(self, name): ...       # ProbeResult | None
+            async def get_all_latest(self): ...         # {name: ProbeResult}
+            async def set_latest(self, result): ...
+            def clear_latest(self): ...                 # sync: schedule I/O on the running loop
+            async def append_history(self, result): ... # cap by count AND by age, per entry
+            async def get_history(self): ...            # {name: [ProbeResult, ...]}, oldest first
+            async def append_alert(self, alert): ...    # cap by count AND by age
+            async def get_alerts(self): ...             # [AlertRecord, ...], oldest first
 
-                async def _clear():
-                    keys = await self._redis.keys("fw:latest:*")
-                    if keys:
-                        await self._redis.delete(*keys)
-
-                try:
-                    loop = asyncio.get_running_loop()
-                except RuntimeError:  # called outside the loop, e.g. at import time
-                    asyncio.run(_clear())
-                    return
-                task = loop.create_task(_clear())
-                self._pending.add(task)
-                task.add_done_callback(self._pending.discard)
-
-            async def append_history(self, result):
-                key = f"fw:history:{result.name}"
-                await self._redis.rpush(key, result.model_dump_json())
-                await self._redis.ltrim(key, -self._max_results, -1)
-                await self._redis.expire(key, self._result_ttl)
-
-            async def get_history(self):
-                keys = await self._redis.keys("fw:history:*")
-                out = {}
-                for key in keys:
-                    name = key.split(":", 2)[2]
-                    raw_list = await self._redis.lrange(key, 0, -1)
-                    out[name] = [ProbeResult.model_validate_json(r) for r in raw_list]
-                return out
-
-            async def append_alert(self, alert):
-                await self._redis.rpush("fw:alerts", alert.model_dump_json())
-                await self._redis.expire("fw:alerts", self._alert_ttl)
-
-            async def get_alerts(self):
-                raw_list = await self._redis.lrange("fw:alerts", 0, -1)
-                return [AlertRecord.model_validate_json(r) for r in raw_list]
+    Keep every collection bounded by the configured count and TTL: health
+    monitoring must never grow the store without limit.
     """
 
     async def get_latest(self, name: str) -> "ProbeResult | None": ...
@@ -142,9 +101,9 @@ class InMemoryProbeStorage:
 
     Set either TTL to ``0`` to disable time-based expiry for that collection.
 
-    For multi-process deployments or persistence across restarts, replace this
-    with a custom backend that implements :class:`ProbeStorage` and pass it to
-    ``HealthRegistry(app, storage=my_storage)``.
+    For multi-process deployments or persistence across restarts, pass
+    :class:`~fastapi_watch.RedisProbeStorage` or another :class:`ProbeStorage`
+    implementation as ``HealthRegistry(app, storage=my_storage)``.
     """
 
     def __init__(
@@ -169,6 +128,49 @@ class InMemoryProbeStorage:
 
         # Alert log (capped at max_alerts; oldest dropped when full, TTL applied on read)
         self._alerts: deque[tuple[float, AlertRecord]] = deque(maxlen=self._max_alerts)
+
+        # Alert claims (claim_alert): key -> monotonic expiry
+        self._claims: dict[str, float] = {}
+
+    def configure(
+        self,
+        *,
+        max_results: int,
+        result_ttl_seconds: float,
+        alert_ttl_seconds: float,
+        max_alerts: int,
+    ) -> None:
+        """Apply new retention settings, keeping the newest entries that still fit."""
+        self._max_results = max(1, max_results)
+        self._result_ttl = result_ttl_seconds
+        self._alert_ttl = alert_ttl_seconds
+        self._max_alerts = max(1, max_alerts)
+        for name in self._history:
+            self._history[name] = deque(self._history[name], maxlen=self._max_results)
+            self._history_times[name] = deque(self._history_times[name], maxlen=self._max_results)
+        self._alerts = deque(self._alerts, maxlen=self._max_alerts)
+
+    async def prune(self, keep: set[str]) -> None:
+        """Drop the latest result and history of every probe not named in *keep*."""
+        for name in [n for n in self._cache if n not in keep]:
+            self._cache.pop(name, None)
+            self._cache_times.pop(name, None)
+        for name in [n for n in self._history if n not in keep]:
+            self._history.pop(name, None)
+            self._history_times.pop(name, None)
+
+    async def claim_alert(self, key: str, ttl_seconds: float) -> bool:
+        """Return True if *key* is unclaimed (or its claim expired) and claim it
+        for *ttl_seconds*.  Process-local; expired claims are purged on each call."""
+        now = time.monotonic()
+        for stale in [k for k, expires in self._claims.items() if expires <= now]:
+            del self._claims[stale]
+        if ttl_seconds <= 0:
+            return True
+        if key in self._claims:
+            return False
+        self._claims[key] = now + ttl_seconds
+        return True
 
     def _result_expired(self, recorded_at: float) -> bool:
         return self._result_ttl > 0 and (time.monotonic() - recorded_at) > self._result_ttl

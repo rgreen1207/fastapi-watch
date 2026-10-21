@@ -1,11 +1,16 @@
 name: CI
 
 on:
+  push:
+    branches: ["**"]
+    tags: ["**"]
   pull_request:
 
-# A new push to the PR supersedes the run in progress rather than queueing behind it.
+# A new push to the same PR or ref supersedes the run in progress rather than
+# queueing behind it.  Pushes have no PR number, so they group by ref; without
+# that every push would share one group and cancel unrelated runs.
 concurrency:
-  group: ci-${{ github.event.pull_request.number }}
+  group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions: {}
@@ -46,6 +51,20 @@ jobs:
           - python-version: "3.16"
             fastapi: "latest"
             experimental: true
+
+    # Real Redis for the RedisProbeStorage tests (they skip without it).
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      FASTAPI_WATCH_REDIS_URL: redis://localhost:6379/0
 
     steps:
       - uses: actions/checkout@v4

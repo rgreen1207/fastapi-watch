@@ -20,6 +20,7 @@ This file contains the complete reference for fastapi-watch. For the condensed o
 - [State-change callbacks](#state-change-callbacks)
 - [Probe result history](#probe-result-history)
 - [Alert history](#alert-history)
+- [Custom storage backends](#custom-storage-backends)
 - [Response format](#response-format)
 - [Writing a custom probe](#writing-a-custom-probe)
 - [Route auto-discovery](#route-auto-discovery)
@@ -61,7 +62,7 @@ registry = HealthRegistry(app, dashboard=False) # dashboard off
 
 **Header** — a plain-language status sentence (`orders-db unhealthy for 8 min`, `All 6 probes healthy`), a probe count summary, and the last check time. A maintenance banner appears when maintenance mode is active.
 
-**Time range** — 15 min, 1 hour, 2 hours, or all retained history (remembered per browser). Graphs draw from the registry's stored history, which is embedded in the page and extended by live updates. How far back "All" reaches depends on `history_size` and `result_ttl_seconds` (120 results per probe and 2 hours by default); use a custom `storage=` backend for longer retention.
+**Time range** — 15 min, 1 hour, 2 hours, or all retained history (remembered per browser). Graphs draw from the registry's stored history, which is embedded in the page and extended by live updates. How far back "All" reaches depends on `history_size` and `result_ttl_seconds` (120 results per probe and 2 hours by default); raise both for longer retention, or use [`RedisProbeStorage`](#redisprobestorage) to share history across workers.
 
 **Status over time** — one lane per probe, colored by status, with a tick at every state change. Gaps in the data are left blank rather than drawn as healthy.
 
@@ -496,7 +497,7 @@ registry = HealthRegistry(
 }
 ```
 
-Results are ordered oldest-first and are in-memory by default. See [Custom storage backend](README.md#custom-storage-backend) to persist across restarts.
+Results are ordered oldest-first and are in-memory by default. Each entry is dropped once it is older than `result_ttl_seconds`, and each probe keeps at most `history_size` entries. See [Custom storage backend](README.md#custom-storage-backend) to share them across workers or keep them across restarts.
 
 ---
 
@@ -526,6 +527,63 @@ registry = HealthRegistry(
 ```
 
 Alerts are ordered oldest-first.
+
+---
+
+## Custom storage backends
+
+Pass any object implementing `ProbeStorage` as `HealthRegistry(app, storage=...)`. The registry's `history_size`, `result_ttl_seconds`, `alert_ttl_seconds` and `max_alerts` are the retention window for every backend; setting a TTL to `0` disables age-based expiry for that collection (count limits still apply).
+
+### `RedisProbeStorage`
+
+```python
+import redis.asyncio as redis
+from fastapi_watch import HealthRegistry, RedisProbeStorage
+
+storage = RedisProbeStorage(
+    redis.from_url("redis://localhost:6379/0"),  # with or without decode_responses=True
+    prefix="myapp:health",   # namespace; one per app sharing the Redis
+    max_entry_bytes=8192,    # byte cap per history entry
+)
+registry = HealthRegistry(app, storage=storage, history_size=120, result_ttl_seconds=7200)
+```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `redis` | required | A `redis.asyncio` client |
+| `prefix` | `"fastapi-watch"` | Prefix for every key. On Redis Cluster use braces (`"{myapp:health}"`) so all keys share a slot |
+| `max_results` | `120` | History entries per probe (the registry's `history_size` overrides it) |
+| `result_ttl_seconds` | `7200` | Age limit for latest results and history entries (the registry's value overrides it) |
+| `alert_ttl_seconds` | `259200` | Age limit for alerts (the registry's value overrides it) |
+| `max_alerts` | `120` | Total alerts kept (the registry's value overrides it) |
+| `max_entry_bytes` | `8192` | Largest stored history entry, minimum 512 |
+
+Built so monitoring never loads the Redis it shares with your app:
+
+- **No `KEYS` or `SCAN`.** Probe names are kept in an index set (`<prefix>:probes`). `get_all_latest` is `SMEMBERS` plus one `MGET`, and `get_history` is `SMEMBERS` plus one pipelined round trip, however many probes there are.
+- **Atomic writes.** Each write is one `MULTI/EXEC`: add the entry, drop entries older than the TTL, trim to the count limit, and refresh a key-level expiry set slightly past the TTL. No key is ever left without its expiry. With a TTL of `0` no expiry is set and nothing is deleted by age.
+- **Per-entry ageing.** History (`<prefix>:history:<name>`) and alerts (`<prefix>:alerts`) are sorted sets scored by `checked_at` / `timestamp`; reads skip expired entries even before a write trims them.
+- **Byte cap.** A history entry over `max_entry_bytes` loses its largest `details` values first (for example a request-metrics probe's per-route table) and gets `details["_truncated"] = true`; scalar values such as `p95_rtt_ms` stay, so dashboard graphs keep working. Latest results (`<prefix>:latest:<name>`) are stored in full.
+- **Cleanup.** Keys of probes that stop reporting expire on their own; `prune(keep)` deletes them at once.
+- **One alert per state change across replicas.** `claim_alert` is a single `SET <prefix>:alert-claim:<key> 1 NX PX <ttl>`; only the first replica to claim a key gets `True`, and every claim key expires.
+
+Upper bound on memory used:
+
+```
+probes × (history_size × max_entry_bytes + one latest result) + max_alerts × (~150 B + probe name)
+```
+
+where `probes` counts the probe names written within the last `result_ttl_seconds` (or since the last `prune()` when that TTL is `0`).
+
+### Writing your own
+
+Implement the eight `ProbeStorage` methods: `get_latest`, `get_all_latest`, `set_latest`, `clear_latest` (sync; schedule I/O on the running loop), `append_history`, `get_history`, `append_alert` and `get_alerts`. Results and alerts are returned oldest-first. Three optional methods are called when present:
+
+- `configure(*, max_results, result_ttl_seconds, alert_ttl_seconds, max_alerts)`: receives the registry's retention settings.
+- `async prune(keep: set[str])`: delete the latest result and history of every probe not in `keep`.
+- `async claim_alert(key: str, ttl_seconds: float) -> bool`: return `True` only for the first caller to claim `key` within `ttl_seconds`, so one replica sends each alert. `ttl_seconds <= 0` always returns `True`. Claims must expire.
+
+Bound every collection by count and by age, per entry. The `ProbeStorage` docstring has an outline.
 
 ---
 
@@ -1548,7 +1606,7 @@ The endpoint is subject to the same `auth` as all other health endpoints.
 | `result_ttl_seconds` | `float` | `7200.0` | How long results are retained |
 | `alert_ttl_seconds` | `float` | `259200.0` | How long alert records are retained |
 | `max_alerts` | `int` | `120` | Hard cap on stored alerts |
-| `storage` | `ProbeStorage \| None` | `None` | Custom storage backend |
+| `storage` | `ProbeStorage \| None` | `None` | Storage backend; in-memory when `None`. See [Custom storage backends](#custom-storage-backends) |
 | `probe_timeout` | `float \| None` | `30.0` | Seconds before a probe without its own `timeout` is reported UNHEALTHY. `None` disables the default |
 | `metrics_prefix` | `str` | `""` | Prepended to every `/metrics` name. The default `probe_*` names collide with blackbox_exporter's; `"fastapi_watch_"` namespaces them |
 | `timezone` | `str` | `"UTC"` | IANA timezone for `checked_at` timestamps |
