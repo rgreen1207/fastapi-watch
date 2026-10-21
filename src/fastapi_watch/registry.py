@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import fnmatch
+import functools
 import hashlib
 import hmac
 import inspect
@@ -156,18 +157,42 @@ def _endpoint_keys(route) -> set:
 _STREAM_TOKEN_TTL_S = 300
 
 
-def _stream_token_key(auth: dict | Callable) -> bytes:
+_STREAM_TOKEN_SALT = b"fastapi-watch/stream-token"
+
+
+@functools.lru_cache(maxsize=8)
+def _derive_stream_token_key(material: bytes) -> bytes:
+    """Stretch credentials into a token-signing key (cached: scrypt costs ~50 ms).
+
+    Tokens appear in URLs and so in access logs; with a fast hash, one logged
+    token would let an attacker test password guesses offline at billions per
+    second.  scrypt makes each guess cost what it costs here.  PBKDF2 stands in
+    on the rare Python builds whose OpenSSL lacks scrypt.
+    """
+    scrypt = getattr(hashlib, "scrypt", None)
+    if scrypt is not None:
+        return scrypt(material, salt=_STREAM_TOKEN_SALT, n=2**14, r=8, p=1, dklen=32)
+    return hashlib.pbkdf2_hmac("sha256", material, _STREAM_TOKEN_SALT, 600_000)
+
+
+def _stream_token_key(auth: dict | Callable, secret: str | bytes | None = None) -> bytes:
     """Return the key that signs dashboard stream tokens.
 
-    Derived from the configured credentials, so every worker process and replica
-    sharing them accepts each other's tokens (the stream request may land on a
-    different worker than the page did).  A callable *auth* has no shared secret,
-    so it gets a per-process random key: tokens then only validate on the worker
-    that issued them.
+    An explicit *secret* (``stream_token_secret=``) is used as-is.  Otherwise
+    the key is derived from the configured credentials, so every worker process
+    and replica sharing them accepts each other's tokens (the stream request may
+    land on a different worker than the page did).  A callable *auth* has no
+    shared secret, so without *secret* it gets a per-process random key: tokens
+    then only validate on the worker that issued them.
     """
+    if secret is not None:
+        return secret.encode() if isinstance(secret, str) else bytes(secret)
     if isinstance(auth, dict):
-        material = auth.get("key") or f"{auth.get('username')}:{auth.get('password')}"
-        return hashlib.sha256(b"fastapi-watch/stream-token\x00" + str(material).encode()).digest()
+        if auth.get("type") == "apikey":
+            material = f"apikey\x00{auth['key']}"
+        else:
+            material = f"basic\x00{auth['username']}\x00{auth['password']}"
+        return _derive_stream_token_key(material.encode())
     return secrets.token_bytes(32)
 
 
@@ -179,11 +204,18 @@ def _mint_stream_token(key: bytes) -> str:
 
 def _valid_stream_token(key: bytes, token: str) -> bool:
     """True if *token* was signed with *key* and has not expired."""
+    return _stream_token_expiry(key, token) is not None
+
+
+def _stream_token_expiry(key: bytes, token: str) -> int | None:
+    """Return the expiry (Unix time) of a valid, unexpired *token*, else ``None``."""
     expiry, _, signature = token.partition(".")
     if not expiry.isdigit():
-        return False
+        return None
     expected = hmac.new(key, expiry.encode(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(signature, expected) and int(expiry) >= time.time()
+    if hmac.compare_digest(signature, expected) and int(expiry) >= time.time():
+        return int(expiry)
+    return None
 
 
 def _takes_two_positional(fn: Callable) -> bool:
@@ -224,6 +256,28 @@ def _normalize_interval(ms: int | None) -> int | None:
     if ms is None or ms == 0:
         return None
     return max(ms, _MIN_POLL_INTERVAL_MS)
+
+
+def _validate_auth(auth) -> None:
+    """Raise ``ValueError`` for an *auth* dict with missing or blank credentials.
+
+    ``{"type": "apikey", "key": ""}`` would otherwise admit every request that
+    simply omits the header (an absent header compares equal to ``""``).
+    """
+    if auth is None or callable(auth):
+        return
+    if not isinstance(auth, dict):
+        raise ValueError(f"auth must be None, a callable, or a dict; got {type(auth)!r}")
+    required = {"apikey": ("key",), "basic": ("username", "password")}.get(auth.get("type"))
+    if required is None:
+        raise ValueError(f"Unknown auth type {auth.get('type')!r}. Supported: 'basic', 'apikey'.")
+    for field in required:
+        value = auth.get(field)
+        # The value itself is never echoed: it may be a real credential.
+        if not isinstance(value, str):
+            raise ValueError(f"auth {field!r} must be a non-empty string, got {type(value).__name__}")
+        if not value.strip():
+            raise ValueError(f"auth {field!r} must not be empty or whitespace")
 
 
 def _make_auth_checker(auth) -> Callable | None:
@@ -369,6 +423,11 @@ class HealthRegistry:
             (default ``""``, keeping ``probe_healthy`` etc.).  Those names
             collide with blackbox_exporter's ``probe_*`` metrics; set e.g.
             ``"fastapi_watch_"`` to namespace them.
+        stream_token_secret: Key that signs the dashboard's short-lived stream
+            tokens (keyword-only).  By default the key is derived from the
+            *auth* credentials with scrypt, or is random per process for a
+            callable *auth*; pass the same secret to every worker and replica to
+            make a callable *auth*'s tokens valid across all of them.
 
     Example::
 
@@ -408,9 +467,14 @@ class HealthRegistry:
         storage: ProbeStorage | None = None,
         probe_timeout: float | None = 30.0,
         metrics_prefix: str = "",
+        *,
+        stream_token_secret: str | bytes | None = None,
     ) -> None:
         if probe_timeout is not None and probe_timeout <= 0:
             raise ValueError(f"probe_timeout must be positive or None, got {probe_timeout!r}")
+        _validate_auth(auth)
+        if stream_token_secret is not None and not stream_token_secret:
+            raise ValueError("stream_token_secret must not be empty")
         self.app = app
         self.prefix = prefix
         self._logger = logger
@@ -454,8 +518,11 @@ class HealthRegistry:
         if webhook_url:
             self._alerters.append(WebhookAlerter(url=webhook_url))
 
-        # Auth
+        # Auth.  The stream-token key is derived once, here: scrypt is slow by design.
         self._auth = auth
+        self._stream_token_key: bytes | None = (
+            _stream_token_key(auth, stream_token_secret) if auth is not None and serve_routes else None
+        )
 
         # Startup
         self._started: bool = False
@@ -1350,6 +1417,7 @@ class HealthRegistry:
         make_report: Callable[[list[ProbeResult]], str],
         filter_tags: frozenset[str] | None = None,
         filter_probes: frozenset[str] | None = None,
+        expires_at: float | None = None,
     ) -> AsyncGenerator[str, None]:
         """Async generator that yields SSE (Server-Sent Events) events while the client is connected.
 
@@ -1358,14 +1426,22 @@ class HealthRegistry:
         In single-fetch mode it sends one event with a ``retry:`` hint, so the
         browser waits ``_SINGLE_FETCH_RETRY_MS`` before reconnecting instead of
         its ~3 s default — each reconnect re-runs every probe.
+
+        *expires_at* (Unix time) ends the stream when the stream token that
+        authorized it expires; a token checked only at connect time would
+        otherwise grant access for as long as the connection stays open.
         """
         task = asyncio.current_task()
         if task is not None:
             self._sse_tasks.add(task)
         await self._on_connect()
         loop = asyncio.get_running_loop()
+
+        def _expired() -> bool:
+            return expires_at is not None and time.time() >= expires_at
+
         try:
-            while not self._shutting_down:
+            while not self._shutting_down and not _expired():
                 results = await self._get_results()
                 if filter_tags:
                     results = [r for r in results if filter_tags & set(r.tags)]
@@ -1381,7 +1457,7 @@ class HealthRegistry:
                 next_keepalive = loop.time() + _SSE_KEEPALIVE_S
                 while (now := loop.time()) < deadline:
                     await asyncio.sleep(min(0.5, deadline - now))
-                    if self._shutting_down or await request.is_disconnected():
+                    if self._shutting_down or _expired() or await request.is_disconnected():
                         return
                     if loop.time() >= next_keepalive:
                         yield ": keepalive\n\n"
@@ -1523,11 +1599,15 @@ class HealthRegistry:
         if auth_checker is not None:
             # A browser EventSource cannot send headers, so the authenticated
             # dashboard page hands its stream a short-lived signed token instead.
-            token_key = _stream_token_key(self._auth)
+            token_key = self._stream_token_key
 
             async def _stream_auth(request: Request) -> None:
                 token = request.query_params.get("token")
-                if token and _valid_stream_token(token_key, token):
+                expiry = _stream_token_expiry(token_key, token) if token else None
+                if expiry is not None:
+                    # A token-only stream ends when its token does, so the page
+                    # reconnects through a reload that mints a fresh one.
+                    request.state.stream_token_expiry = expiry
                     return
                 await auth_checker(request)
 
@@ -1710,6 +1790,7 @@ class HealthRegistry:
                     _make_sse_report,
                     filter_tags=_parse_csv_filter(tag),
                     filter_probes=_parse_csv_filter(probe),
+                    expires_at=getattr(request.state, "stream_token_expiry", None),
                 ),
                 media_type="text/event-stream",
                 headers=sse_headers,
@@ -1733,6 +1814,7 @@ class HealthRegistry:
                     _make_sse_report,
                     filter_tags=_parse_csv_filter(tag),
                     filter_probes=_parse_csv_filter(probe),
+                    expires_at=getattr(request.state, "stream_token_expiry", None),
                 ),
                 media_type="text/event-stream",
                 headers=sse_headers,

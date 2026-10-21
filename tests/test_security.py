@@ -548,3 +548,35 @@ async def test_rabbitmq_management_api_sends_basic_auth_header_without_deprecate
     kwargs = mock_session.get.call_args.kwargs
     assert "auth" not in kwargs
     assert kwargs["headers"] == {"Authorization": "Basic " + base64.b64encode(b"admin:hunter2").decode()}
+
+
+# ---------------------------------------------------------------------------
+# Blank credentials are rejected at init
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("auth", [
+    {"type": "apikey", "key": ""},
+    {"type": "apikey", "key": "   "},
+    {"type": "apikey"},
+    {"type": "apikey", "key": None},
+    {"type": "basic", "username": "", "password": "pw"},
+    {"type": "basic", "username": "ops", "password": ""},
+    {"type": "basic", "username": "ops", "password": " \t"},
+    {"type": "basic", "username": "ops"},
+])
+@pytest.mark.parametrize("serve_routes", [True, False])
+def test_blank_credentials_raise_at_init(auth, serve_routes):
+    with pytest.raises(ValueError, match="auth"):
+        HealthRegistry(FastAPI(), auth=auth, serve_routes=serve_routes)
+
+
+def test_blank_credential_error_does_not_echo_the_value():
+    with pytest.raises(ValueError) as excinfo:
+        HealthRegistry(FastAPI(), auth={"type": "basic", "username": "ops", "password": 12345})
+    assert "12345" not in str(excinfo.value)
+
+
+def test_empty_api_key_no_longer_admits_headerless_requests():
+    """Previously key="" matched the empty string an absent header reads as."""
+    with pytest.raises(ValueError):
+        HealthRegistry(FastAPI(), auth={"type": "apikey", "key": ""})
