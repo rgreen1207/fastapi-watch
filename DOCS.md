@@ -891,24 +891,22 @@ async def lifespan(app):
 from fastapi_watch import HealthRegistry, RequestMetricsMiddleware, RequestMetricsProbe
 
 app = FastAPI()
-middleware = RequestMetricsMiddleware(app, per_route=True)
-probe = RequestMetricsProbe(middleware, max_error_rate=0.05, max_avg_rtt_ms=500)
-registry = HealthRegistry(app, poll_interval_ms=None)
-registry.add(probe)
+app.add_middleware(RequestMetricsMiddleware, per_route=True)
 
-# In production: uvicorn myapp:middleware
+registry = HealthRegistry(app)
+registry.add(RequestMetricsProbe(app, max_error_rate=0.05, max_avg_rtt_ms=500))
 ```
 
-> Create the middleware yourself rather than via `app.add_middleware()` — `add_middleware()` creates an internal copy the probe can't see.
+Pass the **app** to `RequestMetricsProbe`. Starlette builds middleware instances lazily (on the first request or lifespan event), so the probe looks up the live `RequestMetricsMiddleware` in `app.middleware_stack` on its first check. Until then it reports `"no requests observed yet"`; if the stack is built without the middleware it reports UNHEALTHY with a configuration error. Passing a `RequestMetricsMiddleware` instance you serve yourself still works.
 
-`per_route=True` breaks stats down by route template (e.g. `/users/{user_id}`). `per_route=False` collects aggregates only.
+`per_route=True` breaks stats down by route template (e.g. `/users/{user_id}`, including any `include_router` or `Mount` prefix). Requests that match no route share one `"<unmatched>"` entry and a `Mount` without inner routes (static files, raw ASGI apps) shares one `"/static/{path:path}"`-style entry, so the table stays bounded however many distinct URLs arrive. `per_route=False` collects aggregates only.
 
 **`RequestMetricsMiddleware` args:**
 
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `per_route` | `True` | Per-route-template breakdown |
-| `window_size` | `200` | RTT sliding window size |
+| `window_size` | `200` | Recent requests used for `error_rate`, percentiles, and requests-per-minute. A count, not a time span: on a busy route it covers seconds, on a quiet one it can cover hours |
 | `ema_alpha` | `0.1` | EMA smoothing factor |
 | `min_error_status` | `500` | Status codes counted as errors (`500` = 5xx only; `400` = 4xx and 5xx) |
 
@@ -916,10 +914,11 @@ registry.add(probe)
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `middleware` | required | The `RequestMetricsMiddleware` instance |
+| `middleware` | required | The app the middleware was added to (recommended), or a `RequestMetricsMiddleware` instance requests pass through |
 | `name` | `"request_metrics"` | Probe label |
 | `max_error_rate` | `0.1` | Error-rate threshold |
 | `max_avg_rtt_ms` | `None` | RTT threshold; `None` disables it |
+| `circuit_breaker_enabled` | `False` | The probe only reads in-memory counters, so the circuit breaker is off by default |
 
 ---
 

@@ -1,13 +1,13 @@
 """Request metrics middleware and associated probe.
 
-Add :class:`RequestMetricsMiddleware` to your FastAPI app and pass it to
+Add :class:`RequestMetricsMiddleware` to your FastAPI app and pass the app to
 :class:`RequestMetricsProbe` to get automatic, app-wide request telemetry
 without decorating individual routes.
 """
 import threading
 import time
 from collections import deque
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -15,6 +15,12 @@ from starlette.responses import Response
 
 from .models import ProbeResult, ProbeStatus
 from .probes.base import BaseProbe, _calc_percentiles, _update_ema
+
+if TYPE_CHECKING:
+    from starlette.applications import Starlette
+
+# Bound on the middleware-stack walk: real stacks are a handful of layers deep.
+_MAX_STACK_DEPTH = 64
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +105,33 @@ class _RouteStats:
         }
 
 
+UNMATCHED_ROUTE = "<unmatched>"
+
+
+def _route_key(scope: dict, entry_root_path: str) -> str:
+    """Return the per-route bucket for a finished request.
+
+    Keys are route *templates* (``/users/{id}``), never concrete URLs: a key per
+    URL would let scanners and 404 floods grow the stats table without bound.
+
+    * A matched route keys on its full template, including any router prefix
+      and Mount prefix.  FastAPI 0.137+ keeps included routes' short paths on
+      ``route.path`` and the full one on the effective route context.
+    * A Mount that matched no inner route (static files, raw ASGI apps, or a
+      404 inside a mounted app) shares one ``<mount>/{path:path}`` bucket.
+    * Anything else shares the single ``<unmatched>`` bucket.
+    """
+    root_path = scope.get("root_path", "")
+    mount_prefix = root_path[len(entry_root_path):] if root_path.startswith(entry_root_path) else ""
+    effective = (scope.get("fastapi") or {}).get("effective_route_context")
+    template = getattr(effective, "path", None) or getattr(scope.get("route"), "path", None)
+    if template:
+        return mount_prefix + template
+    if mount_prefix:
+        return mount_prefix + "/{path:path}"
+    return UNMATCHED_ROUTE
+
+
 # ---------------------------------------------------------------------------
 # Middleware
 # ---------------------------------------------------------------------------
@@ -106,15 +139,21 @@ class _RouteStats:
 class RequestMetricsMiddleware(BaseHTTPMiddleware):
     """Starlette middleware that records request metrics across all routes.
 
-    Attach to your FastAPI app, then pass the same instance to
+    Attach it with ``app.add_middleware(...)``, then pass the *app* to
     :class:`RequestMetricsProbe` to expose the collected data as a health probe.
+    Starlette builds middleware instances lazily (on the first request or
+    lifespan event), so the probe finds the live instance in the app's
+    middleware stack when it first checks.
 
     Args:
         app: The ASGI application (injected automatically by FastAPI/Starlette).
         per_route: When ``True`` (default), metrics are also broken down by
             route path template (e.g. ``/users/{id}``), available in the probe's
-            ``details["routes"]``.  When ``False``, only aggregate stats are
-            tracked.
+            ``details["routes"]``.  Requests that match no route share a single
+            ``"<unmatched>"`` entry, and a Mount without inner routes (e.g.
+            static files) shares one ``"/static/{path:path}"``-style entry, so
+            the table stays bounded however many distinct URLs arrive.  When
+            ``False``, only aggregate stats are tracked.
         window_size: Number of recent requests used for the error rate,
             percentiles, and requests-per-minute (default ``200``).
         ema_alpha: Smoothing factor for the exponential moving average RTT
@@ -129,13 +168,10 @@ class RequestMetricsMiddleware(BaseHTTPMiddleware):
         from fastapi_watch import HealthRegistry, RequestMetricsMiddleware, RequestMetricsProbe
 
         app = FastAPI()
-
-        metrics = RequestMetricsMiddleware(app, per_route=True)
         app.add_middleware(RequestMetricsMiddleware, per_route=True)
 
-        # Attach the middleware *before* building the probe
         registry = HealthRegistry(app)
-        registry.add(RequestMetricsProbe(metrics, max_error_rate=0.05))
+        registry.add(RequestMetricsProbe(app, max_error_rate=0.05))
     """
 
     def __init__(
@@ -163,28 +199,27 @@ class RequestMetricsMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next) -> Response:
         start = time.perf_counter()
+        # Routing grows root_path by each Mount it enters; remember the starting
+        # value so the mount prefix can be recovered afterwards.
+        entry_root_path = request.scope.get("root_path", "")
         try:
             response = await call_next(request)
         except Exception:
             # Unhandled exceptions become a 500 in Starlette's ServerErrorMiddleware,
             # which sits outside every user middleware — so this is the only place
             # the request can be counted.  Re-raise so that response is unchanged.
-            self._record(request, 500, start)
+            self._record(request, 500, start, entry_root_path)
             raise
-        self._record(request, response.status_code, start)
+        self._record(request, response.status_code, start, entry_root_path)
         return response
 
-    def _record(self, request: Request, status_code: int, start: float) -> None:
+    def _record(self, request: Request, status_code: int, start: float, entry_root_path: str) -> None:
         """Record one finished request in the aggregate and its per-route bucket."""
         rtt_ms = round((time.perf_counter() - start) * 1000, 2)
         self._aggregate.record(status_code, rtt_ms)
 
         if self.per_route:
-            # Prefer the route template (e.g. /users/{id}) over the concrete
-            # path (e.g. /users/42) so stats group by pattern, not by value.
-            route = request.scope.get("route")
-            path = getattr(route, "path", None) or request.url.path or "<unmatched>"
-            self._get_or_create(path).record(status_code, rtt_ms)
+            self._get_or_create(_route_key(request.scope, entry_root_path)).record(status_code, rtt_ms)
 
 
 # ---------------------------------------------------------------------------
@@ -202,36 +237,89 @@ class RequestMetricsProbe(BaseProbe):
     ``"no requests observed yet"`` in details.
 
     Args:
-        middleware: The :class:`RequestMetricsMiddleware` instance attached to
-            the app.
+        middleware: The app the middleware was added to (recommended), or a
+            :class:`RequestMetricsMiddleware` instance that requests actually
+            pass through.  Given an app, the live instance is looked up in
+            ``app.middleware_stack`` on the first check after Starlette builds
+            it; if the stack is built but holds no ``RequestMetricsMiddleware``
+            the probe reports UNHEALTHY with a configuration error.
         name: Probe name (default ``"request_metrics"``).
         max_error_rate: Error rate (0–1) above which the probe is UNHEALTHY
             (default ``0.1`` = 10 %).
         max_avg_rtt_ms: Average RTT threshold in milliseconds.  ``None``
             disables this check.
         poll_interval_ms: Per-probe poll interval override.
+        circuit_breaker_enabled: Whether the registry's circuit breaker may
+            suspend this probe (default ``False``).  The probe only reads
+            in-memory counters, so suspending it protects nothing and would
+            serve a stale result while traffic recovers.
 
     Example::
 
-        registry.add(RequestMetricsProbe(metrics, max_error_rate=0.02, max_avg_rtt_ms=500))
+        registry.add(RequestMetricsProbe(app, max_error_rate=0.02, max_avg_rtt_ms=500))
     """
 
     def __init__(
         self,
-        middleware: RequestMetricsMiddleware,
+        middleware: "RequestMetricsMiddleware | Starlette",
         name: str = "request_metrics",
         max_error_rate: float = 0.1,
         max_avg_rtt_ms: float | None = None,
         poll_interval_ms: int | None = None,
+        circuit_breaker_enabled: bool = False,
     ) -> None:
+        if isinstance(middleware, RequestMetricsMiddleware):
+            self._middleware: RequestMetricsMiddleware | None = middleware
+            self._app = None
+        elif hasattr(middleware, "middleware_stack"):
+            self._middleware = None
+            self._app = middleware
+        else:
+            raise TypeError(
+                "RequestMetricsProbe needs the app RequestMetricsMiddleware was added to, "
+                f"or a RequestMetricsMiddleware instance; got {type(middleware).__name__}"
+            )
         self.name = name
-        self._middleware = middleware
         self.max_error_rate = max_error_rate
         self.max_avg_rtt_ms = max_avg_rtt_ms
         self.poll_interval_ms = poll_interval_ms
+        self.circuit_breaker_enabled = circuit_breaker_enabled
+
+    def _resolve_middleware(self) -> "RequestMetricsMiddleware | None | bool":
+        """Return the live middleware, ``None`` if the stack is not built yet,
+        or ``False`` if it is built without a ``RequestMetricsMiddleware``."""
+        if self._middleware is not None:
+            return self._middleware
+        node = self._app.middleware_stack
+        if node is None:
+            return None
+        for _ in range(_MAX_STACK_DEPTH):
+            if node is None:
+                break
+            if isinstance(node, RequestMetricsMiddleware):
+                self._middleware = node
+                return node
+            node = getattr(node, "app", None)
+        return False
 
     async def check(self) -> ProbeResult:
-        snap = self._middleware._aggregate.snapshot()
+        middleware = self._resolve_middleware()
+        if middleware is False:
+            return ProbeResult(
+                name=self.name,
+                status=ProbeStatus.UNHEALTHY,
+                latency_ms=0.0,
+                error="RequestMetricsMiddleware is not installed on the app",
+            )
+        if middleware is None:
+            return ProbeResult(
+                name=self.name,
+                status=ProbeStatus.HEALTHY,
+                latency_ms=0.0,
+                details={"message": "no requests observed yet"},
+            )
+
+        snap = middleware._aggregate.snapshot()
 
         if snap["request_count"] == 0:
             return ProbeResult(
@@ -254,9 +342,9 @@ class RequestMetricsProbe(BaseProbe):
         status = ProbeStatus.UNHEALTHY if reasons else ProbeStatus.HEALTHY
         details: dict[str, Any] = dict(snap)
 
-        if self._middleware.per_route:
-            with self._middleware._routes_lock:
-                routes_copy = list(self._middleware._routes.items())
+        if middleware.per_route:
+            with middleware._routes_lock:
+                routes_copy = list(middleware._routes.items())
             details["routes"] = {
                 path: stats.snapshot()
                 for path, stats in sorted(routes_copy)

@@ -56,7 +56,19 @@ FastAPI 0.137 stores included routers as `_IncludedRouter` wrappers whose routes
 
 **Fix:** paths are matched and described using the full path a client requests on every FastAPI version. Health routes are recognised as the registry's own handlers rather than by path prefix, so an application route such as `/healthcheck` is no longer skipped by the default `/health` prefix, and `prefix=""` no longer excludes every route. `discover_routes()` and `watch_router()` now share one implementation.
 
+#### `RequestMetricsProbe` can find the middleware itself
+
+`app.add_middleware(RequestMetricsMiddleware)` makes Starlette build the instance lazily, so there was no supported way to hand that live instance to `RequestMetricsProbe`; the documented example built a second instance that never saw traffic, leaving the probe at "no requests observed yet" forever.
+
+**Fix:** `RequestMetricsProbe(app)` accepts the app and resolves the live middleware from `app.middleware_stack` on its first check. If the stack is built without the middleware, the probe reports UNHEALTHY with a configuration error rather than silently showing no traffic. Passing a middleware instance still works. `RequestMetricsProbe` also defaults to `circuit_breaker_enabled=False` (see the passive-probe circuit breaker change below).
+
 ### Performance
+
+#### Per-route request metrics no longer grow without bound
+
+With `per_route=True`, a request that matched no route was bucketed under its concrete URL, so every distinct 404 — scanners, typos, cache-busting query paths — created a new stats entry holding two rolling windows. Memory grew without bound, and every entry was snapshotted, sorted, and streamed to the dashboard on each update.
+
+**Fix:** unmatched requests share one `"<unmatched>"` entry, and a `Mount` without inner routes (static files, raw ASGI apps) shares one `"<mount>/{path:path}"` entry. Matched routes key on their full template, including `include_router` and `Mount` prefixes, on every FastAPI version.
 
 #### Concurrent requests share one probe run
 
