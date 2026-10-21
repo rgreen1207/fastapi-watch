@@ -78,3 +78,22 @@ async def test_prune_drops_unlisted_probes():
     assert [a.probe for a in await store.get_alerts()] == ["drop"]  # alert log is left alone
     await store.prune(set())
     assert await store.get_all_latest() == {} and await store.get_history() == {}
+
+
+async def test_claim_alert_first_caller_wins_until_expiry(monkeypatch):
+    store = InMemoryProbeStorage()
+    assert await store.claim_alert("db:unhealthy", 10) is True
+    assert await store.claim_alert("db:unhealthy", 10) is False
+    assert await store.claim_alert("db:healthy", 10) is True
+    real = time.monotonic
+    monkeypatch.setattr(storage_module, "time", SimpleNamespace(monotonic=lambda: real() + 60))
+    assert await store.claim_alert("db:unhealthy", 10) is True
+    assert list(store._claims) == ["db:unhealthy"]  # expired claims purged: stays bounded
+
+
+async def test_claim_alert_non_positive_ttl_always_true_and_stores_nothing():
+    store = InMemoryProbeStorage()
+    for _ in range(3):
+        assert await store.claim_alert("db:unhealthy", 0) is True
+        assert await store.claim_alert("db:unhealthy", -1) is True
+    assert store._claims == {}

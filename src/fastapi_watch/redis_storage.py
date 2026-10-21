@@ -83,17 +83,19 @@ class RedisProbeStorage:
 
     Keys (``P`` = *prefix*): ``P:probes`` (set of probe names), ``P:latest:<name>``
     (string), ``P:history:<name>`` (sorted set scored by ``checked_at``) and
-    ``P:alerts`` (sorted set scored by ``timestamp``).
+    ``P:alerts`` (sorted set scored by ``timestamp``) and short-lived
+    ``P:alert-claim:<key>`` markers written by :meth:`claim_alert`.
 
     **Size bound.**  Redis memory used by this backend is at most::
 
-        N × (max_results × max_entry_bytes + L) + max_alerts × A + N × len(name)
+        N × (max_results × max_entry_bytes + L) + max_alerts × A + N × len(name) + C
 
     plus Redis' per-key overhead, where ``N`` is the number of probe names
     written within the last ``result_ttl_seconds`` (or since the last
     :meth:`prune` when that TTL is ``0``), ``L`` the size of one probe's
     serialized latest result and ``A`` the size of one serialized alert (about
-    150 bytes plus the probe name).  Each history entry is cut to
+    150 bytes plus the probe name) and ``C`` the alert claims live at once (one
+    small key per claimed alert, each expiring after its claim TTL).  Each history entry is cut to
     ``max_entry_bytes`` (unless the probe name alone exceeds it); every write
     trims its collection by count and by age in the same transaction that adds
     to it; and once a collection stops being written it expires as a whole
@@ -369,6 +371,18 @@ class RedisProbeStorage:
             self._alerts_key, "+inf", cutoff, start=0, num=self._max_alerts
         )
         return [AlertRecord.model_validate_json(_payload(m)) for m in reversed(members)]
+
+    async def claim_alert(self, key: str, ttl_seconds: float) -> bool:
+        """Return True if this caller is first to claim *key* within *ttl_seconds*.
+
+        One ``SET NX PX``, so exactly one of several replicas sharing the prefix
+        wins.  The claim key always expires; ``ttl_seconds <= 0`` claims
+        without storing anything.
+        """
+        ttl_ms = math.ceil(ttl_seconds * 1000)
+        if ttl_ms <= 0:
+            return True
+        return bool(await self._redis.set(f"{self._prefix}:alert-claim:{key}", 1, nx=True, px=ttl_ms))
 
     # ------------------------------------------------------------------ prune
 

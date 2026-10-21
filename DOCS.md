@@ -565,6 +565,7 @@ Built so monitoring never loads the Redis it shares with your app:
 - **Per-entry ageing.** History (`<prefix>:history:<name>`) and alerts (`<prefix>:alerts`) are sorted sets scored by `checked_at` / `timestamp`; reads skip expired entries even before a write trims them.
 - **Byte cap.** A history entry over `max_entry_bytes` loses its largest `details` values first (for example a request-metrics probe's per-route table) and gets `details["_truncated"] = true`; scalar values such as `p95_rtt_ms` stay, so dashboard graphs keep working. Latest results (`<prefix>:latest:<name>`) are stored in full.
 - **Cleanup.** Keys of probes that stop reporting expire on their own; `prune(keep)` deletes them at once.
+- **One alert per state change across replicas.** `claim_alert` is a single `SET <prefix>:alert-claim:<key> 1 NX PX <ttl>`; only the first replica to claim a key gets `True`, and every claim key expires.
 
 Upper bound on memory used:
 
@@ -576,10 +577,11 @@ where `probes` counts the probe names written within the last `result_ttl_second
 
 ### Writing your own
 
-Implement the eight `ProbeStorage` methods: `get_latest`, `get_all_latest`, `set_latest`, `clear_latest` (sync; schedule I/O on the running loop), `append_history`, `get_history`, `append_alert` and `get_alerts`. Results and alerts are returned oldest-first. Two optional methods are called when present:
+Implement the eight `ProbeStorage` methods: `get_latest`, `get_all_latest`, `set_latest`, `clear_latest` (sync; schedule I/O on the running loop), `append_history`, `get_history`, `append_alert` and `get_alerts`. Results and alerts are returned oldest-first. Three optional methods are called when present:
 
 - `configure(*, max_results, result_ttl_seconds, alert_ttl_seconds, max_alerts)`: receives the registry's retention settings.
 - `async prune(keep: set[str])`: delete the latest result and history of every probe not in `keep`.
+- `async claim_alert(key: str, ttl_seconds: float) -> bool`: return `True` only for the first caller to claim `key` within `ttl_seconds`, so one replica sends each alert. `ttl_seconds <= 0` always returns `True`. Claims must expire.
 
 Bound every collection by count and by age, per entry. The `ProbeStorage` docstring has an outline.
 

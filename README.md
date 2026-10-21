@@ -248,6 +248,8 @@ It is safe to point at the Redis your app already uses: it never runs `KEYS` or 
 redis bytes ≤ probes × (history_size × max_entry_bytes + one latest result) + max_alerts × (~150 B + probe name)
 ```
 
+Replicas sharing a prefix also share alert dedupe: `claim_alert(key, ttl_seconds)` is one `SET NX PX`, so only one replica sends each alert, and every claim key expires.
+
 History entries larger than `max_entry_bytes` drop their largest `details` values first and are marked `details["_truncated"] = true`; the latest result is always stored in full. With the defaults, 20 probes take at most about 19 MB of history, and typically far less.
 
 To write your own backend (PostgreSQL, Memcached, ...), implement the `ProbeStorage` protocol. See [DOCS.md — Custom storage backends](https://github.com/rgreen1207/fastapi-watch/blob/main/DOCS.md#custom-storage-backends).

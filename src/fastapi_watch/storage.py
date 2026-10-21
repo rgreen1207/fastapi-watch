@@ -51,6 +51,11 @@ class ProbeStorage(Protocol):
         # Delete the latest result and history of every probe not in keep.
         async def prune(self, keep: set[str]) -> None: ...
 
+        # Return True if this caller is the first to claim key within
+        # ttl_seconds (and record the claim), False if another caller holds it.
+        # Lets only one replica send each alert.  ttl_seconds <= 0: always True.
+        async def claim_alert(self, key: str, ttl_seconds: float) -> bool: ...
+
     For Redis use the bundled :class:`~fastapi_watch.RedisProbeStorage`.  A
     custom backend outline::
 
@@ -124,6 +129,9 @@ class InMemoryProbeStorage:
         # Alert log (capped at max_alerts; oldest dropped when full, TTL applied on read)
         self._alerts: deque[tuple[float, AlertRecord]] = deque(maxlen=self._max_alerts)
 
+        # Alert claims (claim_alert): key -> monotonic expiry
+        self._claims: dict[str, float] = {}
+
     def configure(
         self,
         *,
@@ -150,6 +158,19 @@ class InMemoryProbeStorage:
         for name in [n for n in self._history if n not in keep]:
             self._history.pop(name, None)
             self._history_times.pop(name, None)
+
+    async def claim_alert(self, key: str, ttl_seconds: float) -> bool:
+        """Return True if *key* is unclaimed (or its claim expired) and claim it
+        for *ttl_seconds*.  Process-local; expired claims are purged on each call."""
+        now = time.monotonic()
+        for stale in [k for k, expires in self._claims.items() if expires <= now]:
+            del self._claims[stale]
+        if ttl_seconds <= 0:
+            return True
+        if key in self._claims:
+            return False
+        self._claims[key] = now + ttl_seconds
+        return True
 
     def _result_expired(self, recorded_at: float) -> bool:
         return self._result_ttl > 0 and (time.monotonic() - recorded_at) > self._result_ttl

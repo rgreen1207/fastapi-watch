@@ -490,3 +490,33 @@ async def test_registry_serves_from_redis(spy, prefix):
         status = (await http.get("/health/status")).json()
     assert [r["status"] for r in history["noop"]] == ["healthy"]
     assert status["status"] == "healthy"
+
+
+# --- claim_alert (cross-replica alert dedupe) -------------------------------
+
+async def test_claim_alert_only_one_replica_wins(client, prefix):
+    one = RedisProbeStorage(client, prefix=prefix)
+    two = RedisProbeStorage(client, prefix=prefix)
+    results = await asyncio.gather(*(s.claim_alert("db:unhealthy", 30) for s in (one, two, one, two)))
+    assert sorted(results) == [False, False, False, True]
+    assert await two.claim_alert("db:healthy", 30) is True  # different key, own claim
+
+
+async def test_claim_alert_expires_and_always_has_ttl(client, spy, prefix):
+    store = _store(spy, prefix)
+    assert await store.claim_alert("db:unhealthy", 0.2) is True
+    pttl = await client.pttl(f"{prefix}:alert-claim:db:unhealthy")
+    assert 0 < pttl <= 200
+    assert await store.claim_alert("db:unhealthy", 0.2) is False
+    await asyncio.sleep(0.3)
+    assert await store.claim_alert("db:unhealthy", 0.2) is True
+    for key in await _keys(client, prefix):
+        assert await client.pttl(key) > 0, key
+
+
+async def test_claim_alert_non_positive_ttl_stores_nothing(client, spy, prefix):
+    store = _store(spy, prefix)
+    for ttl in (0, -5):
+        assert await store.claim_alert("db:unhealthy", ttl) is True
+        assert await store.claim_alert("db:unhealthy", ttl) is True
+    assert await _keys(client, prefix) == []
