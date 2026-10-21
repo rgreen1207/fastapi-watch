@@ -95,10 +95,26 @@ class _BrokenStorage(InMemoryProbeStorage):
 
 
 @pytest.mark.asyncio
-async def test_failed_run_reaches_every_caller_and_is_forgotten():
-    registry = HealthRegistry(FastAPI(), poll_interval_ms=None, storage=_BrokenStorage())
+async def test_failed_run_reaches_every_caller_and_is_forgotten(monkeypatch):
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=None)
     registry.add(_Slow(delay=0.05))
+
+    async def _fails(probe, critical):
+        await asyncio.sleep(0.05)
+        raise ConnectionError("unexpected")
+
+    monkeypatch.setattr(registry, "_check_or_cached", _fails)
     outcomes = await asyncio.gather(registry.run_all(), registry.run_all(), return_exceptions=True)
 
     assert all(isinstance(o, ConnectionError) for o in outcomes)
+    assert registry._inflight == {}
+
+
+@pytest.mark.asyncio
+async def test_storage_failure_does_not_fail_the_shared_run():
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=None, storage=_BrokenStorage())
+    registry.add(_Slow(delay=0.05))
+    outcomes = await asyncio.gather(registry.run_all(), registry.run_all())
+
+    assert [[r.status for r in o] for o in outcomes] == [[ProbeStatus.HEALTHY]] * 2
     assert registry._inflight == {}

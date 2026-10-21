@@ -346,15 +346,13 @@ async def test_poll_loop_populates_cache():
 async def test_get_results_uses_cache_in_poll_mode():
     app = FastAPI()
     registry = HealthRegistry(app, poll_interval_ms=60_000)
+    probe = NoOpProbe(name="cached")
+    registry.add(probe)
 
-    cached_result = ProbeResult(name="cached", status=ProbeStatus.HEALTHY)
-    registry._probes.append((NoOpProbe(name="cached"), True))
-    await registry._storage.set_latest(cached_result)
-
-    results = await registry._get_results()
-    assert any(r.name == "cached" for r in results)
-    # Polled probe with warm cache should not have been re-run
-    assert await registry._storage.get_latest("cached") is cached_result
+    first = await registry._get_results()  # first run in this process
+    second = await registry._get_results()
+    # Polled probe that ran here and is not yet due is not re-run
+    assert second[0] is first[0]
 
 
 @pytest.mark.asyncio

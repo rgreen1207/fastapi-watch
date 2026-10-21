@@ -109,3 +109,101 @@ async def test_cancellation_propagates_after_cleanup():
     assert registry._active_connections == 0
     assert not registry._sse_tasks
     registry._cancel_poll_task()
+
+
+# ---------------------------------------------------------------------------
+# max_stream_connections
+# ---------------------------------------------------------------------------
+
+def _single_fetch_app(**kwargs):
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None, **kwargs)
+    registry.add(NoOpProbe(name="a"))
+    return app, registry
+
+
+def test_default_stream_cap_is_100():
+    _, registry = _single_fetch_app()
+    assert registry._max_stream_connections == 100
+
+
+@pytest.mark.parametrize("path", ["/health/status/stream", "/health/ready/stream"])
+def test_streams_beyond_the_cap_get_503_with_retry_after(path):
+    app, registry = _single_fetch_app(max_stream_connections=2)
+    held = [registry._reserve_stream_slot(), registry._reserve_stream_slot()]
+    client = TestClient(app)
+
+    resp = client.get(path)
+    assert resp.status_code == 503
+    assert resp.headers["Retry-After"] == "30"
+    assert resp.json() == {"error": "too many stream connections"}
+    assert registry._active_connections == 0  # the generator never started
+
+    held[0]()
+    assert client.get(path).status_code == 200
+
+
+def test_slot_is_held_while_streaming_and_released_after():
+    app, registry = _single_fetch_app(max_stream_connections=5)
+    seen = []
+
+    async def _fake_stream(request, make_report, **kwargs):
+        seen.append(registry._stream_slots)
+        yield "data: {}\n\n"
+
+    registry._event_stream = _fake_stream
+    client = TestClient(app)
+    for _ in range(3):
+        assert client.get("/health/status/stream").status_code == 200
+    assert seen == [1, 1, 1]
+    assert registry._stream_slots == 0
+
+
+def test_unlimited_streams_with_none():
+    app, registry = _single_fetch_app(max_stream_connections=None)
+    for _ in range(150):
+        registry._reserve_stream_slot()
+    assert TestClient(app).get("/health/status/stream").status_code == 200
+
+
+def test_release_is_idempotent():
+    _, registry = _single_fetch_app(max_stream_connections=1)
+    release = registry._reserve_stream_slot()
+    release()
+    release()
+    assert registry._stream_slots == 0
+
+
+@pytest.mark.asyncio
+async def test_slot_released_when_the_response_fails_before_streaming():
+    released = []
+
+    async def _never_iterated():
+        yield "data: {}\n\n"
+
+    response = registry_module._SlotStreamingResponse(_never_iterated(), release=lambda: released.append(1))
+
+    async def _send(message):
+        raise OSError("client gone")
+
+    async def _receive():
+        return {"type": "http.disconnect"}
+
+    with pytest.raises(OSError):
+        await response({"type": "http", "asgi": {"spec_version": "2.0"}}, _receive, _send)
+    assert released == [1]
+
+
+def test_cap_applies_after_auth():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None, auth={"type": "apikey", "key": "k"}, max_stream_connections=1)
+    registry._reserve_stream_slot()
+    client = TestClient(app)
+    assert client.get("/health/status/stream").status_code == 403
+    assert client.get("/health/status/stream", headers={"X-API-Key": "k"}).status_code == 503
+
+
+@pytest.mark.parametrize("value", [0, -5])
+def test_invalid_stream_cap_is_rejected(value):
+    with pytest.raises(ValueError, match="max_stream_connections"):
+        HealthRegistry(FastAPI(), max_stream_connections=value)

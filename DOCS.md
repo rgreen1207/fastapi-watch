@@ -106,6 +106,10 @@ Events are sent at the shortest effective probe interval (a probe with `poll_int
 
 In single-fetch mode (no probe has an interval) the stream sends one event, preceded by `retry: 30000`, and closes. Browsers then wait 30 seconds before reconnecting instead of their ~3-second default — each reconnect runs every probe again.
 
+**Connection limit.** At most `max_stream_connections` streams (default `100`, across both stream endpoints) are open at once; each one wakes every 0.5 s, so the cap keeps stream clients from loading the app's event loop. Further stream requests get `503` with `Retry-After: 30` before any streaming starts. Pass `max_stream_connections=None` for no limit.
+
+Streams keep working while the storage backend is down: they are served from this process's own results (see [Polling and caching](#polling-and-caching)). A stream opened with a dashboard stream token closes when the token expires; see [Authentication](#authentication).
+
 **JavaScript:**
 
 ```js
@@ -144,6 +148,15 @@ Minimum enforced interval is 1000 ms — lower values are clamped.
 
 - **With SSE clients connected** — serves the most recent cached result without re-running probes.
 - **With no streaming active** — runs probes on demand with a built-in lock to prevent thundering herd.
+
+Results are served from an in-process copy of each registered probe's last result; the request path writes to storage but never reads it. Two things follow:
+
+- **Shared storage.** With a backend shared by several replicas (e.g. Redis), each replica reports only its own registered probes as checked by itself. A probe that has not yet run in this process runs on the first request, so `/health/ready` never passes on another replica's result.
+- **Storage outages.** Every storage call is bounded by `storage_timeout` (default 2 s; `None` disables). A failing or timed-out call is logged (at most once a minute per operation) and never fails a request: `/health/ready`, `/health/status`, `/health/metrics` and the streams keep answering from in-process results, `/health/history` and `/health/alerts` return `503 {"error": "storage unavailable"}`, and the dashboard renders without history. Storage writes run concurrently, so a hung backend adds at most one `storage_timeout` to a check. If your orchestrator's readiness timeout is short (Kubernetes defaults to 1 s), set `storage_timeout` below it.
+
+If the backend implements `prune(keep)`, the registry calls it with the registered probe names on the first request and then at most every 10 minutes (from the poll loop or later requests), so a renamed or removed probe's data does not linger. Give each app its own key namespace on a shared backend: pruning deletes every probe name not registered in the app doing the pruning.
+
+On shutdown the registry awaits `aclose()` on every registered and startup probe that defines one (5 s limit each; failures are logged).
 
 ---
 
@@ -277,6 +290,8 @@ All `/metrics` names start with `probe_`, which collides with blackbox_exporter'
 
 While active: `/health/ready` returns `200 {"status": "maintenance"}`, alerters are suppressed, and the dashboard shows an amber banner.
 
+Probes keep running and state changes are still recorded and passed to `on_state_change` callbacks. When maintenance ends, the first check of each probe sends alerters any difference from the last status they were sent: a dependency that went down during the window and is still down alerts `healthy -> unhealthy`, while one that failed and recovered within the window sends nothing.
+
 ### HTTP endpoints
 
 `POST` and `DELETE /health/maintenance` change readiness and silence alerts, so they are **only mounted when `auth=` is configured** (see [Authentication](#authentication)). Without auth, `GET /health/maintenance` still reports status and the [Python API](#python-api) works as usual.
@@ -303,6 +318,8 @@ curl https://your-app/health/maintenance
 ```
 
 An `until` without a UTC offset is read in the registry's `timezone`. An `until` that has already passed is rejected with `422` and leaves any current maintenance window untouched.
+
+Because browsers attach cached Basic credentials to any request to your site, `POST` and `DELETE` refuse cross-site browser requests with `403`: a `Sec-Fetch-Site: cross-site` header, or an `Origin` whose host and port don't match the request's `Host` (or `X-Forwarded-Host`). A non-empty body must be `Content-Type: application/json`, otherwise `415`. curl, scripts and other non-browser clients send neither header, so the commands above, including the empty-body `POST`, work unchanged.
 
 ### Deployment workflow
 
@@ -501,7 +518,7 @@ registry = HealthRegistry(
 }
 ```
 
-Results are ordered oldest-first and are in-memory by default. Each entry is dropped once it is older than `result_ttl_seconds`, and each probe keeps at most `history_size` entries. See [Custom storage backend](README.md#custom-storage-backend) to share them across workers or keep them across restarts.
+Results are ordered oldest-first and are in-memory by default. Each entry is dropped once it is older than `result_ttl_seconds`, and each probe keeps at most `history_size` entries. See [Custom storage backend](README.md#custom-storage-backend) to share them across workers or keep them across restarts. With a custom `storage=`, the retention arguments are applied through the backend's `configure()` method when you pass them; a backend without `configure()` keeps its own limits and a warning names the ignored arguments. If the backend is unavailable, the endpoint returns `503 {"error": "storage unavailable"}`.
 
 ---
 
@@ -530,7 +547,7 @@ registry = HealthRegistry(
 }
 ```
 
-Alerts are ordered oldest-first.
+Alerts are ordered oldest-first. If the storage backend is unavailable, the endpoint returns `503 {"error": "storage unavailable"}`.
 
 ---
 
@@ -1513,6 +1530,26 @@ Alerters are called concurrently from a background worker queue. A failed alerte
 
 The built-in alerters post from fastapi-watch's own thread pool (see [Blocking checks](#blocking-checks-and-the-thread-pool)), and `timeout` bounds the whole request — connecting, sending, and waiting for the response status — not just each socket read, so an endpoint that answers slowly cannot hold a thread past it. The request then fails with `TimeoutError`, which is logged like any other alerter failure. Resolving the webhook's hostname is bounded only by the system resolver's own timeouts.
 
+### Flap limiting and multi-replica dedupe
+
+Both are off by default.
+
+```python
+registry = HealthRegistry(
+    app,
+    alerters=[PagerDutyAlerter(routing_key="...")],
+    storage=my_redis_storage,       # shared by every replica
+    alert_min_interval_s=300,       # at most one alert per probe per 5 minutes
+    alert_dedupe_window_s=120,      # one replica sends each alert
+)
+```
+
+**`alert_min_interval_s`** limits each probe to one alert per interval. The first change after a quiet interval alerts immediately. Changes within the interval are coalesced; when it ends, the probe's latest status is sent if it differs from the last status alerters received. The final state is never lost (it is sent even if the probe is not checked again), and a flap that ends where it started (`healthy -> unhealthy -> healthy`) sends nothing.
+
+**`alert_dedupe_window_s`** stops every replica from sending the same alert. Before sending, a replica calls the storage backend's `claim_alert(key, ttl_seconds)` with key `"<probe>:<new_status>"`; only the replica that wins the claim sends, and the others treat the alert as sent. Set the window to roughly how far apart replicas notice the same change (about one poll interval): the same probe moving to the same status again within the window is not re-sent by anyone. If the claim fails or exceeds `storage_timeout`, the replica sends anyway, since a duplicate alert is better than none. With a backend that lacks `claim_alert` (including the default in-process storage), a warning is logged at startup and alerts are not deduplicated.
+
+`on_state_change` callbacks and `/health/alerts` records are unaffected by both settings and still see every transition.
+
 ### `SlackAlerter`
 
 Posts a formatted message to a Slack Incoming Webhook.
@@ -1627,11 +1664,16 @@ The endpoint is subject to the same `auth` as all other health endpoints.
 | `poll_interval_ms` | `int \| None` | `60000` | Re-run interval (ms) while SSE clients are connected. `0`/`None` = on-demand. Min `1000`. |
 | `logger` | `logging.Logger \| None` | `None` | Logger for warnings and probe exceptions |
 | `grace_period_ms` | `int` | `0` | Hold `/ready` as "starting" for this many ms after startup |
-| `history_size` | `int` | `120` | Max results per probe |
+| `history_size` | `int` | `120` | Max results per probe. With a custom `storage`, applied through its `configure()` when passed (as are the next three) |
 | `result_ttl_seconds` | `float` | `7200.0` | How long results are retained |
 | `alert_ttl_seconds` | `float` | `259200.0` | How long alert records are retained |
 | `max_alerts` | `int` | `120` | Hard cap on stored alerts |
-| `storage` | `ProbeStorage \| None` | `None` | Storage backend; in-memory when `None`. See [Custom storage backends](#custom-storage-backends) |
+| `storage` | `ProbeStorage \| None` | `None` | Storage backend; in-memory when `None`. See [Custom storage backends](#custom-storage-backends). Retention arguments you pass are applied through its `configure()`; without one, a warning names the ignored arguments |
+| `storage_timeout` | `float \| None` | `2.0` | Keyword-only. Seconds each storage call may take. Failures and timeouts are logged and never fail a health check; `None` disables the limit |
+| `max_stream_connections` | `int \| None` | `100` | Keyword-only. Most SSE streams open at once; more get `503` with `Retry-After`. `None` = unlimited |
+| `alert_min_interval_s` | `float` | `0.0` | Keyword-only. At most one alert per probe per this many seconds; changes in between are coalesced and the latest status is sent when the interval ends. `0` = off |
+| `alert_dedupe_window_s` | `float \| None` | `None` | Keyword-only. With a shared storage that implements `claim_alert()`, only one replica sends each alert within this window. `None` = off |
+| `stream_token_secret` | `str \| bytes \| None` | `None` | Keyword-only. Key that signs dashboard stream tokens. Default: derived from `auth` credentials (scrypt), or per-process random for a callable `auth` |
 | `probe_timeout` | `float \| None` | `30.0` | Seconds before a probe without its own `timeout` is reported UNHEALTHY. `None` disables the default |
 | `metrics_prefix` | `str` | `""` | Prepended to every `/metrics` name. The default `probe_*` names collide with blackbox_exporter's; `"fastapi_watch_"` namespaces them |
 | `timezone` | `str` | `"UTC"` | IANA timezone for `checked_at` timestamps |
@@ -1642,7 +1684,7 @@ The endpoint is subject to the same `auth` as all other health endpoints.
 | `circuit_breaker_threshold` | `int` | `5` | Consecutive failures before circuit opens |
 | `circuit_breaker_cooldown_ms` | `int` | `600000` | Cooldown before probe is retried (10 min) |
 | `webhook_url` | `str \| None` | `None` | Legacy — wraps into `WebhookAlerter` |
-| `auth` | `dict \| Callable \| None` | `None` | Authentication for all health endpoints. `None` logs a warning — endpoints are publicly accessible. A callable must return exactly `True` to grant access; `None`, `0`, `""`, or any other truthy value is denied. |
+| `auth` | `dict \| Callable \| None` | `None` | Authentication for all health endpoints. `None` logs a warning — endpoints are publicly accessible. A callable must return exactly `True` to grant access; `None`, `0`, `""`, or any other truthy value is denied. An empty or whitespace `key`, `username` or `password` raises `ValueError`. |
 | `startup_probes` | `list[BaseProbe] \| None` | `None` | Probes required for `/health/startup` to pass |
 | `alerters` | `list[BaseAlerter] \| None` | `None` | Alerters to fire on state changes |
 
@@ -1712,9 +1754,11 @@ registry = HealthRegistry(app, auth=my_auth)
 
 The auth callable **must return exactly `True`** (the boolean). Returning `None`, `0`, `""`, or any other truthy value is treated as denial and returns `403`. This prevents accidental access grants from callables that return a user object or empty string on failure.
 
-Comparison of static credentials uses `secrets.compare_digest` to prevent timing attacks.
+Comparison of static credentials uses `secrets.compare_digest` to prevent timing attacks. An empty or whitespace-only `key`, `username` or `password` raises `ValueError` at startup (an empty API key would otherwise match a request that simply omits the header).
 
-**Dashboard live updates under auth.** A browser `EventSource` cannot send headers, so the authenticated dashboard page embeds a short-lived signed token (`?token=…`, valid 5 minutes, checked when the stream connects) in its stream URL. `/health/status/stream` and `/health/ready/stream` accept either that token or normal credentials; no other endpoint accepts it, and the credentials themselves never appear in the page. For `basic` and `apikey` auth the signing key is derived from the configured credentials, so tokens work across worker processes and replicas. A callable `auth` has no shared secret, so its tokens only validate on the process that issued them — with several workers behind a load balancer, prefer `basic`/`apikey` or route the dashboard with session affinity. If a reconnect is refused after the token expires, the page reloads itself to get a fresh one.
+**Dashboard live updates under auth.** A browser `EventSource` cannot send headers, so the authenticated dashboard page embeds a short-lived signed token (`?token=…`, valid 5 minutes, checked when the stream connects) in its stream URL. `/health/status/stream` and `/health/ready/stream` accept either that token or normal credentials; no other endpoint accepts it, and the credentials themselves never appear in the page. For `basic` and `apikey` auth the signing key is derived from the configured credentials with scrypt (once, at startup), so tokens work across worker processes and replicas, and a token that turns up in an access log is expensive to use for guessing the credentials. A callable `auth` has no shared secret, so by default its tokens only validate on the process that issued them. With several workers behind a load balancer, pass the same `stream_token_secret=` to every one of them (recommended), use `basic`/`apikey`, or route the dashboard with session affinity. `stream_token_secret` also replaces the credential-derived key for `basic`/`apikey`.
+
+A stream authorized by a token closes when the token expires; the reconnect is refused and the page reloads itself to get a fresh token. Streams authorized by headers or credentials are not time-limited.
 
 ### Response fields and information disclosure
 

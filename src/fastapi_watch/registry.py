@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import fnmatch
+import functools
 import hashlib
 import hmac
 import inspect
@@ -12,6 +13,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, AsyncGenerator, Awaitable, Callable, Iterator
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
@@ -33,6 +35,14 @@ class _MaintenanceRequest(BaseModel):
     minutes: float | None = Field(None, gt=0, le=525600)  # max 1 year
     until: datetime | None = None
 
+class _DefaultInt(int):
+    """An ``int`` parameter default, distinguishable from the same value passed explicitly."""
+
+
+class _DefaultFloat(float):
+    """A ``float`` parameter default, distinguishable from the same value passed explicitly."""
+
+
 _MIN_POLL_INTERVAL_MS = 1000
 _AUTO_HTTP_METHODS = frozenset({"HEAD", "OPTIONS"})
 # Used when the caller passed no logger= but an error must still be reported.
@@ -41,6 +51,30 @@ _LIB_LOGGER = logging.getLogger("fastapi_watch")
 # browsers in single-fetch mode.
 _SSE_KEEPALIVE_S = 15.0
 _SINGLE_FETCH_RETRY_MS = 30_000
+# Storage: returned by _storage_call when an operation fails or times out; a
+# failing operation is logged at most once per interval; stored data of
+# probes no longer registered is pruned at most this often.
+_STORAGE_FAILED: Any = object()
+_STORAGE_LOG_INTERVAL_S = 60.0
+_PRUNE_INTERVAL_S = 600.0
+# Shutdown: how long each probe's aclose() may take.
+_ACLOSE_TIMEOUT_S = 5.0
+# Retry-After (seconds) sent when max_stream_connections streams are open.
+_STREAM_RETRY_AFTER_S = 30
+
+
+class _SlotStreamingResponse(StreamingResponse):
+    """A StreamingResponse that calls *release* once it has finished, however it ends."""
+
+    def __init__(self, content, *, release: Callable[[], None], **kwargs) -> None:
+        super().__init__(content, **kwargs)
+        self._release = release
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._release()
 
 
 def _iter_app_routes(routes, prefix: str = "") -> Iterator[tuple[Any, str]]:
@@ -156,18 +190,42 @@ def _endpoint_keys(route) -> set:
 _STREAM_TOKEN_TTL_S = 300
 
 
-def _stream_token_key(auth: dict | Callable) -> bytes:
+_STREAM_TOKEN_SALT = b"fastapi-watch/stream-token"
+
+
+@functools.lru_cache(maxsize=8)
+def _derive_stream_token_key(material: bytes) -> bytes:
+    """Stretch credentials into a token-signing key (cached: scrypt costs ~50 ms).
+
+    Tokens appear in URLs and so in access logs; with a fast hash, one logged
+    token would let an attacker test password guesses offline at billions per
+    second.  scrypt makes each guess cost what it costs here.  PBKDF2 stands in
+    on the rare Python builds whose OpenSSL lacks scrypt.
+    """
+    scrypt = getattr(hashlib, "scrypt", None)
+    if scrypt is not None:
+        return scrypt(material, salt=_STREAM_TOKEN_SALT, n=2**14, r=8, p=1, dklen=32)
+    return hashlib.pbkdf2_hmac("sha256", material, _STREAM_TOKEN_SALT, 600_000)
+
+
+def _stream_token_key(auth: dict | Callable, secret: str | bytes | None = None) -> bytes:
     """Return the key that signs dashboard stream tokens.
 
-    Derived from the configured credentials, so every worker process and replica
-    sharing them accepts each other's tokens (the stream request may land on a
-    different worker than the page did).  A callable *auth* has no shared secret,
-    so it gets a per-process random key: tokens then only validate on the worker
-    that issued them.
+    An explicit *secret* (``stream_token_secret=``) is used as-is.  Otherwise
+    the key is derived from the configured credentials, so every worker process
+    and replica sharing them accepts each other's tokens (the stream request may
+    land on a different worker than the page did).  A callable *auth* has no
+    shared secret, so without *secret* it gets a per-process random key: tokens
+    then only validate on the worker that issued them.
     """
+    if secret is not None:
+        return secret.encode() if isinstance(secret, str) else bytes(secret)
     if isinstance(auth, dict):
-        material = auth.get("key") or f"{auth.get('username')}:{auth.get('password')}"
-        return hashlib.sha256(b"fastapi-watch/stream-token\x00" + str(material).encode()).digest()
+        if auth.get("type") == "apikey":
+            material = f"apikey\x00{auth['key']}"
+        else:
+            material = f"basic\x00{auth['username']}\x00{auth['password']}"
+        return _derive_stream_token_key(material.encode())
     return secrets.token_bytes(32)
 
 
@@ -179,11 +237,18 @@ def _mint_stream_token(key: bytes) -> str:
 
 def _valid_stream_token(key: bytes, token: str) -> bool:
     """True if *token* was signed with *key* and has not expired."""
+    return _stream_token_expiry(key, token) is not None
+
+
+def _stream_token_expiry(key: bytes, token: str) -> int | None:
+    """Return the expiry (Unix time) of a valid, unexpired *token*, else ``None``."""
     expiry, _, signature = token.partition(".")
     if not expiry.isdigit():
-        return False
+        return None
     expected = hmac.new(key, expiry.encode(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(signature, expected) and int(expiry) >= time.time()
+    if hmac.compare_digest(signature, expected) and int(expiry) >= time.time():
+        return int(expiry)
+    return None
 
 
 def _takes_two_positional(fn: Callable) -> bool:
@@ -224,6 +289,82 @@ def _normalize_interval(ms: int | None) -> int | None:
     if ms is None or ms == 0:
         return None
     return max(ms, _MIN_POLL_INTERVAL_MS)
+
+
+def _validate_auth(auth) -> None:
+    """Raise ``ValueError`` for an *auth* dict with missing or blank credentials.
+
+    ``{"type": "apikey", "key": ""}`` would otherwise admit every request that
+    simply omits the header (an absent header compares equal to ``""``).
+    """
+    if auth is None or callable(auth):
+        return
+    if not isinstance(auth, dict):
+        raise ValueError(f"auth must be None, a callable, or a dict; got {type(auth)!r}")
+    required = {"apikey": ("key",), "basic": ("username", "password")}.get(auth.get("type"))
+    if required is None:
+        raise ValueError(f"Unknown auth type {auth.get('type')!r}. Supported: 'basic', 'apikey'.")
+    for field in required:
+        value = auth.get(field)
+        # The value itself is never echoed: it may be a real credential.
+        if not isinstance(value, str):
+            raise ValueError(f"auth {field!r} must be a non-empty string, got {type(value).__name__}")
+        if not value.strip():
+            raise ValueError(f"auth {field!r} must not be empty or whitespace")
+
+
+def _origin_matches(origin: str, hosts: list[str]) -> bool:
+    """True if *origin* (``scheme://host[:port]``) names one of *hosts* (``host[:port]``).
+
+    A missing port means the scheme's default on both sides, so a TLS-terminating
+    proxy that forwards ``Host: example.com`` still matches ``https://example.com``.
+    """
+    try:
+        parts = urlsplit(origin)
+        origin_port = parts.port
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return False  # includes the opaque "null" origin
+    default_port = 443 if parts.scheme == "https" else 80
+    wanted = (parts.hostname.lower(), origin_port or default_port)
+    for host in hosts:
+        try:
+            candidate = urlsplit(f"//{host.strip()}")
+            candidate_port = candidate.port
+        except ValueError:
+            continue
+        if candidate.hostname and (candidate.hostname.lower(), candidate_port or default_port) == wanted:
+            return True
+    return False
+
+
+async def _reject_cross_site(request: Request) -> None:
+    """Dependency for state-changing routes: refuse browser cross-site requests.
+
+    Basic credentials are cached by the browser and sent with any request to
+    the site, so without this a page elsewhere could ``<form method=post>`` to
+    ``/health/maintenance`` and switch on indefinite maintenance.  Refused with
+    403: ``Sec-Fetch-Site: cross-site``, or an ``Origin`` that does not match
+    the request's ``Host`` (or ``X-Forwarded-Host``).  A non-empty body that is
+    not ``application/json`` is refused with 415, which also rules out every
+    body a form or no-cors fetch can send.  Requests from non-browser clients
+    (curl, scripts) carry neither header and are unaffected.
+    """
+    if request.headers.get("sec-fetch-site", "").lower() == "cross-site":
+        raise HTTPException(status_code=403, detail="cross-site request refused")
+    origin = request.headers.get("origin")
+    if origin is not None:
+        hosts = [request.headers.get("host", "")]
+        forwarded = request.headers.get("x-forwarded-host")
+        if forwarded:
+            hosts.append(forwarded.split(",")[0])
+        if not _origin_matches(origin, hosts):
+            raise HTTPException(status_code=403, detail="cross-origin request refused")
+    if await request.body():
+        media_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+        if media_type != "application/json":
+            raise HTTPException(status_code=415, detail="request body must be application/json")
 
 
 def _make_auth_checker(auth) -> Callable | None:
@@ -323,6 +464,11 @@ class HealthRegistry:
             for this many ms, measured from when the registry is created
             (affects ``/health/ready`` only).
         history_size: Number of past results kept per probe (default 120).
+            With a custom *storage*, this and the other retention arguments
+            (*result_ttl_seconds*, *alert_ttl_seconds*, *max_alerts*) are
+            applied through the backend's ``configure()`` when passed
+            explicitly; a backend without ``configure()`` keeps its own limits
+            and a warning names the ignored arguments.
         groups: :class:`~fastapi_watch.ProbeGroup` instances to merge at startup.
         dashboard: ``True`` (default) — built-in HTML dashboard.  ``False`` — omit the
             route.  Callable ``(report: HealthReport) -> str`` — custom renderer;
@@ -369,6 +515,36 @@ class HealthRegistry:
             (default ``""``, keeping ``probe_healthy`` etc.).  Those names
             collide with blackbox_exporter's ``probe_*`` metrics; set e.g.
             ``"fastapi_watch_"`` to namespace them.
+        storage_timeout: Seconds each storage operation may take (keyword-only,
+            default ``2.0``; ``None`` disables).  A storage operation that
+            fails or times out is logged (at most once a minute per operation)
+            and never fails a health check: ``/ready``, ``/status``,
+            ``/metrics`` and the streams are served from this process's last
+            results, ``/history`` and ``/alerts`` return 503, and the
+            dashboard renders without history.
+        max_stream_connections: Most SSE stream connections open at once
+            (keyword-only, default ``100``; ``None`` = unlimited).  Further
+            stream requests get ``503`` with a ``Retry-After`` header.
+        alert_min_interval_s: Flap limiting (keyword-only, default ``0`` = off).
+            At most one alert per probe is sent to alerters per this many
+            seconds.  The first change after a quiet interval alerts at once;
+            later changes inside the interval are coalesced, and when it ends
+            the probe's latest status is sent if it differs from the last one
+            sent — so the final state is never lost, and a flap that ends
+            where it started sends nothing.  Callbacks and stored alert
+            records still see every transition.
+        alert_dedupe_window_s: Cross-replica alert dedupe (keyword-only,
+            default ``None`` = off).  With a shared storage backend that
+            implements ``claim_alert(key, ttl_seconds)``, replicas claim each
+            ``"<probe>:<new_status>"`` alert for this many seconds and only
+            the winner sends it.  A failing claim sends anyway.  Without
+            ``claim_alert`` a warning is logged at init and alerts are not
+            deduplicated.
+        stream_token_secret: Key that signs the dashboard's short-lived stream
+            tokens (keyword-only).  By default the key is derived from the
+            *auth* credentials with scrypt, or is random per process for a
+            callable *auth*; pass the same secret to every worker and replica to
+            make a callable *auth*'s tokens valid across all of them.
 
     Example::
 
@@ -390,7 +566,7 @@ class HealthRegistry:
         poll_interval_ms: int | None = 60_000,
         logger: logging.Logger | None = None,
         grace_period_ms: int = 0,
-        history_size: int = 120,
+        history_size: int = _DefaultInt(120),
         timezone: str = "UTC",
         groups: list[ProbeGroup] | None = None,
         dashboard: bool | Callable[..., str] | str | Path = True,
@@ -402,15 +578,32 @@ class HealthRegistry:
         alerters: list[BaseAlerter] | None = None,
         auth: dict | Callable | None = None,
         startup_probes: list[BaseProbe] | None = None,
-        result_ttl_seconds: float = 7200.0,
-        alert_ttl_seconds: float = 259200.0,
-        max_alerts: int = 120,
+        result_ttl_seconds: float = _DefaultFloat(7200.0),
+        alert_ttl_seconds: float = _DefaultFloat(259200.0),
+        max_alerts: int = _DefaultInt(120),
         storage: ProbeStorage | None = None,
         probe_timeout: float | None = 30.0,
         metrics_prefix: str = "",
+        *,
+        stream_token_secret: str | bytes | None = None,
+        storage_timeout: float | None = 2.0,
+        max_stream_connections: int | None = 100,
+        alert_min_interval_s: float = 0.0,
+        alert_dedupe_window_s: float | None = None,
     ) -> None:
         if probe_timeout is not None and probe_timeout <= 0:
             raise ValueError(f"probe_timeout must be positive or None, got {probe_timeout!r}")
+        if storage_timeout is not None and storage_timeout <= 0:
+            raise ValueError(f"storage_timeout must be positive or None, got {storage_timeout!r}")
+        if max_stream_connections is not None and max_stream_connections < 1:
+            raise ValueError(f"max_stream_connections must be at least 1 or None, got {max_stream_connections!r}")
+        if alert_min_interval_s < 0:
+            raise ValueError(f"alert_min_interval_s must be zero or positive, got {alert_min_interval_s!r}")
+        if alert_dedupe_window_s is not None and alert_dedupe_window_s <= 0:
+            raise ValueError(f"alert_dedupe_window_s must be positive or None, got {alert_dedupe_window_s!r}")
+        _validate_auth(auth)
+        if stream_token_secret is not None and not stream_token_secret:
+            raise ValueError("stream_token_secret must not be empty")
         self.app = app
         self.prefix = prefix
         self._logger = logger
@@ -420,22 +613,41 @@ class HealthRegistry:
         self._timezone_name: str = timezone
         self._tzinfo: ZoneInfo = ZoneInfo(timezone)
         self._start_time: datetime = datetime.now(self._tzinfo)
-        self._history_size: int = max(1, history_size)
-        self._storage: ProbeStorage = storage or InMemoryProbeStorage(
-            max_results=self._history_size,
-            result_ttl_seconds=result_ttl_seconds,
-            alert_ttl_seconds=alert_ttl_seconds,
-            max_alerts=max(1, max_alerts),
-        )
+        self._history_size: int = int(max(1, history_size))
+        retention = {
+            "max_results": self._history_size,
+            "result_ttl_seconds": float(result_ttl_seconds),
+            "alert_ttl_seconds": float(alert_ttl_seconds),
+            "max_alerts": int(max(1, max_alerts)),
+        }
+        self._storage_timeout = storage_timeout
+        # op name -> (monotonic time last logged, failures suppressed since)
+        self._storage_failures: dict[str, tuple[float, int]] = {}
+        if storage is None:
+            self._storage: ProbeStorage = InMemoryProbeStorage(**retention)
+        else:
+            self._storage = storage
+            self._configure_storage(retention, {
+                "history_size": history_size,
+                "result_ttl_seconds": result_ttl_seconds,
+                "alert_ttl_seconds": alert_ttl_seconds,
+                "max_alerts": max_alerts,
+            })
         self._probes: list[tuple[BaseProbe, bool]] = []
         self._poll_interval_ms: int | None = self._set_interval(poll_interval_ms)
 
         # Per-probe scheduling
         self._probe_last_run: dict[str, float] = {}
         self._last_checked_at: datetime | None = None
-        self._cache_lock = asyncio.Lock()
+        # Last result per probe, as checked by this process.  Health endpoints
+        # are served from here, so they reflect this process's own checks and
+        # keep working while storage is slow or down.  One entry per probe name.
+        self._last_results: dict[str, ProbeResult] = {}
         # id(probe) -> its in-flight run, shared by concurrent callers
         self._inflight: dict[int, asyncio.Task] = {}
+        # Storage pruning of probes no longer registered (monotonic time of the last one)
+        self._last_prune: float | None = None
+        self._prune_task: asyncio.Task | None = None
 
         # Circuit breaker state
         self._circuit_breaker_enabled: bool = circuit_breaker
@@ -454,8 +666,11 @@ class HealthRegistry:
         if webhook_url:
             self._alerters.append(WebhookAlerter(url=webhook_url))
 
-        # Auth
+        # Auth.  The stream-token key is derived once, here: scrypt is slow by design.
         self._auth = auth
+        self._stream_token_key: bytes | None = (
+            _stream_token_key(auth, stream_token_secret) if auth is not None and serve_routes else None
+        )
 
         # Startup
         self._started: bool = False
@@ -463,18 +678,43 @@ class HealthRegistry:
 
         # State-change callbacks and streaming
         self._probe_states: dict[str, ProbeStatus] = {}
+        # Last status handed to the alerters, per probe.  Differs from
+        # _probe_states after maintenance, which suppresses alerters only.
+        self._alerted_states: dict[str, ProbeStatus] = {}
         self._state_change_callbacks: list[
             Callable[[str, ProbeStatus, ProbeStatus], None | Awaitable[None]]
         ] = []
         self._poll_task: asyncio.Task | None = None
         self._active_connections: int = 0
+        # Open SSE responses, counted from the request (not the generator start).
+        self._max_stream_connections: int | None = max_stream_connections
+        self._stream_slots: int = 0
         self._shutting_down: bool = False
         self._sse_tasks: set[asyncio.Task] = set()
         self._signal_handler_installed: bool = False
 
-        # Bounded alert queue — avoids unbounded create_task() per state-change
-        self._alert_queue: asyncio.Queue[AlertRecord] = asyncio.Queue(maxsize=256)
+        # Bounded alert queue — avoids unbounded create_task() per state-change.
+        # A None item only wakes the worker to re-check coalesced alerts.
+        self._alert_queue: asyncio.Queue[AlertRecord | None] = asyncio.Queue(maxsize=256)
         self._alert_worker: asyncio.Task | None = None
+
+        # Flap limiting: monotonic time of each probe's last alert, and the
+        # time a coalesced alert falls due (one marker per probe at most).
+        self._alert_min_interval_s: float = float(alert_min_interval_s)
+        self._alert_last_sent_at: dict[str, float] = {}
+        self._alert_pending: dict[str, float] = {}
+
+        # Cross-replica dedupe through the storage's optional claim_alert().
+        self._alert_dedupe_window_s: float | None = alert_dedupe_window_s
+        if alert_dedupe_window_s is not None and (
+            storage is None or not callable(getattr(self._storage, "claim_alert", None))
+        ):
+            (self._logger or _LIB_LOGGER).warning(
+                "fastapi-watch: alert_dedupe_window_s needs a shared storage backend that implements "
+                "claim_alert(); %s does not, so every replica sends its own alerts.",
+                "the default in-process storage" if storage is None else type(self._storage).__name__,
+            )
+            self._alert_dedupe_window_s = None
 
         if serve_routes:
             self._register_routes(tags or ["health"], dashboard=dashboard)
@@ -491,6 +731,31 @@ class HealthRegistry:
                 "set_maintenance()/clear_maintenance() or pass auth= to HealthRegistry.",
                 prefix,
             )
+
+    def _configure_storage(self, retention: dict, passed: dict) -> None:
+        """Apply explicitly passed retention arguments to a caller-supplied *storage*.
+
+        Without this, ``HealthRegistry(storage=s, history_size=5)`` silently
+        kept the backend's own limits.  A backend with ``configure()`` gets all
+        four effective values; one without it keeps its settings, and the
+        ignored arguments are named in a warning.  Nothing happens when no
+        retention argument was passed, so a backend configured in its own
+        constructor is left alone.
+        """
+        explicit = [name for name, value in passed.items() if not isinstance(value, (_DefaultInt, _DefaultFloat))]
+        if not explicit:
+            return
+        configure = getattr(self._storage, "configure", None)
+        if callable(configure):
+            configure(**retention)
+            return
+        (self._logger or _LIB_LOGGER).warning(
+            "fastapi-watch: %s has no configure() method, so %s %s ignored; set retention "
+            "on the storage backend itself.",
+            type(self._storage).__name__,
+            ", ".join(explicit),
+            "is" if len(explicit) == 1 else "are",
+        )
 
     # ------------------------------------------------------------------
     # Public API — probe registration
@@ -926,7 +1191,11 @@ class HealthRegistry:
         """
         self._poll_interval_ms = self._set_interval(ms)
         if self._poll_interval_ms is None:
-            self._storage.clear_latest()
+            self._last_results.clear()
+            try:
+                self._storage.clear_latest()
+            except Exception as exc:
+                self._log_storage_failure("clear_latest", exc)
             if not self._has_custom_intervals():
                 self._cancel_poll_task()
         elif self._active_connections > 0:
@@ -994,24 +1263,72 @@ class HealthRegistry:
         return task
 
     async def _run_probe(self, probe: BaseProbe, critical: bool) -> ProbeResult:
-        """Check one probe, then record its result, history, and state change exactly once."""
-        result = await self._safe_check(probe, critical)
+        """Check one probe, then record its result, history, and state change exactly once.
+
+        The result is kept in-process first, so it is reported even when the
+        storage writes fail.  Those writes and the state-change handling run
+        concurrently: a slow backend delays the check by at most one
+        ``storage_timeout``, not one per write.
+        """
+        result, from_cache = await self._check_or_cached(probe, critical)
         checked_at = datetime.now(self._tzinfo)
-        updates: dict = {"checked_at": checked_at}
+        # A cached result served while the circuit is open keeps its own
+        # checked_at: stamping it "now" would make a stale result look fresh.
+        updates: dict = {} if from_cache else {"checked_at": checked_at}
         if getattr(probe, "description", None) is not None and result.description is None:
             updates["description"] = probe.description
         probe_tags = getattr(probe, "tags", None) or []
         if probe_tags and not result.tags:
             updates["tags"] = probe_tags
-        result = result.model_copy(update=updates)
-        run_time = asyncio.get_running_loop().time()
-        async with self._cache_lock:
-            await self._storage.set_latest(result)
-            self._probe_last_run[result.name] = run_time
+        if updates:
+            result = result.model_copy(update=updates)
+        self._last_results[probe.name] = result
+        self._probe_last_run[probe.name] = asyncio.get_running_loop().time()
+        if not from_cache:
             self._last_checked_at = checked_at
-        await self._storage.append_history(result)
-        await self._fire_state_changes([result])
+        await asyncio.gather(
+            self._storage_call("set_latest", result),
+            self._storage_call("append_history", result),
+            self._fire_state_changes([result]),
+        )
         return result
+
+    async def _storage_call(self, op: str, *args: Any) -> Any:
+        """Await ``storage.<op>(*args)``, bounded by ``storage_timeout``.
+
+        Returns the result, or ``_STORAGE_FAILED`` if the call raised or timed
+        out (after logging it, rate-limited).  Never raises an ``Exception``:
+        the monitoring store being down must not take health checks down.
+        The default in-memory backend cannot block, so it skips the timeout.
+        """
+        try:
+            awaitable = getattr(self._storage, op)(*args)
+            if self._storage_timeout is None or type(self._storage) is InMemoryProbeStorage:
+                return await awaitable
+            return await asyncio.wait_for(awaitable, self._storage_timeout)
+        except Exception as exc:
+            self._log_storage_failure(op, exc)
+            return _STORAGE_FAILED
+
+    def _log_storage_failure(self, op: str, exc: BaseException) -> None:
+        """Log a failed storage *op*, at most once per ``_STORAGE_LOG_INTERVAL_S``."""
+        now = time.monotonic()
+        last, suppressed = self._storage_failures.get(op, (None, 0))
+        if last is not None and now - last < _STORAGE_LOG_INTERVAL_S:
+            self._storage_failures[op] = (last, suppressed + 1)
+            return
+        self._storage_failures[op] = (now, 0)
+        timed_out = isinstance(exc, asyncio.TimeoutError) and self._storage_timeout is not None
+        reason = f"timed out after {self._storage_timeout:g} s" if timed_out else f"failed ({type(exc).__name__})"
+        (self._logger or _LIB_LOGGER).warning(
+            "fastapi-watch: storage %s %s%s; health checks continue from in-process results "
+            "(logged at most once per %g s per operation)",
+            op,
+            reason,
+            f", {suppressed} more failure(s) since the last report" if suppressed else "",
+            _STORAGE_LOG_INTERVAL_S,
+            exc_info=None if timed_out else exc,
+        )
 
     def _is_cb_active(self, probe: BaseProbe) -> bool:
         """Return True if the circuit breaker is active for this probe."""
@@ -1051,6 +1368,14 @@ class HealthRegistry:
 
     async def _safe_check(self, probe: BaseProbe, critical: bool) -> ProbeResult:
         """Run one probe with circuit-breaker and timeout handling."""
+        return (await self._check_or_cached(probe, critical))[0]
+
+    async def _check_or_cached(self, probe: BaseProbe, critical: bool) -> tuple[ProbeResult, bool]:
+        """Run one probe with circuit-breaker and timeout handling.
+
+        Returns ``(result, from_cache)``; *from_cache* is True when the circuit
+        is open and the probe's last result is served in place of a check.
+        """
         loop = asyncio.get_running_loop()
         cb_active = self._is_cb_active(probe)
 
@@ -1059,17 +1384,20 @@ class HealthRegistry:
             open_until = self._circuit_open_until.get(probe.name, 0.0)
             if loop.time() < open_until:
                 cb_info = self._cb_info(probe.name, True)
-                cached = await self._storage.get_latest(probe.name)
+                cached = self._last_results.get(probe.name)
+                if cached is None:
+                    stored = await self._storage_call("get_latest", probe.name)
+                    cached = None if stored is _STORAGE_FAILED else stored
                 if cached is not None:
                     details = {**(cached.details or {}), "circuit_breaker": cb_info}
-                    return cached.model_copy(update={"critical": critical, "details": details})
+                    return cached.model_copy(update={"critical": critical, "details": details}), True
                 return ProbeResult(
                     name=probe.name,
                     status=ProbeStatus.UNHEALTHY,
                     critical=critical,
                     error="circuit breaker open — probe temporarily suspended",
                     details={"circuit_breaker": cb_info},
-                )
+                ), False
 
         result = await self._guarded_check(probe, critical)
 
@@ -1111,7 +1439,7 @@ class HealthRegistry:
                 update={"details": {**(result.details or {}), "circuit_breaker": cb_info}}
             )
 
-        return result
+        return result, False
 
     # ------------------------------------------------------------------
     # Per-probe scheduling helpers
@@ -1158,23 +1486,68 @@ class HealthRegistry:
     # ------------------------------------------------------------------
 
     async def _get_results(self) -> list[ProbeResult]:
-        """Return current probe results.
+        """Return the current result of every registered probe, as checked by this process.
 
         Single-fetch probes always run fresh.  Polled probes run when their
-        interval has elapsed or their result is absent from cache.
+        interval has elapsed, when they have not yet run in this process, or
+        when no result is held for them.
+
+        Results come from the in-process copy of each probe's last result, not
+        from storage.  A shared backend (e.g. Redis) also holds other
+        replicas' and other apps' results — under the same probe names, for
+        replicas — and those must not decide this process's readiness.  It
+        also means no storage read per request, so a slow or unavailable
+        backend cannot slow or fail health checks.
         """
         self._ensure_background_polling()
-        cached = await self._storage.get_all_latest()
+        self._schedule_prune()
         now = asyncio.get_running_loop().time()
         to_run = [
             (p, c) for p, c in self._probes
             if self._effective_interval_s(p) is None
-            or p.name not in cached
-            or (p.name in self._probe_last_run and self._is_probe_due(p, now))
+            or p.name not in self._probe_last_run
+            or p.name not in self._last_results
+            or self._is_probe_due(p, now)
         ]
         if to_run:
             await self._execute_probes(to_run)
-        return list((await self._storage.get_all_latest()).values())
+        results: dict[str, ProbeResult] = {}
+        for p, _ in self._probes:
+            result = self._last_results.get(p.name)
+            if result is not None:
+                results.setdefault(p.name, result)
+        return list(results.values())
+
+    def _prune_due(self) -> bool:
+        return self._last_prune is None or time.monotonic() - self._last_prune >= _PRUNE_INTERVAL_S
+
+    def _schedule_prune(self) -> None:
+        """Start a background :meth:`_prune_storage` when one is due; never awaited by a request."""
+        if not self._prune_due() or self._shutting_down:
+            return
+        if self._prune_task is not None and not self._prune_task.done():
+            return
+        self._prune_task = asyncio.get_running_loop().create_task(self._prune_storage())
+
+    async def _prune_storage(self) -> None:
+        """Drop data of probes that are no longer registered, here and in storage.
+
+        Runs at most every ``_PRUNE_INTERVAL_S``: from the first health request
+        and from the poll loop.  Without it, a renamed or removed probe (e.g.
+        after ``discover_routes(refresh=True)`` or a deploy) would keep its
+        results and history in storage until their TTL, or forever with TTL 0.
+        Storage support is optional (``prune(keep)``).
+        """
+        self._last_prune = time.monotonic()
+        keep = {p.name for p, _ in self._probes}
+        for state in (
+            self._last_results, self._probe_last_run, self._probe_states,
+            self._alerted_states, self._alert_last_sent_at, self._alert_pending,
+        ):
+            for name in [n for n in state if n not in keep]:
+                del state[name]
+        if callable(getattr(self._storage, "prune", None)):
+            await self._storage_call("prune", keep)
 
     # ------------------------------------------------------------------
     # Polling loop
@@ -1297,6 +1670,38 @@ class HealthRegistry:
             except (asyncio.CancelledError, Exception):
                 pass
             self._alert_worker = None
+        if self._prune_task is not None and not self._prune_task.done():
+            self._prune_task.cancel()
+            try:
+                await self._prune_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._prune_task = None
+        await self._close_probes()
+
+    async def _close_probes(self) -> None:
+        """Await ``aclose()`` on every registered and startup probe that has one.
+
+        Lets probes stop what they run in the background (e.g. the event-loop
+        probe's sampler).  Closes run concurrently, each bounded by
+        ``_ACLOSE_TIMEOUT_S``; a failure is logged and does not stop the rest.
+        """
+        unique = {id(p): p for p in [*(p for p, _ in self._probes), *self._startup_probes]}
+        logger = self._logger or _LIB_LOGGER
+
+        async def _close(probe: BaseProbe) -> None:
+            try:
+                ret = probe.aclose()
+                if inspect.isawaitable(ret):
+                    await asyncio.wait_for(ret, _ACLOSE_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                logger.warning("fastapi-watch: probe %r aclose() timed out after %g s", probe.name, _ACLOSE_TIMEOUT_S)
+            except Exception:
+                logger.exception("fastapi-watch: probe %r aclose() failed", probe.name)
+
+        closers = [_close(p) for p in unique.values() if callable(getattr(p, "aclose", None))]
+        if closers:
+            await asyncio.gather(*closers)
 
     async def _poll_loop(self) -> None:
         """Background loop: run each probe when its interval elapses (1 s granularity).
@@ -1312,6 +1717,8 @@ class HealthRegistry:
                 due = [(p, c) for p, c in self._probes if self._is_probe_due(p, now)]
                 if due:
                     await self._execute_probes(due)
+                if self._prune_due():
+                    await self._prune_storage()
             except Exception:
                 (self._logger or _LIB_LOGGER).exception("fastapi-watch: poll iteration failed")
             await asyncio.sleep(1.0)
@@ -1332,6 +1739,27 @@ class HealthRegistry:
     # SSE (Server-Sent Events) streaming
     # ------------------------------------------------------------------
 
+    def _reserve_stream_slot(self) -> Callable[[], None] | None:
+        """Take one of ``max_stream_connections`` stream slots.
+
+        Returns a release function (safe to call more than once), or ``None``
+        when every slot is taken.  Each open stream wakes every 0.5 s, so an
+        uncapped count — reachable by anyone when *auth* is ``None`` — would
+        let clients load the app's event loop at will.
+        """
+        if self._max_stream_connections is not None and self._stream_slots >= self._max_stream_connections:
+            return None
+        self._stream_slots += 1
+        released = False
+
+        def _release() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                self._stream_slots -= 1
+
+        return _release
+
     def _stream_interval_s(self) -> float | None:
         """Seconds between stream events: the shortest effective probe interval.
 
@@ -1350,6 +1778,7 @@ class HealthRegistry:
         make_report: Callable[[list[ProbeResult]], str],
         filter_tags: frozenset[str] | None = None,
         filter_probes: frozenset[str] | None = None,
+        expires_at: float | None = None,
     ) -> AsyncGenerator[str, None]:
         """Async generator that yields SSE (Server-Sent Events) events while the client is connected.
 
@@ -1358,14 +1787,22 @@ class HealthRegistry:
         In single-fetch mode it sends one event with a ``retry:`` hint, so the
         browser waits ``_SINGLE_FETCH_RETRY_MS`` before reconnecting instead of
         its ~3 s default — each reconnect re-runs every probe.
+
+        *expires_at* (Unix time) ends the stream when the stream token that
+        authorized it expires; a token checked only at connect time would
+        otherwise grant access for as long as the connection stays open.
         """
         task = asyncio.current_task()
         if task is not None:
             self._sse_tasks.add(task)
         await self._on_connect()
         loop = asyncio.get_running_loop()
+
+        def _expired() -> bool:
+            return expires_at is not None and time.time() >= expires_at
+
         try:
-            while not self._shutting_down:
+            while not self._shutting_down and not _expired():
                 results = await self._get_results()
                 if filter_tags:
                     results = [r for r in results if filter_tags & set(r.tags)]
@@ -1381,7 +1818,7 @@ class HealthRegistry:
                 next_keepalive = loop.time() + _SSE_KEEPALIVE_S
                 while (now := loop.time()) < deadline:
                     await asyncio.sleep(min(0.5, deadline - now))
-                    if self._shutting_down or await request.is_disconnected():
+                    if self._shutting_down or _expired() or await request.is_disconnected():
                         return
                     if loop.time() >= next_keepalive:
                         yield ": keepalive\n\n"
@@ -1403,11 +1840,20 @@ class HealthRegistry:
         probe that is already failing at startup alerts (``healthy -> unhealthy``)
         instead of staying silent until it happens to recover and fail again.
         A first HEALTHY result is not a change and fires nothing.
+
+        Alerters are compared against the last status *they* were sent, not the
+        previous result: maintenance suppresses alerters but not state tracking,
+        so a dependency that failed during maintenance and stayed down would
+        otherwise never alert.  The first check after maintenance sends any
+        difference (``healthy -> unhealthy``); a failure that recovered within
+        the window sends nothing.  Callbacks and stored alert records still
+        follow real transitions only.
         """
         in_maintenance = self._in_maintenance()
         for result in results:
             old = self._probe_states.get(result.name, ProbeStatus.HEALTHY)
             self._probe_states[result.name] = result.status
+            alert_record: AlertRecord | None = None
             if old != result.status:
                 alert_record = AlertRecord(
                     probe=result.name,
@@ -1415,7 +1861,7 @@ class HealthRegistry:
                     new_status=result.status,
                     timestamp=datetime.now(self._tzinfo),
                 )
-                await self._storage.append_alert(alert_record)
+                await self._storage_call("append_alert", alert_record)
                 for cb in self._state_change_callbacks:
                     # User code: one broken callback must not fail the health check
                     # that triggered it, nor stop the callbacks and alerts after it.
@@ -1429,16 +1875,102 @@ class HealthRegistry:
                             getattr(cb, "__name__", cb),
                             result.name,
                         )
-                if self._alerters and not in_maintenance:
-                    self._ensure_alert_worker()
-                    try:
-                        self._alert_queue.put_nowait(alert_record)
-                    except asyncio.QueueFull:
-                        if self._logger:
-                            self._logger.warning(
-                                "Alert queue full, dropping alert for probe %r",
-                                alert_record.probe,
-                            )
+            if self._alerters and not in_maintenance:
+                self._send_to_alerters(result.name, result.status, alert_record)
+
+    def _send_to_alerters(
+        self, name: str, status: ProbeStatus, transition: AlertRecord | None, *, due: bool = False
+    ) -> None:
+        """Queue an alert if *status* differs from the status alerters last received.
+
+        *transition* is the record of a real state change, reused when it
+        starts from what alerters last saw; otherwise (catching up after
+        maintenance, or a coalesced change) a record from the last-sent status
+        is built.  The last-sent status advances only once the alert is
+        queued, so an alert dropped on a full queue is retried at the next check.
+
+        With ``alert_min_interval_s``, a change within that interval of the
+        probe's last alert is not queued: a pending marker is set instead, and
+        the alert worker sends the probe's then-current status when the
+        interval ends — if it still differs from the last one sent.  The first
+        alert after a quiet interval is never delayed.  *due* marks that send
+        (the interval has ended), skipping the rate check.
+        """
+        sent = self._alerted_states.get(name, ProbeStatus.HEALTHY)
+        if sent == status:
+            # Back where alerters last saw it: a flap that needs no alert.
+            self._alert_pending.pop(name, None)
+            return
+        now = time.monotonic()
+        if self._alert_min_interval_s > 0 and not due:
+            last = self._alert_last_sent_at.get(name)
+            if last is not None and now - last < self._alert_min_interval_s:
+                if name not in self._alert_pending:
+                    self._alert_pending[name] = last + self._alert_min_interval_s
+                    self._wake_alert_worker()
+                return
+        if transition is None or transition.old_status != sent:
+            transition = AlertRecord(
+                probe=name,
+                old_status=sent,
+                new_status=status,
+                timestamp=datetime.now(self._tzinfo),
+            )
+        self._ensure_alert_worker()
+        try:
+            self._alert_queue.put_nowait(transition)
+        except asyncio.QueueFull:
+            if self._logger:
+                self._logger.warning("Alert queue full, dropping alert for probe %r", transition.probe)
+            return
+        self._alerted_states[name] = status
+        self._alert_last_sent_at[name] = now
+        self._alert_pending.pop(name, None)
+
+    def _wake_alert_worker(self) -> None:
+        """Make the alert worker recompute when the next coalesced alert is due."""
+        self._ensure_alert_worker()
+        try:
+            self._alert_queue.put_nowait(None)
+        except asyncio.QueueFull:
+            pass  # the worker is busy and re-checks after each alert anyway
+
+    def _next_pending_alert_delay(self) -> float | None:
+        """Seconds until the next coalesced alert is due, or ``None`` if none is pending."""
+        if not self._alert_pending:
+            return None
+        return max(0.0, min(self._alert_pending.values()) - time.monotonic())
+
+    def _send_due_alerts(self) -> None:
+        """Send the current status of every probe whose coalescing interval has ended.
+
+        Pending markers that fall due during maintenance are dropped: the
+        first check after maintenance catches alerters up anyway.
+        """
+        if not self._alert_pending:
+            return
+        now = time.monotonic()
+        in_maintenance = self._in_maintenance()
+        for name, due in list(self._alert_pending.items()):
+            if due > now:
+                continue
+            del self._alert_pending[name]
+            status = self._probe_states.get(name)
+            if status is not None and self._alerters and not in_maintenance:
+                self._send_to_alerters(name, status, None, due=True)
+
+    async def _claim_alert(self, alert: AlertRecord) -> bool:
+        """True if this replica should send *alert* (always, without dedupe).
+
+        With ``alert_dedupe_window_s``, replicas sharing a storage backend race
+        to claim ``"<probe>:<new_status>"`` for that window and only the winner
+        sends.  A failing claim sends anyway: a duplicate alert beats none.
+        """
+        if self._alert_dedupe_window_s is None:
+            return True
+        key = f"{alert.probe}:{alert.new_status.value}"
+        claimed = await self._storage_call("claim_alert", key, self._alert_dedupe_window_s)
+        return claimed is _STORAGE_FAILED or bool(claimed)
 
     def _ensure_alert_worker(self) -> None:
         """Start the alert worker task if not already running."""
@@ -1451,20 +1983,32 @@ class HealthRegistry:
                 pass  # no running loop yet
 
     async def _alert_loop(self) -> None:
-        """Drain the alert queue, dispatching each alert to all registered alerters."""
+        """Drain the alert queue, dispatching each alert to all registered alerters.
+
+        Between alerts it also sends coalesced alerts (``alert_min_interval_s``)
+        as they fall due, waking for the earliest one.
+        """
         while True:
+            self._send_due_alerts()
+            delay = self._next_pending_alert_delay()
             try:
-                alert = await self._alert_queue.get()
+                if delay is None:
+                    alert = await self._alert_queue.get()
+                else:
+                    alert = await asyncio.wait_for(self._alert_queue.get(), delay)
+            except asyncio.TimeoutError:
+                continue  # a coalesced alert is due
             except asyncio.CancelledError:
                 return
             try:
-                await self._dispatch_alert(alert)
+                if alert is not None and await self._claim_alert(alert):
+                    await self._dispatch_alert(alert)
             except asyncio.CancelledError:
                 return
             except Exception:
                 # The worker must outlive any one bad alert, but not silently.
                 (self._logger or _LIB_LOGGER).exception(
-                    "Dispatching alert for probe %s failed", alert.probe
+                    "Dispatching alert for probe %s failed", getattr(alert, "probe", None)
                 )
             finally:
                 self._alert_queue.task_done()
@@ -1523,11 +2067,15 @@ class HealthRegistry:
         if auth_checker is not None:
             # A browser EventSource cannot send headers, so the authenticated
             # dashboard page hands its stream a short-lived signed token instead.
-            token_key = _stream_token_key(self._auth)
+            token_key = self._stream_token_key
 
             async def _stream_auth(request: Request) -> None:
                 token = request.query_params.get("token")
-                if token and _valid_stream_token(token_key, token):
+                expiry = _stream_token_expiry(token_key, token) if token else None
+                if expiry is not None:
+                    # A token-only stream ends when its token does, so the page
+                    # reconnects through a reload that mints a fresh one.
+                    request.state.stream_token_expiry = expiry
                     return
                 await auth_checker(request)
 
@@ -1541,6 +2089,36 @@ class HealthRegistry:
             ).model_dump_json()
 
         sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+        def _storage_unavailable() -> Response:
+            return JSONResponse({"error": "storage unavailable"}, status_code=503)
+
+        def _open_stream(request: Request, tag: str | None, probe: str | None) -> Response:
+            """Start an SSE response, or answer 503 once ``max_stream_connections`` are open.
+
+            The slot is taken here, before the generator starts, so a burst of
+            connections cannot all pass the check; it is released when the
+            response finishes, even if the generator never ran.
+            """
+            release = registry._reserve_stream_slot()
+            if release is None:
+                return JSONResponse(
+                    {"error": "too many stream connections"},
+                    status_code=503,
+                    headers={"Retry-After": str(_STREAM_RETRY_AFTER_S)},
+                )
+            return _SlotStreamingResponse(
+                registry._event_stream(
+                    request,
+                    _make_sse_report,
+                    filter_tags=_parse_csv_filter(tag),
+                    filter_probes=_parse_csv_filter(probe),
+                    expires_at=getattr(request.state, "stream_token_expiry", None),
+                ),
+                release=release,
+                media_type="text/event-stream",
+                headers=sse_headers,
+            )
 
         @self.app.get(
             f"{prefix}/live",
@@ -1622,11 +2200,16 @@ class HealthRegistry:
             f"{prefix}/history",
             tags=tags,
             summary="Probe result history",
-            description="Returns the last N results for each probe (oldest-first), within the result TTL window.",
+            description=(
+                "Returns the last N results for each probe (oldest-first), within the result TTL window. "
+                "503 when storage is unavailable."
+            ),
             dependencies=auth_deps,
         )
         async def probe_history() -> Response:
-            history = await registry._storage.get_history()
+            history = await registry._storage_call("get_history")
+            if history is _STORAGE_FAILED:
+                return _storage_unavailable()
             payload = {
                 name: [r.model_dump(mode="json") for r in entries]
                 for name, entries in history.items()
@@ -1637,11 +2220,16 @@ class HealthRegistry:
             f"{prefix}/alerts",
             tags=tags,
             summary="Alert history",
-            description="Returns probe state-change alerts retained within the alert TTL window (default 72 hours).",
+            description=(
+                "Returns probe state-change alerts retained within the alert TTL window (default 72 hours). "
+                "503 when storage is unavailable."
+            ),
             dependencies=auth_deps,
         )
         async def alert_history() -> Response:
-            alerts = await registry._storage.get_alerts()
+            alerts = await registry._storage_call("get_alerts")
+            if alerts is _STORAGE_FAILED:
+                return _storage_unavailable()
             return JSONResponse({"alerts": [a.model_dump(mode="json") for a in alerts]})
 
         @self.app.get(
@@ -1703,17 +2291,8 @@ class HealthRegistry:
             request: Request,
             tag: str | None = Query(default=None),
             probe: str | None = Query(default=None),
-        ) -> StreamingResponse:
-            return StreamingResponse(
-                registry._event_stream(
-                    request,
-                    _make_sse_report,
-                    filter_tags=_parse_csv_filter(tag),
-                    filter_probes=_parse_csv_filter(probe),
-                ),
-                media_type="text/event-stream",
-                headers=sse_headers,
-            )
+        ) -> Response:
+            return _open_stream(request, tag, probe)
 
         @self.app.get(
             f"{prefix}/status/stream",
@@ -1726,17 +2305,8 @@ class HealthRegistry:
             request: Request,
             tag: str | None = Query(default=None),
             probe: str | None = Query(default=None),
-        ) -> StreamingResponse:
-            return StreamingResponse(
-                registry._event_stream(
-                    request,
-                    _make_sse_report,
-                    filter_tags=_parse_csv_filter(tag),
-                    filter_probes=_parse_csv_filter(probe),
-                ),
-                media_type="text/event-stream",
-                headers=sse_headers,
-            )
+        ) -> Response:
+            return _open_stream(request, tag, probe)
 
         @self.app.get(
             f"{prefix}/metrics",
@@ -1774,7 +2344,9 @@ class HealthRegistry:
         # State-changing routes are mounted only behind auth: an open POST would
         # let anyone pin /ready at 200 and silence alerts.  set_maintenance() and
         # clear_maintenance() remain available to the application either way.
+        # The cross-site check runs first, before credentials are even looked at.
         if auth_checker is not None:
+            change_deps = [Depends(_reject_cross_site), *auth_deps]
 
             @self.app.post(
                 f"{prefix}/maintenance",
@@ -1785,8 +2357,9 @@ class HealthRegistry:
                     "``{\"until\": \"<ISO datetime>\"}``."
                     " Omit body (or send ``{}``) for indefinite maintenance."
                     " A naive ``until`` is read in the registry timezone; a past one is rejected with 422."
+                    " A body must be ``application/json`` (415 otherwise); browser cross-site requests get 403."
                 ),
-                dependencies=auth_deps,
+                dependencies=change_deps,
             )
             async def enable_maintenance(body: _MaintenanceRequest = Body(default=_MaintenanceRequest())) -> Response:
                 now = datetime.now(registry._tzinfo)
@@ -1810,8 +2383,8 @@ class HealthRegistry:
                 f"{prefix}/maintenance",
                 tags=tags,
                 summary="Disable maintenance mode",
-                description="Clears maintenance mode immediately.",
-                dependencies=auth_deps,
+                description="Clears maintenance mode immediately. Browser cross-site requests get 403.",
+                dependencies=change_deps,
             )
             async def disable_maintenance() -> Response:
                 registry.clear_maintenance()
@@ -1867,5 +2440,7 @@ class HealthRegistry:
                     checked_at=registry._last_checked_at,
                     timezone=registry._timezone_name,
                 )
-                history = await registry._storage.get_history() if builtin_dashboard else None
+                history = await registry._storage_call("get_history") if builtin_dashboard else None
+                if history is _STORAGE_FAILED:
+                    history = {}  # the page still renders, from live results only
                 return HTMLResponse(content=_renderer(report, registry._in_maintenance(), request, history))
