@@ -1,12 +1,13 @@
 import asyncio
 import base64
+import fnmatch
 import logging
 import re
 import secrets
 import signal as _signal
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import AsyncGenerator, Awaitable, Callable
+from typing import Any, AsyncGenerator, Awaitable, Callable, Iterator
 from zoneinfo import ZoneInfo
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
@@ -32,18 +33,18 @@ _AUTO_HTTP_METHODS = frozenset({"HEAD", "OPTIONS"})
 _LIB_LOGGER = logging.getLogger("fastapi_watch")
 
 
-def _iter_app_routes(routes, prefix: str = ""):
-    """Yield concrete route objects from app.routes, recursing into router containers.
+def _iter_app_routes(routes, prefix: str = "") -> Iterator[tuple[Any, str]]:
+    """Yield ``(route, prefix)`` for every concrete route, recursing into router containers.
 
     Handles both the flat layout (FastAPI <0.137) where include_router copies routes
     with their full paths into app.routes, and the nested layout (FastAPI 0.137+) where
     _IncludedRouter wrapper objects are stored instead.  Routes inside _IncludedRouter
-    retain their short path (without the prefix); callers that need the full effective
-    path should use _effective_path(route, prefix) with the prefix accumulated here.
+    retain their short path (without the prefix), so *prefix* is the accumulated
+    include prefix; ``_effective_path(route, prefix)`` gives the path a client requests.
     """
     for item in routes:
         if hasattr(item, "path"):
-            yield item
+            yield item, prefix
             continue
 
         # FastAPI 0.137+: _IncludedRouter stores prefix in include_context.prefix.
@@ -101,33 +102,57 @@ def _invalidate_included_router_caches(routes) -> None:
             item._effective_candidates_version = None
 
 
-def _route_description(route, APIWebSocketRoute) -> str:
-    """Return a human-readable route label: ``'GET /items/{id}'`` or ``'WS /ws/chat'``."""
-    if APIWebSocketRoute is not None and isinstance(route, APIWebSocketRoute):
-        return f"WS {route.path}"
+def _route_description(route, path: str, is_websocket: bool) -> str:
+    """Return a human-readable route label: ``'GET /items/{id}'`` or ``'WS /ws/chat'``.
+
+    *path* is the full effective path, not ``route.path``, which lacks the
+    include prefix on FastAPI 0.137+.
+    """
+    if is_websocket:
+        return f"WS {path}"
     all_methods = set(getattr(route, "methods", None) or set())
     meaningful = sorted(all_methods - _AUTO_HTTP_METHODS) or sorted(all_methods)
-    return f"{' '.join(meaningful)} {route.path}"
+    return f"{' '.join(meaningful)} {path}"
 
 
-def _parse_tag_filter(tag: str | None) -> frozenset[str] | None:
-    """Parse a comma-separated tag query param into a frozenset, or None for no filter.
+def _name_slug(text: str) -> str:
+    """Collapse characters a probe name may not contain (and ``:``) into ``_``.
 
-    Treats empty strings, whitespace-only values, and None identically — all mean no filter.
+    ``':'`` is excluded because it separates a handler name from its route
+    qualifier (``list_items:GET_users``).
     """
-    if not tag:
-        return None
-    parts = tag.split(",")[:50]
-    tags = frozenset(t.strip() for t in parts if t.strip())
-    return tags or None
+    return re.sub(r"[^A-Za-z0-9_\-.]+", "_", text).strip("_")
 
 
-def _parse_probe_filter(probe: str | None) -> frozenset[str] | None:
-    if not probe:
+def _is_health_handler(endpoint) -> bool:
+    """True for route handlers that a HealthRegistry mounted itself.
+
+    Identifies health routes regardless of prefix — including another
+    registry's, or a registry mounted at the root where no prefix can tell
+    them apart from application routes.
+    """
+    endpoint = getattr(endpoint, "__wrapped__", endpoint)
+    return getattr(endpoint, "__qualname__", "").startswith(f"{HealthRegistry.__name__}._register_routes.")
+
+
+def _endpoint_keys(route) -> set:
+    """The route's endpoint and, if fastapi-watch wrapped it, the original function."""
+    endpoint = getattr(route, "endpoint", None)
+    if endpoint is None:
+        return set()
+    return {endpoint, getattr(endpoint, "__wrapped__", endpoint)}
+
+
+def _parse_csv_filter(value: str | None) -> frozenset[str] | None:
+    """Parse a comma-separated ``?tag=`` / ``?probe=`` query param into a frozenset.
+
+    Returns None for no filter — empty strings, whitespace-only values, and
+    None are all treated that way.  At most 50 entries are considered.
+    """
+    if not value:
         return None
-    parts = probe.split(",")[:50]
-    names = frozenset(p.strip() for p in parts if p.strip())
-    return names or None
+    parts = value.split(",")[:50]
+    return frozenset(p.strip() for p in parts if p.strip()) or None
 
 
 def _normalize_interval(ms: int | None) -> int | None:
@@ -419,15 +444,35 @@ class HealthRegistry:
         """Add a single probe. Returns ``self`` for chaining.
 
         Silently skips the probe if it is already registered (identity check).
+        Logs a warning when a *different* probe already uses the same name:
+        results, history, alerts, and circuit-breaker state are keyed by name,
+        so the two will overwrite each other.  (A warning rather than an error,
+        so existing apps keep starting; give each probe a unique name.)
+
+        Raises:
+            ValueError: if the name contains characters outside ``[A-Za-z0-9_\\-.:]``.
         """
-        if not re.match(r'^[A-Za-z0-9_\-\.:]+$', probe.name):
+        self._check_probe_name(probe.name)
+        if any(p is probe for p, _ in self._probes):
+            return self
+        if any(p.name == probe.name for p, _ in self._probes):
+            (self._logger or _LIB_LOGGER).warning(
+                "fastapi-watch: a different probe is already registered as %r; their results "
+                "will overwrite each other. Give each probe a unique name.",
+                probe.name,
+            )
+        self._probes.append((probe, critical))
+        return self
+
+    @staticmethod
+    def _check_probe_name(name: str) -> None:
+        """Raise ``ValueError`` unless *name* uses only the allowed characters."""
+        # fullmatch, not match with "$": "$" also matches before a trailing newline.
+        if not re.fullmatch(r"[A-Za-z0-9_\-.:]+", name):
             raise ValueError(
-                f"Probe name {probe.name!r} contains invalid characters. "
+                f"Probe name {name!r} contains invalid characters. "
                 "Names must contain only letters, digits, hyphens, underscores, dots, and colons."
             )
-        if not any(p is probe for p, _ in self._probes):
-            self._probes.append((probe, critical))
-        return self
 
     def add_probes(self, probes: list[BaseProbe], critical: bool = True) -> "HealthRegistry":
         """Add a list of probes. Returns ``self`` for chaining."""
@@ -465,7 +510,8 @@ class HealthRegistry:
         Call this after all routes are registered (e.g. at the end of your app
         module or inside a lifespan startup hook).
 
-        Health endpoints under this registry's *prefix* are always excluded.
+        Routes mounted by any HealthRegistry are always excluded.  Path patterns
+        match the full path a client requests, including ``include_router`` prefixes.
         FastAPI route tags (used for OpenAPI docs) are automatically merged into
         probe tags; *tags* adds extra labels on top of those.
 
@@ -491,100 +537,28 @@ class HealthRegistry:
                 overridden even with ``refresh=True``.
             name_fn: Optional callable ``(route) -> str`` to customise probe names.
                 Receives the FastAPI route object and returns the desired probe name.
-                Defaults to ``route.name`` (the handler function name).
+                Defaults to ``route.name`` (the handler function name); when two
+                routes share one, later ones are qualified with their methods and
+                path (e.g. ``list_items:GET_orders``).
             **probe_kwargs: Extra keyword arguments forwarded to each
                 :class:`~fastapi_watch.probes.route.FastAPIRouteProbe`
                 (e.g. ``max_error_rate=0.05``).
 
         Returns ``self`` for chaining.
         """
-        import fnmatch
-        from fastapi.routing import APIRoute
-        from .probes.route import FastAPIRouteProbe
-        from .probes.websocket import FastAPIWebSocketProbe
-
-        try:
-            from fastapi.routing import APIWebSocketRoute
-        except ImportError:
-            APIWebSocketRoute = None
-
-        excluded = list(exclude_paths or [])
-        included = list(include_paths or [])
-        _include_methods = {m.upper() for m in include_methods} if include_methods else None
-        _tags = list(tags) if tags else []
-        _ws_kwargs = ws_probe_kwargs or {}
-
-        for route in _iter_app_routes(self.app.routes):
-            if not isinstance(route, APIRoute) and not (
-                APIWebSocketRoute is not None and isinstance(route, APIWebSocketRoute)
-            ):
-                continue
-            if not hasattr(route, "path"):
-                continue
-            if route.path.startswith(self.prefix):
-                continue
-            if included and not any(fnmatch.fnmatch(route.path, p) for p in included):
-                continue
-            if any(fnmatch.fnmatch(route.path, p) for p in excluded):
-                continue
-            if _include_methods is not None and isinstance(route, APIRoute):
-                route_methods = set(getattr(route, "methods", None) or set())
-                if not route_methods & _include_methods:
-                    continue
-
-            current = getattr(route.dependant, "call", None)
-            fw = getattr(current, "_fastapi_watch", None)
-
-            if refresh:
-                if fw in ("manual", "router"):
-                    continue
-                if fw == "discover":
-                    old = getattr(current, "_fastapi_watch_probe", None)
-                    if old is not None:
-                        self._probes = [(p, c) for p, c in self._probes if p is not old]
-            else:
-                if fw is not None:
-                    continue
-
-            route_tags = list(getattr(route, "tags", None) or [])
-            probe_tags = list(dict.fromkeys(route_tags + _tags))
-            description = _route_description(route, APIWebSocketRoute)
-
-            probe_name = name_fn(route) if name_fn else (route.name or route.path)
-            if isinstance(route, APIRoute):
-                probe = FastAPIRouteProbe(
-                    name=probe_name,
-                    description=description,
-                    tags=probe_tags,
-                    **probe_kwargs,
-                )
-            else:
-                probe = FastAPIWebSocketProbe(
-                    name=probe_name,
-                    description=description,
-                    tags=probe_tags,
-                    **_ws_kwargs,
-                )
-
-            # Unwrap any existing fastapi-watch wrapper before re-watching to avoid
-            # double-wrapping (e.g. discover_routes(refresh=True) after a prior call).
-            original_endpoint = getattr(route.endpoint, "__wrapped__", route.endpoint)
-            wrapped = probe.watch(original_endpoint)
-            try:
-                wrapped._fastapi_watch = "discover"
-                wrapped._fastapi_watch_probe = probe
-                route.dependant.call = wrapped
-                # FastAPI 0.137+: _EffectiveRouteContext is built lazily from
-                # route.endpoint, not route.dependant.call, so patch both.
-                route.endpoint = wrapped
-            except AttributeError:
-                continue
-            self.add(probe, critical=critical)
-
-        # FastAPI 0.137+: reset lazy _IncludedRouter caches so the next request
-        # rebuilds _EffectiveRouteContext with the patched endpoints.
-        _invalidate_included_router_caches(self.app.routes)
-
+        self._monitor_routes(
+            list(_iter_app_routes(self.app.routes)),
+            marker="discover",
+            refresh=refresh,
+            exclude_paths=exclude_paths,
+            include_paths=include_paths,
+            include_methods=include_methods,
+            critical=critical,
+            tags=tags,
+            ws_probe_kwargs=ws_probe_kwargs,
+            name_fn=name_fn,
+            probe_kwargs=probe_kwargs,
+        )
         return self
 
     def watch_router(
@@ -635,7 +609,9 @@ class HealthRegistry:
                 :class:`~fastapi_watch.probes.websocket.FastAPIWebSocketProbe`.
             name_fn: Optional callable ``(route) -> str`` to customise probe names.
                 Receives the FastAPI route object and returns the desired probe name.
-                Defaults to ``route.name`` (the handler function name).
+                Defaults to ``route.name`` (the handler function name); when two
+                routes share one, later ones are qualified with their methods and
+                path (e.g. ``list_items:GET_orders``).
             group: When ``True``, all probes created for this router are collected
                 into a :class:`~fastapi_watch.ProbeGroup` before being registered,
                 so group-level tags propagate to every member probe.
@@ -656,7 +632,63 @@ class HealthRegistry:
             # Monitor only write endpoints for the orders router
             registry.watch_router(orders_router, include_methods=["POST", "PUT", "DELETE"])
         """
-        import fnmatch
+        router_endpoints = set().union(*(_endpoint_keys(r) for r in getattr(router, "routes", [])))
+        # Primary: the app's own route table, which carries the include prefix.
+        # Fallback: router.routes for anything the primary pass could not reach
+        # (they are the serving objects on FastAPI 0.137+, but carry no prefix).
+        candidates = [
+            (route, prefix) for route, prefix in _iter_app_routes(self.app.routes)
+            if _endpoint_keys(route) & router_endpoints
+        ]
+        reached = set().union(*(_endpoint_keys(r) for r, _ in candidates))
+        candidates += [
+            (route, "") for route in getattr(router, "routes", [])
+            if _endpoint_keys(route) and not (_endpoint_keys(route) & reached)
+        ]
+        probe_group = ProbeGroup(tags=list(tags) if tags else None) if group else None
+        self._monitor_routes(
+            candidates,
+            marker="router",
+            refresh=True,
+            exclude_paths=exclude_paths,
+            include_paths=include_paths,
+            include_methods=include_methods,
+            critical=critical,
+            tags=tags,
+            ws_probe_kwargs=ws_probe_kwargs,
+            name_fn=name_fn,
+            probe_kwargs=probe_kwargs,
+            probe_group=probe_group,
+        )
+        if probe_group is not None:
+            self.include(probe_group)
+        return self
+
+    def _monitor_routes(
+        self,
+        candidates: "list[tuple[Any, str]]",
+        *,
+        marker: str,
+        refresh: bool,
+        exclude_paths: list[str] | None,
+        include_paths: list[str] | None,
+        include_methods: list[str] | None,
+        critical: bool,
+        tags: list[str] | None,
+        ws_probe_kwargs: dict | None,
+        name_fn: "Callable | None",
+        probe_kwargs: dict,
+        probe_group: ProbeGroup | None = None,
+    ) -> None:
+        """Wrap each candidate ``(route, include_prefix)`` with a route probe.
+
+        Shared by :meth:`discover_routes` (``marker="discover"``) and
+        :meth:`watch_router` (``marker="router"``).  Paths are matched on the
+        full effective path.  ``@probe.watch`` and ``watch_router`` monitoring
+        is never replaced; a ``discover_routes`` probe is replaced when
+        *refresh* is set.  Auto-generated names that collide are qualified with
+        the route's methods and path so every route keeps its own result.
+        """
         from fastapi.routing import APIRoute
         from .probes.route import FastAPIRouteProbe
         from .probes.websocket import FastAPIWebSocketProbe
@@ -666,136 +698,75 @@ class HealthRegistry:
         except ImportError:
             APIWebSocketRoute = None
 
-        excluded = list(exclude_paths or [])
-        included = list(include_paths or [])
-        _include_methods = {m.upper() for m in include_methods} if include_methods else None
-        _tags = list(tags) if tags else []
-        _ws_kwargs = ws_probe_kwargs or {}
+        methods_filter = {m.upper() for m in include_methods} if include_methods else None
+        extra_tags = list(tags) if tags else []
+        taken = {p.name for p, _ in self._probes}
+        seen: set[int] = set()
 
-        router_routes = getattr(router, "routes", [])
-        # Use getattr so _IncludedRouter wrappers (which lack .endpoint) are skipped.
-        # Include unwrapped originals too: in FastAPI <0.137 routes are copied into
-        # app.routes, so discover_routes may have already patched those copies' endpoints
-        # while router.routes still holds the originals (or vice-versa in 0.137+).
-        router_endpoints: set = set()
-        for _r in router_routes:
-            _ep = getattr(_r, "endpoint", None)
-            if _ep is not None:
-                router_endpoints.add(_ep)
-                _ep_base = getattr(_ep, "__wrapped__", None)
-                if _ep_base is not None:
-                    router_endpoints.add(_ep_base)
-
-        probe_group: ProbeGroup | None = None
-        if group:
-            probe_group = ProbeGroup(tags=_tags or None)
-
-        def _process_route(route: "APIRoute") -> bool:
-            """Wrap one route with a probe. Returns True if a probe was added."""
-            if not isinstance(route, APIRoute) and not (
-                APIWebSocketRoute is not None and isinstance(route, APIWebSocketRoute)
-            ):
-                return False
-            if not hasattr(route, "path"):
-                return False
-            ep = getattr(route, "endpoint", None)
-            ep_base = getattr(ep, "__wrapped__", ep)  # unwrap if already patched
-            if ep not in router_endpoints and ep_base not in router_endpoints:
-                return False
-            if included and not any(fnmatch.fnmatch(route.path, p) for p in included):
-                return False
-            if any(fnmatch.fnmatch(route.path, p) for p in excluded):
-                return False
-            if _include_methods is not None and isinstance(route, APIRoute):
-                route_methods = set(getattr(route, "methods", None) or set())
-                if not route_methods & _include_methods:
-                    return False
+        for route, prefix in candidates:
+            is_ws = APIWebSocketRoute is not None and isinstance(route, APIWebSocketRoute)
+            if (not isinstance(route, APIRoute) and not is_ws) or id(route) in seen:
+                continue
+            seen.add(id(route))
+            if _is_health_handler(getattr(route, "endpoint", None)):
+                continue
+            path = _effective_path(route, prefix)
+            if include_paths and not any(fnmatch.fnmatch(path, pat) for pat in include_paths):
+                continue
+            if any(fnmatch.fnmatch(path, pat) for pat in exclude_paths or []):
+                continue
+            if methods_filter is not None and not is_ws and not set(route.methods or ()) & methods_filter:
+                continue
 
             current = getattr(route.dependant, "call", None)
-            fw = getattr(current, "_fastapi_watch", None)
-            if fw in ("manual", "router"):
-                return False
+            existing = getattr(current, "_fastapi_watch", None)
+            replaced = None
+            if existing in ("manual", "router"):
+                continue
+            if existing == "discover":
+                if not refresh:
+                    continue
+                replaced = getattr(current, "_fastapi_watch_probe", None)
 
-            if fw == "discover":
-                old = getattr(current, "_fastapi_watch_probe", None)
-                if old is not None:
-                    self._probes = [(p, c) for p, c in self._probes if p is not old]
-
-            route_tags = list(getattr(route, "tags", None) or [])
-            probe_tags = list(dict.fromkeys(route_tags + _tags))
-            description = _route_description(route, APIWebSocketRoute)
-
-            probe_name = name_fn(route) if name_fn else (route.name or route.path)
-            if isinstance(route, APIRoute):
-                probe = FastAPIRouteProbe(
-                    name=probe_name,
-                    description=description,
-                    tags=probe_tags,
-                    **probe_kwargs,
-                )
+            description = _route_description(route, path, is_ws)
+            if name_fn is not None:
+                name = name_fn(route)
             else:
-                probe = FastAPIWebSocketProbe(
-                    name=probe_name,
-                    description=description,
-                    tags=probe_tags,
-                    **_ws_kwargs,
-                )
+                name = route.name or _name_slug(path) or "root"
+                if name in taken and (replaced is None or replaced.name != name):
+                    name = f"{name}:{_name_slug(description)}"
+            # Validate before touching the route, so a bad name leaves it unpatched.
+            self._check_probe_name(name)
 
-            # Always watch the original (unwrapped) function to avoid double-wrapping
-            # in the case where discover_routes already patched route.endpoint.
-            original_endpoint = getattr(route.endpoint, "__wrapped__", route.endpoint)
-            wrapped = probe.watch(original_endpoint)
+            probe_tags = list(dict.fromkeys(list(getattr(route, "tags", None) or []) + extra_tags))
+            if is_ws:
+                probe = FastAPIWebSocketProbe(name=name, description=description, tags=probe_tags, **(ws_probe_kwargs or {}))
+            else:
+                probe = FastAPIRouteProbe(name=name, description=description, tags=probe_tags, **probe_kwargs)
+
+            # Watch the original function so re-monitoring never double-wraps.
+            wrapped = probe.watch(getattr(route.endpoint, "__wrapped__", route.endpoint))
             try:
-                wrapped._fastapi_watch = "router"
+                wrapped._fastapi_watch = marker
                 wrapped._fastapi_watch_probe = probe
                 route.dependant.call = wrapped
-                # Also patch route.endpoint so that if FastAPI re-derives dependant
-                # from endpoint (as _IncludedRouter wrappers may do in newer versions),
-                # the wrapped function is used instead of the original.
+                # FastAPI 0.137+ builds its request context from route.endpoint.
                 route.endpoint = wrapped
             except AttributeError:
-                return False
+                continue
 
+            if replaced is not None:
+                self._probes = [(p, c) for p, c in self._probes if p is not replaced]
+                taken.discard(replaced.name)
+            taken.add(name)
             if probe_group is not None:
                 probe_group.add(probe, critical=critical)
             else:
                 self.add(probe, critical=critical)
-            return True
-
-        # Primary pass: find routes via app.routes (works when FastAPI flattens routes).
-        processed_endpoints: set = set()
-        for route in _iter_app_routes(self.app.routes):
-            ep = getattr(route, "endpoint", None)
-            if ep is None:
-                continue
-            ep_base = getattr(ep, "__wrapped__", ep)
-            if (ep in router_endpoints or ep_base in router_endpoints) and _process_route(route):
-                # Record whichever key is in router_endpoints for the unprocessed diff.
-                processed_endpoints.add(ep_base if ep_base in router_endpoints else ep)
-
-        # Fallback pass: newer FastAPI may store routes in _IncludedRouter wrappers
-        # that _iter_app_routes cannot descend into. In that case, the route objects
-        # inside router.routes are the same objects used for serving (not copies), so
-        # wrapping them directly has the same effect.
-        unprocessed = router_endpoints - processed_endpoints
-        if unprocessed:
-            for route in router_routes:
-                ep = getattr(route, "endpoint", None)
-                if ep is None:
-                    continue
-                ep_base = getattr(ep, "__wrapped__", ep)
-                ep_key = ep_base if ep_base in unprocessed else (ep if ep in unprocessed else None)
-                if ep_key is not None and _process_route(route):
-                    unprocessed.discard(ep_key)
-
-        if probe_group is not None:
-            self.include(probe_group)
 
         # FastAPI 0.137+: reset lazy _IncludedRouter caches so the next request
-        # rebuilds _EffectiveRouteContext with the patched endpoints.
+        # rebuilds its route context with the patched endpoints.
         _invalidate_included_router_caches(self.app.routes)
-
-        return self
 
     def set_started(self) -> "HealthRegistry":
         """Mark the application as fully initialised.
@@ -1434,10 +1405,10 @@ class HealthRegistry:
             if registry._in_grace_period():
                 return JSONResponse({"status": "starting"}, status_code=503)
             results = await registry._get_results()
-            _filter = _parse_tag_filter(tag)
+            _filter = _parse_csv_filter(tag)
             if _filter:
                 results = [r for r in results if _filter & set(r.tags)]
-            _probe_filter = _parse_probe_filter(probe)
+            _probe_filter = _parse_csv_filter(probe)
             if _probe_filter:
                 results = [r for r in results if r.name in _probe_filter]
             report = HealthReport.from_results(
@@ -1466,10 +1437,10 @@ class HealthRegistry:
             probe: str | None = Query(default=None),
         ) -> Response:
             results = await registry._get_results()
-            _filter = _parse_tag_filter(tag)
+            _filter = _parse_csv_filter(tag)
             if _filter:
                 results = [r for r in results if _filter & set(r.tags)]
-            _probe_filter = _parse_probe_filter(probe)
+            _probe_filter = _parse_csv_filter(probe)
             if _probe_filter:
                 results = [r for r in results if r.name in _probe_filter]
             report = HealthReport.from_results(
@@ -1572,8 +1543,8 @@ class HealthRegistry:
                 registry._event_stream(
                     request,
                     _make_sse_report,
-                    filter_tags=_parse_tag_filter(tag),
-                    filter_probes=_parse_probe_filter(probe),
+                    filter_tags=_parse_csv_filter(tag),
+                    filter_probes=_parse_csv_filter(probe),
                 ),
                 media_type="text/event-stream",
                 headers=sse_headers,
@@ -1595,8 +1566,8 @@ class HealthRegistry:
                 registry._event_stream(
                     request,
                     _make_sse_report,
-                    filter_tags=_parse_tag_filter(tag),
-                    filter_probes=_parse_probe_filter(probe),
+                    filter_tags=_parse_csv_filter(tag),
+                    filter_probes=_parse_csv_filter(probe),
                 ),
                 media_type="text/event-stream",
                 headers=sse_headers,

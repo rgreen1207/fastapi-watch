@@ -382,15 +382,15 @@ def test_maintenance_valid_minutes_accepted():
 # ---------------------------------------------------------------------------
 
 def test_tag_filter_truncates_at_50():
-    from fastapi_watch.registry import _parse_tag_filter
+    from fastapi_watch.registry import _parse_csv_filter
     tags = ",".join(f"tag{i}" for i in range(200))
-    result = _parse_tag_filter(tags)
+    result = _parse_csv_filter(tags)
     assert len(result) <= 50
 
 
 def test_tag_filter_normal_use_unaffected():
-    from fastapi_watch.registry import _parse_tag_filter
-    result = _parse_tag_filter("api,db,cache")
+    from fastapi_watch.registry import _parse_csv_filter
+    result = _parse_csv_filter("api,db,cache")
     assert result == frozenset({"api", "db", "cache"})
 
 

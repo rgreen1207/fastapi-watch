@@ -794,7 +794,7 @@ async def lifespan(app):
 | `name_fn` | `None` | Callable `(route) -> str` for custom probe names; defaults to the handler function name |
 | `**probe_kwargs` | — | Forwarded to each `FastAPIRouteProbe` (e.g. `max_error_rate=0.05`) |
 
-**Probe naming:** each probe is named after the handler function (`route.name`), which FastAPI sets from the function name by default — so probes have readable names like `list_users` and `create_order` without any configuration.
+**Probe naming:** each probe is named after the handler function (`route.name`), which FastAPI sets from the function name by default — so probes have readable names like `list_users` and `create_order` without any configuration. When two routes share a handler name (common across routers), the later one is qualified with its methods and path — e.g. `list_items` and `list_items:GET_orders` — so each keeps its own result. `exclude_paths` / `include_paths` match the full path a client requests, including any `include_router` prefix.
 
 **Probe description:** each probe's description is automatically set to the HTTP method and path (e.g. `GET /users/{user_id}` or `WS /ws/chat`), which appears as a subtitle under the probe name on the dashboard.
 

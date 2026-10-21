@@ -44,6 +44,18 @@ Callbacks registered with `on_state_change()` ran unguarded inside the probe run
 
 **Fix:** the constructor's `timeout` keeps its meaning (per-broadcast wait, now also exposed as `reply_timeout`), and the probe's overall deadline covers every broadcast it issues plus a 2 s margin: `timeout + 2` for ping-only, `7 × timeout + 2` with `detailed=True`.
 
+#### Route probes with the same handler name no longer collide
+
+Auto-discovered probes are named after the handler function, and two routers each defining `list_items` produced two probes named `list_items`. Results, history, alerts, and circuit-breaker state are keyed by name, so only one survived — the other route's traffic was silently invisible. A probe name failing validation was also only detected after the route had already been patched.
+
+**Fix:** when an auto-generated name is already taken, the later route's probe is qualified with its methods and path (`list_items`, `list_items:GET_orders`); unique names are unchanged. Names are validated before a route is patched. `registry.add()` now warns when a *different* probe reuses an existing name (a warning, not an error, so existing apps keep starting). The name check also no longer accepts a trailing newline.
+
+#### Path filters and descriptions use the full path on FastAPI 0.137+
+
+FastAPI 0.137 stores included routers as `_IncludedRouter` wrappers whose routes keep their un-prefixed path. `discover_routes()` / `watch_router()` matched `include_paths` / `exclude_paths` and built probe descriptions from that short path, so `exclude_paths=["/internal/*"]` did not exclude a router included at `/internal`.
+
+**Fix:** paths are matched and described using the full path a client requests on every FastAPI version. Health routes are recognised as the registry's own handlers rather than by path prefix, so an application route such as `/healthcheck` is no longer skipped by the default `/health` prefix, and `prefix=""` no longer excludes every route. `discover_routes()` and `watch_router()` now share one implementation.
+
 ### Performance
 
 #### Concurrent requests share one probe run
