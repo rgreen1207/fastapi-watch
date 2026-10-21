@@ -12,6 +12,7 @@ from .middleware import RequestMetricsMiddleware, RequestMetricsProbe
 from .dashboard import render_dashboard
 from .models import AlertRecord, ProbeStatus, ProbeResult, HealthReport
 from .storage import InMemoryProbeStorage, ProbeStorage
+from .redis_storage import RedisProbeStorage
 
 __all__ = [
     "BaseAlerter",
@@ -39,5 +40,6 @@ __all__ = [
     "HealthReport",
     "InMemoryProbeStorage",
     "ProbeStorage",
+    "RedisProbeStorage",
 ]
 __version__ = "1.7.2"
