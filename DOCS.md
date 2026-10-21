@@ -86,7 +86,7 @@ Each multi-series graph has a legend and labels every line at its right end, and
 
 **Crosshair** — hovering any graph shows the same moment on every graph, with that graph's values in a tooltip.
 
-**Live updates** — the page opens an `EventSource` to `/health/status/stream`, appends each new result to the graphs, and updates the rows in place. If the set of probes changes it reloads once to pick up the new rows.
+**Live updates** — the page opens an `EventSource` to `/health/status/stream?view=dashboard` (see [Dashboard view](#dashboard-view)), appends each new result to the graphs, and updates the rows in place. If the set of probes changes it reloads once to pick up the new rows.
 
 ---
 
@@ -140,6 +140,14 @@ registry.set_poll_interval(0)  # disable
 
 Minimum enforced interval is 1000 ms — lower values are clamped.
 
+### Dashboard view
+
+By default every event carries each probe's full `details`, including every route a `RequestMetricsProbe` tracks with all of its fields. Pass `?view=dashboard` (on either stream) to get what the built-in dashboard reads: each probe keeps its full `details`, except that `routes` is cut to the eight busiest routes with only `request_count`, `p95_rtt_ms`, `error_rate` and `requests_per_minute`. With 150 routes that is about 1.4 KB per event instead of about 42 KB. It combines with `?tag=`, `?probe=` and `?token=`; any other `view` value gets `422`. Without `view` the payload is unchanged. The built-in dashboard's stream URL includes it.
+
+```bash
+curl -N "http://localhost:8000/health/status/stream?view=dashboard"
+```
+
 ---
 
 ## Polling and caching
@@ -154,7 +162,7 @@ Results are served from an in-process copy of each registered probe's last resul
 - **Shared storage.** With a backend shared by several replicas (e.g. Redis), each replica reports only its own registered probes as checked by itself. A probe that has not yet run in this process runs on the first request, so `/health/ready` never passes on another replica's result.
 - **Storage outages.** Every storage call is bounded by `storage_timeout` (default 2 s; `None` disables). A failing or timed-out call is logged (at most once a minute per operation) and never fails a request: `/health/ready`, `/health/status`, `/health/metrics` and the streams keep answering from in-process results, `/health/history` and `/health/alerts` return `503 {"error": "storage unavailable"}`, and the dashboard renders without history. Storage writes run concurrently, so a hung backend adds at most one `storage_timeout` to a check. If your orchestrator's readiness timeout is short (Kubernetes defaults to 1 s), set `storage_timeout` below it.
 
-If the backend implements `prune(keep)`, the registry calls it with the registered probe names on the first request and then at most every 10 minutes (from the poll loop or later requests), so a renamed or removed probe's data does not linger. Give each app its own key namespace on a shared backend: pruning deletes every probe name not registered in the app doing the pruning.
+If the backend implements `forget(names)`, the registry uses it so a renamed or removed probe's data does not linger: it remembers every probe name it has written, and at most every 10 minutes (from the poll loop or a request, in the background, bounded by `storage_timeout`) it calls `forget()` with the names it wrote but no longer registers, for example after `discover_routes(refresh=True)` renames a route probe. Names this process never wrote are never deleted, so apps and replicas can share one backend and key prefix without removing each other's data, including old and new pods with different probe sets during a rolling deploy. Data of probes nobody writes any more expires with `result_ttl_seconds`. Two apps that register the same probe name on one prefix do share that probe's data, so a distinct prefix per app is still recommended.
 
 On shutdown the registry awaits `aclose()` on every registered and startup probe that defines one (5 s limit each; failures are logged).
 
@@ -518,7 +526,7 @@ registry = HealthRegistry(
 }
 ```
 
-Results are ordered oldest-first and are in-memory by default. Each entry is dropped once it is older than `result_ttl_seconds`, and each probe keeps at most `history_size` entries. See [Custom storage backend](README.md#custom-storage-backend) to share them across workers or keep them across restarts. With a custom `storage=`, the retention arguments are applied through the backend's `configure()` method when you pass them; a backend without `configure()` keeps its own limits and a warning names the ignored arguments. If the backend is unavailable, the endpoint returns `503 {"error": "storage unavailable"}`.
+Results are ordered oldest-first and are in-memory by default. Each entry is dropped once it is older than `result_ttl_seconds`, and each probe keeps at most `history_size` entries. See [Custom storage backends](#custom-storage-backends) to share them across workers or keep them across restarts. With a custom `storage=`, the retention arguments reach the backend only when you pass at least one of them explicitly (see [Retention settings](#retention-settings)); a backend without `configure()` keeps its own limits and a warning names the ignored arguments. If the backend is unavailable, the endpoint returns `503 {"error": "storage unavailable"}`.
 
 ---
 
@@ -553,7 +561,17 @@ Alerts are ordered oldest-first. If the storage backend is unavailable, the endp
 
 ## Custom storage backends
 
-Pass any object implementing `ProbeStorage` as `HealthRegistry(app, storage=...)`. The registry's `history_size`, `result_ttl_seconds`, `alert_ttl_seconds` and `max_alerts` are the retention window for every backend; setting a TTL to `0` disables age-based expiry for that collection (count limits still apply).
+Pass any object implementing `ProbeStorage` as `HealthRegistry(app, storage=...)`. Setting a TTL to `0` disables age-based expiry for that collection (count limits still apply).
+
+### Retention settings
+
+Which limits a custom backend uses depends on what you pass to `HealthRegistry`:
+
+- **None of `history_size`, `result_ttl_seconds`, `alert_ttl_seconds`, `max_alerts` passed:** the backend keeps the values it was constructed with. `HealthRegistry(app, storage=RedisProbeStorage(client, max_results=500))` keeps 500 entries per probe.
+- **At least one passed:** the registry calls the backend's `configure()` with all four of its effective values, the ones you passed plus the registry defaults (`120`, `7200`, `259200`, `120`) for the rest. These replace the backend's constructor values.
+- **Backend without `configure()`:** it always keeps its own limits; a warning names any retention arguments you passed.
+
+Set the limits in one place: either on the backend's constructor, or as registry arguments.
 
 ### `RedisProbeStorage`
 
@@ -567,17 +585,21 @@ storage = RedisProbeStorage(
     max_entry_bytes=8192,    # byte cap per history entry
 )
 registry = HealthRegistry(app, storage=storage, history_size=120, result_ttl_seconds=7200)
+# history_size / result_ttl_seconds passed here, so configure() applies them
+# (and the registry's defaults for alert_ttl_seconds and max_alerts).
 ```
 
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `redis` | required | A `redis.asyncio` client |
 | `prefix` | `"fastapi-watch"` | Prefix for every key. On Redis Cluster use braces (`"{myapp:health}"`) so all keys share a slot |
-| `max_results` | `120` | History entries per probe (the registry's `history_size` overrides it) |
-| `result_ttl_seconds` | `7200` | Age limit for latest results and history entries (the registry's value overrides it) |
-| `alert_ttl_seconds` | `259200` | Age limit for alerts (the registry's value overrides it) |
-| `max_alerts` | `120` | Total alerts kept (the registry's value overrides it) |
+| `max_results` | `120` | History entries per probe |
+| `result_ttl_seconds` | `7200` | Age limit for latest results and history entries. `0` = no age limit |
+| `alert_ttl_seconds` | `259200` | Age limit for alerts. `0` = no age limit |
+| `max_alerts` | `120` | Total alerts kept |
 | `max_entry_bytes` | `8192` | Largest stored history entry, minimum 512 |
+
+The four retention arguments are replaced by the registry's values only when `HealthRegistry` is given at least one of `history_size`, `result_ttl_seconds`, `alert_ttl_seconds` or `max_alerts` (see [Retention settings](#retention-settings)).
 
 Built so monitoring never loads the Redis it shares with your app:
 
@@ -585,7 +607,7 @@ Built so monitoring never loads the Redis it shares with your app:
 - **Atomic writes.** Each write is one `MULTI/EXEC`: add the entry, drop entries older than the TTL, trim to the count limit, and refresh a key-level expiry set slightly past the TTL. No key is ever left without its expiry. With a TTL of `0` no expiry is set and nothing is deleted by age.
 - **Per-entry ageing.** History (`<prefix>:history:<name>`) and alerts (`<prefix>:alerts`) are sorted sets scored by `checked_at` / `timestamp`; reads skip expired entries even before a write trims them.
 - **Byte cap.** A history entry over `max_entry_bytes` loses its largest `details` values first (for example a request-metrics probe's per-route table) and gets `details["_truncated"] = true`; scalar values such as `p95_rtt_ms` stay, so dashboard graphs keep working. Latest results (`<prefix>:latest:<name>`) are stored in full.
-- **Cleanup.** Keys of probes that stop reporting expire on their own; `prune(keep)` deletes them at once.
+- **Cleanup.** Keys of probes that stop reporting expire on their own. `forget(names)` deletes the latest result, history and index entry of exactly the named probes; the registry passes only names it wrote and no longer registers, so it never removes another app's or replica's data.
 - **One alert per state change across replicas.** `claim_alert` is a single `SET <prefix>:alert-claim:<key> 1 NX PX <ttl>`; only the first replica to claim a key gets `True`, and every claim key expires.
 
 Upper bound on memory used:
@@ -594,14 +616,14 @@ Upper bound on memory used:
 probes × (history_size × max_entry_bytes + one latest result) + max_alerts × (~150 B + probe name)
 ```
 
-where `probes` counts the probe names written within the last `result_ttl_seconds` (or since the last `prune()` when that TTL is `0`).
+where `probes` counts the probe names written within the last `result_ttl_seconds` (or, when that TTL is `0`, every name written and not yet removed by `forget()`).
 
 ### Writing your own
 
 Implement the eight `ProbeStorage` methods: `get_latest`, `get_all_latest`, `set_latest`, `clear_latest` (sync; schedule I/O on the running loop), `append_history`, `get_history`, `append_alert` and `get_alerts`. Results and alerts are returned oldest-first. Three optional methods are called when present:
 
-- `configure(*, max_results, result_ttl_seconds, alert_ttl_seconds, max_alerts)`: receives the registry's retention settings.
-- `async prune(keep: set[str])`: delete the latest result and history of every probe not in `keep`.
+- `configure(*, max_results, result_ttl_seconds, alert_ttl_seconds, max_alerts)`: receives the registry's retention settings, only when at least one was passed to `HealthRegistry` (see [Retention settings](#retention-settings)).
+- `async forget(names: set[str])`: delete the latest result, history and any index entry of exactly the probes in `names`, and nothing else. The registry passes only names this process wrote and no longer registers.
 - `async claim_alert(key: str, ttl_seconds: float) -> bool`: return `True` only for the first caller to claim `key` within `ttl_seconds`, so one replica sends each alert. `ttl_seconds <= 0` always returns `True`. Claims must expire.
 
 Bound every collection by count and by age, per entry. The `ProbeStorage` docstring has an outline.
@@ -610,7 +632,7 @@ Bound every collection by count and by age, per entry. The `ProbeStorage` docstr
 
 ## Response format
 
-Every response from `/health/ready`, `/health/status`, and the SSE streams shares this shape.
+Every response from `/health/ready`, `/health/status`, and the SSE streams shares this shape (with `?view=dashboard`, the streams trim `details.routes`; see [Dashboard view](#dashboard-view)).
 
 **Health report:**
 
@@ -705,9 +727,11 @@ class PaymentGatewayProbe(BaseProbe):
                 name=self.name,
                 status=ProbeStatus.UNHEALTHY,
                 latency_ms=round(latency, 2),
-                error=str(exc),
+                error=f"gateway check failed: {type(exc).__name__}",
             )
 ```
+
+`error` is shown to anyone who can read the health endpoints. Report the exception type, as the built-in probes do, and log the message: it can carry hostnames, credentials or query parameters (see [Probe error messages](#probe-error-messages)).
 
 ### Configurable
 
@@ -735,7 +759,7 @@ class S3BucketProbe(BaseProbe):
         except Exception as exc:
             latency = (time.perf_counter() - start) * 1000
             return ProbeResult(name=self.name, status=ProbeStatus.UNHEALTHY,
-                               latency_ms=round(latency, 2), error=str(exc))
+                               latency_ms=round(latency, 2), error=type(exc).__name__)
 
 registry.add(S3BucketProbe("my-uploads", "eu-west-1", name="s3-uploads"))
 registry.add(S3BucketProbe("my-backups", "us-east-1", name="s3-backups"))
@@ -772,10 +796,31 @@ class RedisHAProbe(BaseProbe):
         )
 ```
 
+### Releasing resources
+
+A probe that holds a client, connection pool or background task can override `async aclose()`. The registry awaits it once at shutdown for every registered and startup probe (5 s limit each; failures are logged and do not stop the others). The default does nothing.
+
+```python
+class QueueDepthProbe(BaseProbe):
+    name = "queue-depth"
+
+    def __init__(self, url: str) -> None:
+        self._client = QueueClient(url)  # reused across checks
+
+    async def check(self) -> ProbeResult:
+        depth = await self._client.depth()
+        return ProbeResult(name=self.name, status=ProbeStatus.HEALTHY, details={"depth": depth})
+
+    async def aclose(self) -> None:
+        await self._client.close()
+```
+
 ### Testing a custom probe
 
 ```python
 import pytest
+from fastapi import FastAPI
+from fastapi_watch import HealthRegistry
 from fastapi_watch.models import ProbeStatus
 from myapp.probes import MyServiceProbe
 
@@ -790,9 +835,12 @@ async def test_unhealthy_on_exception(monkeypatch):
     async def fail():
         raise ConnectionError("refused")
     monkeypatch.setattr("myapp.probes.call_my_service", fail)
-    result = await MyServiceProbe().check()
+    # The registry turns an exception escaping check() into an UNHEALTHY result.
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=None)
+    registry.add(MyServiceProbe())
+    (result,) = await registry.run_all()
     assert result.status == ProbeStatus.UNHEALTHY
-    assert "refused" in result.error
+    assert "ConnectionError" in result.error  # the type only, never the message
 ```
 
 ### Checklist
@@ -1432,6 +1480,8 @@ The inspect calls are blocking, so they run in fastapi-watch's own thread pool (
 
 `CeleryProbe`, `TCPProbe` (DNS lookup), and the built-in alerters make blocking calls. They run in a private pool of at most 4 daemon threads named `fastapi-watch_N`, never in the event loop's default executor, which your application's own `run_in_executor` calls use. The registry's timeout cancels a check but cannot stop a thread that is already blocked, so each probe has at most one blocking call in flight: while it is still running, the probe reports UNHEALTHY with `"previous check still running"` and submits nothing new. A hung dependency therefore holds one thread, not one per poll, and the threads never delay interpreter exit.
 
+**Known limit: DNS for Kafka, RabbitMQ and Memcached.** `KafkaProbe`, `RabbitMQProbe` and `MemcachedProbe` connect by hostname through their async client libraries (aiokafka, aio-pika, aiomcache). Those libraries resolve the name with the event loop's `getaddrinfo`, which runs in the loop's default executor, the one your application shares, not in fastapi-watch's private pool. fastapi-watch can't resolve the name first and pass an IP, because that would break TLS hostname verification. The probe's `timeout` still bounds each check, but a resolver that hangs can hold a default-executor thread until the system resolver gives up. If that matters, point these probes at hosts that resolve locally (`/etc/hosts`, a node-local DNS cache), or size the default executor with `loop.set_default_executor()`.
+
 ---
 
 ### SQLAlchemy
@@ -1461,12 +1511,12 @@ registry.add(db_probe)
 
 | Probe | Extra | Key args | Details fields |
 |-------|-------|----------|----------------|
-| `RequestMetricsMiddleware` + `RequestMetricsProbe` | built-in | `per_route`, `max_error_rate`, `max_avg_rtt_ms` | `request_count`, `error_count`, `error_rate`, `avg_rtt_ms`, `consecutive_errors`; + `routes` when `per_route=True` |
-| `FastAPIRouteProbe` | built-in | `name`, `max_error_rate`, `max_avg_rtt_ms`, `min_error_status`, `slow_call_threshold_ms`, `cache_window_size`, `cache_time_window_s`, `cache_reporting`, `circuit_breaker_enabled` | `request_count`, `error_count`, `error_rate`, `consecutive_errors`, `last_status_code`, `last_rtt_ms`, `avg_rtt_ms`, `p50_rtt_ms`, `p95_rtt_ms`, `p99_rtt_ms`, `min_rtt_ms`, `max_rtt_ms`, `requests_per_minute`, `slow_calls`\*, `status_distribution`, `error_types`, `cache_hits`\*, `cache_misses`\*, `cache_maxsize`\*, `cache_currsize`\*, `last_error_at`\*, `last_success_at`\* |
+| `RequestMetricsMiddleware` + `RequestMetricsProbe` | built-in | `per_route`, `max_routes`, `max_error_rate`, `max_avg_rtt_ms` | `request_count`, `error_count`, `error_rate`, `avg_rtt_ms`, `consecutive_errors`; + `routes` when `per_route=True` |
+| `FastAPIRouteProbe` | built-in | `name`, `max_error_rate`, `max_avg_rtt_ms`, `min_error_status`, `slow_call_threshold_ms`, `cache_window_size`, `cache_time_window_s`, `cache_reporting`, `circuit_breaker_enabled`, `expose_error_messages` | `request_count`, `error_count`, `error_rate`, `consecutive_errors`, `last_status_code`, `last_rtt_ms`, `avg_rtt_ms`, `p50_rtt_ms`, `p95_rtt_ms`, `p99_rtt_ms`, `min_rtt_ms`, `max_rtt_ms`, `requests_per_minute`, `slow_calls`\*, `status_distribution`, `error_types`, `cache_hits`\*, `cache_misses`\*, `cache_maxsize`\*, `cache_currsize`\*, `last_error_at`\*, `last_success_at`\* |
 | `FastAPIWebSocketProbe` | built-in | `name`, `max_error_rate`, `min_active_connections` | `active_connections`, `total_connections`, `messages_received`, `messages_sent`, `error_count`, `error_rate`, `consecutive_errors`, `avg_duration_ms` |
 | `EventLoopProbe` | built-in | `warn_ms`, `fail_ms`, `sample_interval_ms` | `lag_ms`, `current_lag_ms` |
 | `TCPProbe` | built-in | `host`, `port`, `timeout` | `host`, `port`, `resolved_ips`, `connect_ms` |
-| `SMTPProbe` | built-in | `name`, `max_error_rate`, `max_avg_rtt_ms`, `slow_call_threshold_ms`, `cache_window_size` | `call_count`, `error_count`, `error_rate`, `avg_rtt_ms`, `p50_rtt_ms`, `p95_rtt_ms`, `p99_rtt_ms`, `error_types`, `last_error_at`\* |
+| `SMTPProbe` | built-in | `name`, `max_error_rate`, `max_avg_rtt_ms`, `slow_call_threshold_ms`, `cache_window_size`, `expose_error_messages` | `call_count`, `error_count`, `error_rate`, `avg_rtt_ms`, `p50_rtt_ms`, `p95_rtt_ms`, `p99_rtt_ms`, `error_types`, `last_error_at`\* |
 | `ThresholdProbe` | built-in | `probe`, `warn_if`, `fail_if` | delegates to inner probe |
 
 #### Databases
@@ -1664,11 +1714,11 @@ The endpoint is subject to the same `auth` as all other health endpoints.
 | `poll_interval_ms` | `int \| None` | `60000` | Re-run interval (ms) while SSE clients are connected. `0`/`None` = on-demand. Min `1000`. |
 | `logger` | `logging.Logger \| None` | `None` | Logger for warnings and probe exceptions |
 | `grace_period_ms` | `int` | `0` | Hold `/ready` as "starting" for this many ms after startup |
-| `history_size` | `int` | `120` | Max results per probe. With a custom `storage`, applied through its `configure()` when passed (as are the next three) |
+| `history_size` | `int` | `120` | Max results per probe. With a custom `storage`, sent to its `configure()` (with the next three) only when at least one of the four is passed; otherwise the backend keeps its own values. See [Retention settings](#retention-settings) |
 | `result_ttl_seconds` | `float` | `7200.0` | How long results are retained |
 | `alert_ttl_seconds` | `float` | `259200.0` | How long alert records are retained |
 | `max_alerts` | `int` | `120` | Hard cap on stored alerts |
-| `storage` | `ProbeStorage \| None` | `None` | Storage backend; in-memory when `None`. See [Custom storage backends](#custom-storage-backends). Retention arguments you pass are applied through its `configure()`; without one, a warning names the ignored arguments |
+| `storage` | `ProbeStorage \| None` | `None` | Storage backend; in-memory when `None`. See [Custom storage backends](#custom-storage-backends). Retention arguments you pass are applied through its `configure()`; without one, a warning names the ignored arguments. Its optional `forget()` only ever receives names this process wrote, so a backend can be shared |
 | `storage_timeout` | `float \| None` | `2.0` | Keyword-only. Seconds each storage call may take. Failures and timeouts are logged and never fail a health check; `None` disables the limit |
 | `max_stream_connections` | `int \| None` | `100` | Keyword-only. Most SSE streams open at once; more get `503` with `Retry-After`. `None` = unlimited |
 | `alert_min_interval_s` | `float` | `0.0` | Keyword-only. At most one alert per probe per this many seconds; changes in between are coalesced and the latest status is sent when the interval ends. `0` = off |
@@ -1713,6 +1763,7 @@ The endpoint is subject to the same `auth` as all other health endpoints.
 | `poll_interval_ms` | `int \| None` | `None` | Per-probe poll interval override |
 | `circuit_breaker_threshold` | `int \| None` | `None` | Per-probe circuit threshold |
 | `circuit_breaker_cooldown_ms` | `int \| None` | `None` | Per-probe circuit cooldown |
+| `aclose()` | async method | no-op | Called once at registry shutdown (5 s limit); override to release clients or background tasks. See [Releasing resources](#releasing-resources) |
 
 ### `ProbeResult` fields
 

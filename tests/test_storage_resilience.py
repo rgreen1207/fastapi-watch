@@ -2,8 +2,9 @@
 
 Covers: storage errors and timeouts contained (#16), results limited to this
 process's own registered probes (#17), no storage read per request (#7),
-circuit-open cached results keeping their checked_at (#19), pruning of
-unregistered probes, and probe ``aclose()`` at shutdown.
+circuit-open cached results keeping their checked_at (#19), forgetting
+probes this process stopped registering without touching anyone else's
+(#31), and probe ``aclose()`` at shutdown.
 """
 import asyncio
 import logging
@@ -55,8 +56,8 @@ class _BrokenStorage:
     async def get_alerts(self):
         self._fail("get_alerts")
 
-    async def prune(self, keep):
-        self._fail("prune")
+    async def forget(self, names):
+        self._fail("forget")
 
 
 class _HangingStorage(InMemoryProbeStorage):
@@ -85,7 +86,7 @@ class _CountingStorage(InMemoryProbeStorage):
     def __init__(self):
         super().__init__()
         self.reads: list[str] = []
-        self.pruned: list[set] = []
+        self.forgotten: list[set] = []
 
     async def get_latest(self, name):
         self.reads.append("get_latest")
@@ -95,8 +96,9 @@ class _CountingStorage(InMemoryProbeStorage):
         self.reads.append("get_all_latest")
         return await super().get_all_latest()
 
-    async def prune(self, keep):
-        self.pruned.append(set(keep))
+    async def forget(self, names):
+        self.forgotten.append(set(names))
+        await super().forget(names)
 
 
 class _Failing(BaseProbe):
@@ -382,66 +384,166 @@ async def test_fresh_results_still_get_a_new_checked_at():
 
 
 # ---------------------------------------------------------------------------
-# Pruning probes that are no longer registered
+# #31 Forgetting probes this process stopped registering
 # ---------------------------------------------------------------------------
 
+def _make_due(registry):
+    registry._last_forget -= registry_module._FORGET_INTERVAL_S
+
+
+def _without(registry, name):
+    registry._probes = [(p, c) for p, c in registry._probes if p.name != name]
+
+
 @pytest.mark.asyncio
-async def test_first_request_prunes_unregistered_probes():
+async def test_requests_forget_probes_no_longer_registered():
     storage = _CountingStorage()
     registry = HealthRegistry(FastAPI(), storage=storage, poll_interval_ms=None)
     registry.add(NoOpProbe(name="db")).add(NoOpProbe(name="cache"))
     await registry._get_results()
-    await asyncio.sleep(0)  # the prune runs in the background
-    assert storage.pruned == [{"db", "cache"}]
+    await asyncio.sleep(0)  # the pass runs in the background
+    assert registry._last_forget is not None
+    assert storage.forgotten == []  # every written name is still registered: no call
+    assert registry._written_names == {"db", "cache"}
 
+    _without(registry, "cache")
     await registry._get_results()
     await asyncio.sleep(0)
-    assert len(storage.pruned) == 1  # at most every _PRUNE_INTERVAL_S
+    assert storage.forgotten == []  # at most every _FORGET_INTERVAL_S
 
-    registry._last_prune -= registry_module._PRUNE_INTERVAL_S
+    _make_due(registry)
     await registry._get_results()
     await asyncio.sleep(0)
-    assert len(storage.pruned) == 2
+    assert storage.forgotten == [{"cache"}]
+    assert registry._written_names == {"db"}
+    assert set(await storage.get_all_latest()) == {"db"}
+
+    _make_due(registry)
+    await registry._get_results()
+    await asyncio.sleep(0)
+    assert storage.forgotten == [{"cache"}]  # dropped from tracking: never sent again
 
 
 @pytest.mark.asyncio
-async def test_poll_loop_prunes():
+async def test_poll_loop_forgets():
     storage = _CountingStorage()
     registry = HealthRegistry(FastAPI(), storage=storage, poll_interval_ms=1000)
     registry.add(NoOpProbe(name="db"))
+    registry._written_names.add("old")  # written earlier, no longer registered
     task = asyncio.create_task(registry._poll_loop())
     await asyncio.sleep(0.05)
     task.cancel()
-    assert storage.pruned == [{"db"}]
+    assert storage.forgotten == [{"old"}]
 
 
 @pytest.mark.asyncio
-async def test_prune_drops_local_state_of_removed_probes():
+async def test_never_forgets_names_this_process_did_not_write():
+    storage = _CountingStorage()
+    for name in ("other-app", "old-pod-probe"):  # written by other processes
+        await storage.set_latest(ProbeResult(name=name, status=ProbeStatus.HEALTHY))
+        await storage.append_history(ProbeResult(name=name, status=ProbeStatus.HEALTHY))
+    registry = HealthRegistry(FastAPI(), storage=storage, poll_interval_ms=None)
+    registry.add(NoOpProbe(name="db"))
+    await registry.run_all()
+    for _ in range(3):
+        await registry._forget_unregistered()
+    assert storage.forgotten == []
+    assert set(await storage.get_all_latest()) == {"db", "other-app", "old-pod-probe"}
+    assert set(await storage.get_history()) == {"db", "other-app", "old-pod-probe"}
+
+
+@pytest.mark.asyncio
+async def test_shared_storage_two_apps_keep_each_others_data():
+    storage = InMemoryProbeStorage()
+    one = HealthRegistry(FastAPI(), storage=storage, poll_interval_ms=None)
+    one.add(NoOpProbe(name="a")).add(NoOpProbe(name="b"))
+    two = HealthRegistry(FastAPI(), storage=storage, poll_interval_ms=None)
+    two.add(NoOpProbe(name="b")).add(NoOpProbe(name="c"))  # rolling deploy: overlapping sets
+    await one.run_all()
+    await two.run_all()
+    for registry in (one, two, one, two):
+        await registry._forget_unregistered()
+    assert set(await storage.get_all_latest()) == {"a", "b", "c"}
+    assert set(await storage.get_history()) == {"a", "b", "c"}
+
+
+@pytest.mark.asyncio
+async def test_result_named_differently_from_its_probe_is_not_tracked():
+    class _Renaming(BaseProbe):
+        name = "mine"
+
+        async def check(self):
+            return ProbeResult(name="someone-elses", status=ProbeStatus.HEALTHY)
+
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=None)
+    registry.add(_Renaming())
+    await registry.run_all()
+    assert registry._written_names == set()
+
+
+@pytest.mark.asyncio
+async def test_discover_routes_refresh_forgets_the_replaced_probe_name():
+    app = FastAPI()
+
+    @app.get("/items")
+    async def items():
+        return []
+
+    storage = _CountingStorage()
+    registry = HealthRegistry(app, storage=storage, poll_interval_ms=None)
+    registry.discover_routes(name_fn=lambda route: "items-v1")
+    await registry.run_all()
+    registry.discover_routes(refresh=True, name_fn=lambda route: "items-v2")
+    await registry.run_all()
+    assert {p.name for p, _ in registry._probes} == {"items-v2"}
+    await registry._forget_unregistered()
+    assert storage.forgotten == [{"items-v1"}]
+    assert set(await storage.get_all_latest()) == {"items-v2"}
+
+
+@pytest.mark.asyncio
+async def test_forget_drops_local_state_of_removed_probes():
     registry = HealthRegistry(FastAPI(), poll_interval_ms=None)
     old = NoOpProbe(name="old")
     registry.add(old).add(NoOpProbe(name="db"))
     await registry.run_all()
     registry._probes = [(p, c) for p, c in registry._probes if p is not old]
-    await registry._prune_storage()
+    await registry._forget_unregistered()
     assert set(registry._last_results) == {"db"}
     assert set(registry._probe_last_run) == {"db"}
+    assert await registry._storage.get_latest("old") is None
 
 
 @pytest.mark.asyncio
-async def test_prune_failure_is_contained():
+async def test_forget_failure_is_contained_and_retried():
     registry = HealthRegistry(FastAPI(), storage=_BrokenStorage(), poll_interval_ms=None)
     registry.add(NoOpProbe(name="db"))
-    await registry._prune_storage()  # must not raise
-    assert "prune" in registry._storage.calls
+    await registry.run_all()  # writes fail, but may have landed: the name is tracked
+    _without(registry, "db")
+    await registry._forget_unregistered()  # must not raise
+    assert "forget" in registry._storage.calls
+    assert registry._written_names == {"db"}  # kept for the next pass
 
 
 @pytest.mark.asyncio
-async def test_storage_without_prune_is_fine():
-    registry = HealthRegistry(FastAPI(), poll_interval_ms=None)
+async def test_storage_without_forget_is_fine():
+    class _NoForget:
+        def __init__(self):
+            self._inner = InMemoryProbeStorage()
+
+        def __getattr__(self, name):
+            if name == "forget":
+                raise AttributeError(name)
+            return getattr(self._inner, name)
+
+    registry = HealthRegistry(FastAPI(), storage=_NoForget(), poll_interval_ms=None)
     registry.add(NoOpProbe(name="db"))
     await registry._get_results()
     await asyncio.sleep(0)
-    assert registry._last_prune is not None
+    assert registry._last_forget is not None
+    _without(registry, "db")
+    await registry._forget_unregistered()
+    assert registry._written_names == set()  # tracking stays bounded
 
 
 # ---------------------------------------------------------------------------
@@ -479,14 +581,16 @@ async def test_shutdown_closes_every_probe_despite_failures(monkeypatch, caplog)
 
 
 @pytest.mark.asyncio
-async def test_shutdown_cancels_a_pending_prune():
-    class _SlowPrune(InMemoryProbeStorage):
-        async def prune(self, keep):
+async def test_shutdown_cancels_a_pending_forget():
+    class _SlowForget(InMemoryProbeStorage):
+        async def forget(self, names):
             await asyncio.sleep(30)
 
-    registry = HealthRegistry(FastAPI(), storage=_SlowPrune(), poll_interval_ms=None, storage_timeout=None)
+    registry = HealthRegistry(FastAPI(), storage=_SlowForget(), poll_interval_ms=None, storage_timeout=None)
     registry.add(NoOpProbe(name="db"))
+    registry._written_names.add("old")
     await registry._get_results()
     await asyncio.sleep(0)
+    assert registry._forget_task is not None and not registry._forget_task.done()
     await asyncio.wait_for(registry._shutdown(), timeout=1)
-    assert registry._prune_task is None
+    assert registry._forget_task is None

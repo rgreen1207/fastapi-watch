@@ -12,16 +12,17 @@ import signal as _signal
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, AsyncGenerator, Awaitable, Callable, Iterator
-from urllib.parse import urlsplit
+from typing import Any, AsyncGenerator, Awaitable, Callable, Iterator, Literal
+from urllib.parse import urlencode, urlsplit
 from zoneinfo import ZoneInfo
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
+from pydantic_core import to_json
 
 from .alerts import BaseAlerter, WebhookAlerter
-from .dashboard import render_dashboard
+from .dashboard import _current_probe, render_dashboard
 from .models import AlertRecord, HealthReport, ProbeResult, ProbeStatus
 from .prometheus import render_prometheus, validate_metrics_prefix
 from .probe_group import ProbeGroup
@@ -53,10 +54,10 @@ _SSE_KEEPALIVE_S = 15.0
 _SINGLE_FETCH_RETRY_MS = 30_000
 # Storage: returned by _storage_call when an operation fails or times out; a
 # failing operation is logged at most once per interval; stored data of
-# probes no longer registered is pruned at most this often.
+# probes this process wrote but no longer registers is forgotten at most this often.
 _STORAGE_FAILED: Any = object()
 _STORAGE_LOG_INTERVAL_S = 60.0
-_PRUNE_INTERVAL_S = 600.0
+_FORGET_INTERVAL_S = 600.0
 # Shutdown: how long each probe's aclose() may take.
 _ACLOSE_TIMEOUT_S = 5.0
 # Retry-After (seconds) sent when max_stream_connections streams are open.
@@ -443,7 +444,8 @@ class HealthRegistry:
     - ``GET    /health/startup``       — startup check; 503 until :meth:`set_started` is called
     - ``GET    /health/dashboard``     — HTML dashboard with live SSE (Server-Sent Events) updates
     - ``GET    /health/ready/stream``  — SSE (Server-Sent Events) stream of readiness
-    - ``GET    /health/status/stream`` — SSE (Server-Sent Events) stream of full probe detail
+    - ``GET    /health/status/stream`` — SSE (Server-Sent Events) stream of full probe detail;
+      ``?view=dashboard`` slims routes to what the built-in dashboard charts
     - ``GET    /health/maintenance``   — current maintenance mode status
     - ``POST   /health/maintenance``   — enable maintenance mode (optional body: ``minutes`` or ``until``);
       mounted only when *auth* is set
@@ -464,11 +466,13 @@ class HealthRegistry:
             for this many ms, measured from when the registry is created
             (affects ``/health/ready`` only).
         history_size: Number of past results kept per probe (default 120).
-            With a custom *storage*, this and the other retention arguments
-            (*result_ttl_seconds*, *alert_ttl_seconds*, *max_alerts*) are
-            applied through the backend's ``configure()`` when passed
-            explicitly; a backend without ``configure()`` keeps its own limits
-            and a warning names the ignored arguments.
+            With a custom *storage*, the retention arguments (this,
+            *result_ttl_seconds*, *alert_ttl_seconds*, *max_alerts*) reach the
+            backend only when at least one is passed explicitly: then its
+            ``configure()`` receives all four effective values (defaults for
+            the ones not passed).  Otherwise the backend keeps the values it
+            was constructed with.  A backend without ``configure()`` always
+            keeps its own limits, and a warning names any ignored arguments.
         groups: :class:`~fastapi_watch.ProbeGroup` instances to merge at startup.
         dashboard: ``True`` (default) — built-in HTML dashboard.  ``False`` — omit the
             route.  Callable ``(report: HealthReport) -> str`` — custom renderer;
@@ -496,7 +500,10 @@ class HealthRegistry:
             When the cap is reached the oldest alert is dropped (regardless of TTL).
         storage: Custom storage backend implementing :class:`~fastapi_watch.ProbeStorage`.
             Defaults to :class:`~fastapi_watch.InMemoryProbeStorage`.  Pass a Redis-backed
-            or other implementation here for persistence across restarts.
+            or other implementation here for persistence across restarts.  If it
+            defines ``forget(names)``, data of probes this process wrote and no
+            longer registers is deleted at most every 10 minutes; names it never
+            wrote are never touched, so apps and replicas can share a backend.
         webhook_url: HTTP(S) URL that receives a JSON ``POST`` whenever a probe
             changes state.  The call is fire-and-forget and never blocks health checks.
             Payload: ``{"probe", "old_status", "new_status", "timestamp"}``.
@@ -645,9 +652,12 @@ class HealthRegistry:
         self._last_results: dict[str, ProbeResult] = {}
         # id(probe) -> its in-flight run, shared by concurrent callers
         self._inflight: dict[int, asyncio.Task] = {}
-        # Storage pruning of probes no longer registered (monotonic time of the last one)
-        self._last_prune: float | None = None
-        self._prune_task: asyncio.Task | None = None
+        # Probe names this process has written to storage.  Bounded: only names
+        # it registered.  Those it stops registering are forgotten in storage
+        # (monotonic time of the last pass).
+        self._written_names: set[str] = set()
+        self._last_forget: float | None = None
+        self._forget_task: asyncio.Task | None = None
 
         # Circuit breaker state
         self._circuit_breaker_enabled: bool = circuit_breaker
@@ -1289,6 +1299,8 @@ class HealthRegistry:
         self._probe_last_run[probe.name] = asyncio.get_running_loop().time()
         if not from_cache:
             self._last_checked_at = checked_at
+        if result.name == probe.name:  # only ever forget a name both registered and written here
+            self._written_names.add(result.name)
         await asyncio.gather(
             self._storage_call("set_latest", result),
             self._storage_call("append_history", result),
@@ -1503,7 +1515,7 @@ class HealthRegistry:
         backend cannot slow or fail health checks.
         """
         self._ensure_background_polling()
-        self._schedule_prune()
+        self._schedule_forget()
         now = asyncio.get_running_loop().time()
         to_run = [
             (p, c) for p, c in self._probes
@@ -1521,36 +1533,47 @@ class HealthRegistry:
                 results.setdefault(p.name, result)
         return list(results.values())
 
-    def _prune_due(self) -> bool:
-        return self._last_prune is None or time.monotonic() - self._last_prune >= _PRUNE_INTERVAL_S
+    def _forget_due(self) -> bool:
+        return self._last_forget is None or time.monotonic() - self._last_forget >= _FORGET_INTERVAL_S
 
-    def _schedule_prune(self) -> None:
-        """Start a background :meth:`_prune_storage` when one is due; never awaited by a request."""
-        if not self._prune_due() or self._shutting_down:
+    def _schedule_forget(self) -> None:
+        """Start a background :meth:`_forget_unregistered` when one is due; never awaited by a request."""
+        if not self._forget_due() or self._shutting_down:
             return
-        if self._prune_task is not None and not self._prune_task.done():
+        if self._forget_task is not None and not self._forget_task.done():
             return
-        self._prune_task = asyncio.get_running_loop().create_task(self._prune_storage())
+        self._forget_task = asyncio.get_running_loop().create_task(self._forget_unregistered())
 
-    async def _prune_storage(self) -> None:
-        """Drop data of probes that are no longer registered, here and in storage.
+    async def _forget_unregistered(self) -> None:
+        """Drop data of probes this process wrote but no longer registers, here and in storage.
 
-        Runs at most every ``_PRUNE_INTERVAL_S``: from the first health request
+        Runs at most every ``_FORGET_INTERVAL_S``: from the first health request
         and from the poll loop.  Without it, a renamed or removed probe (e.g.
-        after ``discover_routes(refresh=True)`` or a deploy) would keep its
-        results and history in storage until their TTL, or forever with TTL 0.
-        Storage support is optional (``prune(keep)``).
+        after ``discover_routes(refresh=True)``) would keep its results and
+        history in storage until their TTL, or forever with TTL 0.
+
+        Only names in ``_written_names`` are ever deleted, via the optional
+        storage method ``forget(names)``.  Data written by other apps or other
+        replicas under the same prefix -- including probes this process never
+        registered, as during a rolling deploy -- is never touched.  A name
+        stays tracked until ``forget()`` succeeds, so a failed call is retried.
         """
-        self._last_prune = time.monotonic()
-        keep = {p.name for p, _ in self._probes}
+        self._last_forget = time.monotonic()
+        registered = {p.name for p, _ in self._probes}
         for state in (
             self._last_results, self._probe_last_run, self._probe_states,
             self._alerted_states, self._alert_last_sent_at, self._alert_pending,
         ):
-            for name in [n for n in state if n not in keep]:
+            for name in [n for n in state if n not in registered]:
                 del state[name]
-        if callable(getattr(self._storage, "prune", None)):
-            await self._storage_call("prune", keep)
+        stale = self._written_names - registered
+        if not stale:
+            return
+        if callable(getattr(self._storage, "forget", None)):
+            if await self._storage_call("forget", set(stale)) is _STORAGE_FAILED:
+                return
+        # A name registered again meanwhile is re-added by its next write.
+        self._written_names -= stale
 
     # ------------------------------------------------------------------
     # Polling loop
@@ -1673,13 +1696,13 @@ class HealthRegistry:
             except (asyncio.CancelledError, Exception):
                 pass
             self._alert_worker = None
-        if self._prune_task is not None and not self._prune_task.done():
-            self._prune_task.cancel()
+        if self._forget_task is not None and not self._forget_task.done():
+            self._forget_task.cancel()
             try:
-                await self._prune_task
+                await self._forget_task
             except (asyncio.CancelledError, Exception):
                 pass
-        self._prune_task = None
+        self._forget_task = None
         await self._close_probes()
 
     async def _close_probes(self) -> None:
@@ -1720,8 +1743,8 @@ class HealthRegistry:
                 due = [(p, c) for p, c in self._probes if self._is_probe_due(p, now)]
                 if due:
                     await self._execute_probes(due)
-                if self._prune_due():
-                    await self._prune_storage()
+                if self._forget_due():
+                    await self._forget_unregistered()
             except Exception:
                 (self._logger or _LIB_LOGGER).exception("fastapi-watch: poll iteration failed")
             await asyncio.sleep(1.0)
@@ -2084,19 +2107,26 @@ class HealthRegistry:
 
             stream_deps = [Depends(_stream_auth)]
 
-        def _make_sse_report(results: list[ProbeResult]) -> str:
-            return HealthReport.from_results(
+        def _make_sse_report(results: list[ProbeResult], view: str | None = None) -> str:
+            report = HealthReport.from_results(
                 results,
                 checked_at=registry._last_checked_at,
                 timezone=registry._timezone_name,
-            ).model_dump_json()
+            )
+            if view != "dashboard":
+                return report.model_dump_json()
+            # The built-in dashboard's view: the same slimming as the page's
+            # embedded probes (full details, routes cut to the charted top ones).
+            data = report.model_dump(mode="json", exclude={"probes"})
+            data["probes"] = [_current_probe(r) for r in report.probes]
+            return to_json(data).decode()
 
         sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
         def _storage_unavailable() -> Response:
             return JSONResponse({"error": "storage unavailable"}, status_code=503)
 
-        def _open_stream(request: Request, tag: str | None, probe: str | None) -> Response:
+        def _open_stream(request: Request, tag: str | None, probe: str | None, view: str | None) -> Response:
             """Start an SSE response, or answer 503 once ``max_stream_connections`` are open.
 
             The slot is taken here, before the generator starts, so a burst of
@@ -2113,7 +2143,7 @@ class HealthRegistry:
             return _SlotStreamingResponse(
                 registry._event_stream(
                     request,
-                    _make_sse_report,
+                    functools.partial(_make_sse_report, view=view),
                     filter_tags=_parse_csv_filter(tag),
                     filter_probes=_parse_csv_filter(probe),
                     expires_at=getattr(request.state, "stream_token_expiry", None),
@@ -2294,22 +2324,39 @@ class HealthRegistry:
             request: Request,
             tag: str | None = Query(default=None),
             probe: str | None = Query(default=None),
+            view: Literal["dashboard"] | None = Query(
+                default=None,
+                description=(
+                    "``dashboard``: each probe's ``details.routes`` cut to the 8 busiest routes "
+                    "with only the charted fields, as the built-in dashboard needs."
+                ),
+            ),
         ) -> Response:
-            return _open_stream(request, tag, probe)
+            return _open_stream(request, tag, probe, view)
 
         @self.app.get(
             f"{prefix}/status/stream",
             tags=tags,
             summary="Health status stream",
-            description="SSE (Server-Sent Events) stream of full probe results. Poll loop stops when last client disconnects.",
+            description=(
+                "SSE (Server-Sent Events) stream of full probe results. Poll loop stops when last client disconnects. "
+                "``view=dashboard`` cuts each probe's ``details.routes`` to what the built-in dashboard charts."
+            ),
             dependencies=stream_deps,
         )
         async def status_stream(
             request: Request,
             tag: str | None = Query(default=None),
             probe: str | None = Query(default=None),
+            view: Literal["dashboard"] | None = Query(
+                default=None,
+                description=(
+                    "``dashboard``: each probe's ``details.routes`` cut to the 8 busiest routes "
+                    "with only the charted fields, as the built-in dashboard needs."
+                ),
+            ),
         ) -> Response:
-            return _open_stream(request, tag, probe)
+            return _open_stream(request, tag, probe, view)
 
         @self.app.get(
             f"{prefix}/metrics",
@@ -2423,9 +2470,10 @@ class HealthRegistry:
                     # root_path carries any mount or proxy prefix the app is served
                     # under; without it the page would stream from the wrong URL.
                     root_path = request.scope.get("root_path", "").rstrip("/")
-                    stream_url = f"{root_path}{prefix}/status/stream"
+                    params = {"view": "dashboard"}  # slimmed events: only what the page reads
                     if token_key is not None:
-                        stream_url += f"?token={_mint_stream_token(token_key)}"
+                        params["token"] = _mint_stream_token(token_key)
+                    stream_url = f"{root_path}{prefix}/status/stream?{urlencode(params)}"
                     return render_dashboard(report, stream_url=stream_url, maintenance_banner=maintenance, history=history)
 
             @self.app.get(

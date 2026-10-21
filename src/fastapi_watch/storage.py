@@ -1,16 +1,22 @@
 """Storage backends for probe results and alert history.
 
-:class:`HealthRegistry` writes to storage after every probe poll and reads
-from it to serve the health endpoints.  Three collections are managed:
+:class:`HealthRegistry` writes to storage after every probe check.  The
+readiness, status, metrics and stream endpoints are served from the
+registry's in-process copy of its own results and never read storage, so a
+slow or shared backend cannot slow or skew them.  Three collections are
+managed:
 
 * **Latest** — the most recent :class:`~fastapi_watch.models.ProbeResult` per
-  probe.  Served by ``GET /health/status`` and the live dashboard.
+  probe.  The registry reads it only to show a probe's last result while its
+  circuit is open and this process holds none.
 * **History** — a rolling window of past results per probe (capped at
-  ``max_results`` entries).  Served by ``GET /health/history``.
+  ``max_results`` entries).  Served by ``GET /health/history`` and embedded
+  in the dashboard's graphs.
 * **Alerts** — a log of probe state-change events
   (:class:`~fastapi_watch.models.AlertRecord`), written whenever a probe
   transitions between HEALTHY / DEGRADED / UNHEALTHY.  Served by
-  ``GET /health/alerts`` and consumed by alerters in ``alerts.py``.
+  ``GET /health/alerts``.  Alerters receive each record from the registry
+  directly, not from storage.
 
 Both the latest and history collections share the same ``result_ttl_seconds``
 expiry.  Alerts have their own ``alert_ttl_seconds`` expiry.  Setting either
@@ -45,11 +51,16 @@ class ProbeStorage(Protocol):
     (backends without them keep working)::
 
         # Apply the registry's history_size / TTL / max_alerts settings.
+        # Called only when HealthRegistry is given at least one of them
+        # explicitly; otherwise the backend keeps its own settings.
         def configure(self, *, max_results: int, result_ttl_seconds: float,
                       alert_ttl_seconds: float, max_alerts: int) -> None: ...
 
-        # Delete the latest result and history of every probe not in keep.
-        async def prune(self, keep: set[str]) -> None: ...
+        # Delete the latest result, history and any index entry of exactly the
+        # probes in names, and nothing else.  The registry passes only names
+        # it wrote itself and no longer registers, so apps and replicas
+        # sharing one namespace never delete each other's data.
+        async def forget(self, names: set[str]) -> None: ...
 
         # Return True if this caller is the first to claim key within
         # ttl_seconds (and record the claim), False if another caller holds it.
@@ -150,12 +161,11 @@ class InMemoryProbeStorage:
             self._history_times[name] = deque(self._history_times[name], maxlen=self._max_results)
         self._alerts = deque(self._alerts, maxlen=self._max_alerts)
 
-    async def prune(self, keep: set[str]) -> None:
-        """Drop the latest result and history of every probe not named in *keep*."""
-        for name in [n for n in self._cache if n not in keep]:
+    async def forget(self, names: set[str]) -> None:
+        """Drop the latest result and history of exactly the probes in *names*."""
+        for name in names:
             self._cache.pop(name, None)
             self._cache_times.pop(name, None)
-        for name in [n for n in self._history if n not in keep]:
             self._history.pop(name, None)
             self._history_times.pop(name, None)
 
