@@ -525,6 +525,21 @@ class HealthRegistry:
         max_stream_connections: Most SSE stream connections open at once
             (keyword-only, default ``100``; ``None`` = unlimited).  Further
             stream requests get ``503`` with a ``Retry-After`` header.
+        alert_min_interval_s: Flap limiting (keyword-only, default ``0`` = off).
+            At most one alert per probe is sent to alerters per this many
+            seconds.  The first change after a quiet interval alerts at once;
+            later changes inside the interval are coalesced, and when it ends
+            the probe's latest status is sent if it differs from the last one
+            sent — so the final state is never lost, and a flap that ends
+            where it started sends nothing.  Callbacks and stored alert
+            records still see every transition.
+        alert_dedupe_window_s: Cross-replica alert dedupe (keyword-only,
+            default ``None`` = off).  With a shared storage backend that
+            implements ``claim_alert(key, ttl_seconds)``, replicas claim each
+            ``"<probe>:<new_status>"`` alert for this many seconds and only
+            the winner sends it.  A failing claim sends anyway.  Without
+            ``claim_alert`` a warning is logged at init and alerts are not
+            deduplicated.
         stream_token_secret: Key that signs the dashboard's short-lived stream
             tokens (keyword-only).  By default the key is derived from the
             *auth* credentials with scrypt, or is random per process for a
@@ -573,6 +588,8 @@ class HealthRegistry:
         stream_token_secret: str | bytes | None = None,
         storage_timeout: float | None = 2.0,
         max_stream_connections: int | None = 100,
+        alert_min_interval_s: float = 0.0,
+        alert_dedupe_window_s: float | None = None,
     ) -> None:
         if probe_timeout is not None and probe_timeout <= 0:
             raise ValueError(f"probe_timeout must be positive or None, got {probe_timeout!r}")
@@ -580,6 +597,10 @@ class HealthRegistry:
             raise ValueError(f"storage_timeout must be positive or None, got {storage_timeout!r}")
         if max_stream_connections is not None and max_stream_connections < 1:
             raise ValueError(f"max_stream_connections must be at least 1 or None, got {max_stream_connections!r}")
+        if alert_min_interval_s < 0:
+            raise ValueError(f"alert_min_interval_s must be zero or positive, got {alert_min_interval_s!r}")
+        if alert_dedupe_window_s is not None and alert_dedupe_window_s <= 0:
+            raise ValueError(f"alert_dedupe_window_s must be positive or None, got {alert_dedupe_window_s!r}")
         _validate_auth(auth)
         if stream_token_secret is not None and not stream_token_secret:
             raise ValueError("stream_token_secret must not be empty")
@@ -672,9 +693,28 @@ class HealthRegistry:
         self._sse_tasks: set[asyncio.Task] = set()
         self._signal_handler_installed: bool = False
 
-        # Bounded alert queue — avoids unbounded create_task() per state-change
-        self._alert_queue: asyncio.Queue[AlertRecord] = asyncio.Queue(maxsize=256)
+        # Bounded alert queue — avoids unbounded create_task() per state-change.
+        # A None item only wakes the worker to re-check coalesced alerts.
+        self._alert_queue: asyncio.Queue[AlertRecord | None] = asyncio.Queue(maxsize=256)
         self._alert_worker: asyncio.Task | None = None
+
+        # Flap limiting: monotonic time of each probe's last alert, and the
+        # time a coalesced alert falls due (one marker per probe at most).
+        self._alert_min_interval_s: float = float(alert_min_interval_s)
+        self._alert_last_sent_at: dict[str, float] = {}
+        self._alert_pending: dict[str, float] = {}
+
+        # Cross-replica dedupe through the storage's optional claim_alert().
+        self._alert_dedupe_window_s: float | None = alert_dedupe_window_s
+        if alert_dedupe_window_s is not None and (
+            storage is None or not callable(getattr(self._storage, "claim_alert", None))
+        ):
+            (self._logger or _LIB_LOGGER).warning(
+                "fastapi-watch: alert_dedupe_window_s needs a shared storage backend that implements "
+                "claim_alert(); %s does not, so every replica sends its own alerts.",
+                "the default in-process storage" if storage is None else type(self._storage).__name__,
+            )
+            self._alert_dedupe_window_s = None
 
         if serve_routes:
             self._register_routes(tags or ["health"], dashboard=dashboard)
@@ -1500,7 +1540,10 @@ class HealthRegistry:
         """
         self._last_prune = time.monotonic()
         keep = {p.name for p, _ in self._probes}
-        for state in (self._last_results, self._probe_last_run, self._probe_states, self._alerted_states):
+        for state in (
+            self._last_results, self._probe_last_run, self._probe_states,
+            self._alerted_states, self._alert_last_sent_at, self._alert_pending,
+        ):
             for name in [n for n in state if n not in keep]:
                 del state[name]
         if callable(getattr(self._storage, "prune", None)):
@@ -1833,25 +1876,44 @@ class HealthRegistry:
                             result.name,
                         )
             if self._alerters and not in_maintenance:
-                self._send_to_alerters(result, alert_record)
+                self._send_to_alerters(result.name, result.status, alert_record)
 
-    def _send_to_alerters(self, result: ProbeResult, transition: AlertRecord | None) -> None:
-        """Queue an alert if *result* differs from the status alerters last received.
+    def _send_to_alerters(
+        self, name: str, status: ProbeStatus, transition: AlertRecord | None, *, due: bool = False
+    ) -> None:
+        """Queue an alert if *status* differs from the status alerters last received.
 
         *transition* is the record of a real state change, reused when it
         starts from what alerters last saw; otherwise (catching up after
-        maintenance) a record from the last-sent status is built.  The
-        last-sent status advances only once the alert is queued, so an alert
-        dropped on a full queue is retried at the next check.
+        maintenance, or a coalesced change) a record from the last-sent status
+        is built.  The last-sent status advances only once the alert is
+        queued, so an alert dropped on a full queue is retried at the next check.
+
+        With ``alert_min_interval_s``, a change within that interval of the
+        probe's last alert is not queued: a pending marker is set instead, and
+        the alert worker sends the probe's then-current status when the
+        interval ends — if it still differs from the last one sent.  The first
+        alert after a quiet interval is never delayed.  *due* marks that send
+        (the interval has ended), skipping the rate check.
         """
-        sent = self._alerted_states.get(result.name, ProbeStatus.HEALTHY)
-        if sent == result.status:
+        sent = self._alerted_states.get(name, ProbeStatus.HEALTHY)
+        if sent == status:
+            # Back where alerters last saw it: a flap that needs no alert.
+            self._alert_pending.pop(name, None)
             return
+        now = time.monotonic()
+        if self._alert_min_interval_s > 0 and not due:
+            last = self._alert_last_sent_at.get(name)
+            if last is not None and now - last < self._alert_min_interval_s:
+                if name not in self._alert_pending:
+                    self._alert_pending[name] = last + self._alert_min_interval_s
+                    self._wake_alert_worker()
+                return
         if transition is None or transition.old_status != sent:
             transition = AlertRecord(
-                probe=result.name,
+                probe=name,
                 old_status=sent,
-                new_status=result.status,
+                new_status=status,
                 timestamp=datetime.now(self._tzinfo),
             )
         self._ensure_alert_worker()
@@ -1861,7 +1923,54 @@ class HealthRegistry:
             if self._logger:
                 self._logger.warning("Alert queue full, dropping alert for probe %r", transition.probe)
             return
-        self._alerted_states[result.name] = result.status
+        self._alerted_states[name] = status
+        self._alert_last_sent_at[name] = now
+        self._alert_pending.pop(name, None)
+
+    def _wake_alert_worker(self) -> None:
+        """Make the alert worker recompute when the next coalesced alert is due."""
+        self._ensure_alert_worker()
+        try:
+            self._alert_queue.put_nowait(None)
+        except asyncio.QueueFull:
+            pass  # the worker is busy and re-checks after each alert anyway
+
+    def _next_pending_alert_delay(self) -> float | None:
+        """Seconds until the next coalesced alert is due, or ``None`` if none is pending."""
+        if not self._alert_pending:
+            return None
+        return max(0.0, min(self._alert_pending.values()) - time.monotonic())
+
+    def _send_due_alerts(self) -> None:
+        """Send the current status of every probe whose coalescing interval has ended.
+
+        Pending markers that fall due during maintenance are dropped: the
+        first check after maintenance catches alerters up anyway.
+        """
+        if not self._alert_pending:
+            return
+        now = time.monotonic()
+        in_maintenance = self._in_maintenance()
+        for name, due in list(self._alert_pending.items()):
+            if due > now:
+                continue
+            del self._alert_pending[name]
+            status = self._probe_states.get(name)
+            if status is not None and self._alerters and not in_maintenance:
+                self._send_to_alerters(name, status, None, due=True)
+
+    async def _claim_alert(self, alert: AlertRecord) -> bool:
+        """True if this replica should send *alert* (always, without dedupe).
+
+        With ``alert_dedupe_window_s``, replicas sharing a storage backend race
+        to claim ``"<probe>:<new_status>"`` for that window and only the winner
+        sends.  A failing claim sends anyway: a duplicate alert beats none.
+        """
+        if self._alert_dedupe_window_s is None:
+            return True
+        key = f"{alert.probe}:{alert.new_status.value}"
+        claimed = await self._storage_call("claim_alert", key, self._alert_dedupe_window_s)
+        return claimed is _STORAGE_FAILED or bool(claimed)
 
     def _ensure_alert_worker(self) -> None:
         """Start the alert worker task if not already running."""
@@ -1874,20 +1983,32 @@ class HealthRegistry:
                 pass  # no running loop yet
 
     async def _alert_loop(self) -> None:
-        """Drain the alert queue, dispatching each alert to all registered alerters."""
+        """Drain the alert queue, dispatching each alert to all registered alerters.
+
+        Between alerts it also sends coalesced alerts (``alert_min_interval_s``)
+        as they fall due, waking for the earliest one.
+        """
         while True:
+            self._send_due_alerts()
+            delay = self._next_pending_alert_delay()
             try:
-                alert = await self._alert_queue.get()
+                if delay is None:
+                    alert = await self._alert_queue.get()
+                else:
+                    alert = await asyncio.wait_for(self._alert_queue.get(), delay)
+            except asyncio.TimeoutError:
+                continue  # a coalesced alert is due
             except asyncio.CancelledError:
                 return
             try:
-                await self._dispatch_alert(alert)
+                if alert is not None and await self._claim_alert(alert):
+                    await self._dispatch_alert(alert)
             except asyncio.CancelledError:
                 return
             except Exception:
                 # The worker must outlive any one bad alert, but not silently.
                 (self._logger or _LIB_LOGGER).exception(
-                    "Dispatching alert for probe %s failed", alert.probe
+                    "Dispatching alert for probe %s failed", getattr(alert, "probe", None)
                 )
             finally:
                 self._alert_queue.task_done()
