@@ -439,7 +439,7 @@ Only `/health/ready` is affected — `/health/status` and `/health/live` always 
 
 ## State-change callbacks
 
-Callbacks fire whenever a probe's status changes between runs. Receives `(probe_name: str, old_status: ProbeStatus, new_status: ProbeStatus)`.
+Callbacks fire whenever a probe's status changes between runs. Receives `(probe_name: str, old_status: ProbeStatus, new_status: ProbeStatus)`. A probe's state before its first result counts as `HEALTHY`, so a probe that is already failing at startup fires `healthy → unhealthy` (and alerts); a first healthy result fires nothing. A callback that raises is logged and does not affect the health check or the other callbacks.
 
 ```python
 def on_change(probe_name, old_status, new_status):

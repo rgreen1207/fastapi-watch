@@ -1388,12 +1388,18 @@ class HealthRegistry:
     # ------------------------------------------------------------------
 
     async def _fire_state_changes(self, results: list[ProbeResult]) -> None:
-        """Record alerts and fire callbacks/webhook for any probe whose status changed."""
+        """Record alerts and fire callbacks/webhook for any probe whose status changed.
+
+        A probe's state before its first result is taken to be HEALTHY, so a
+        probe that is already failing at startup alerts (``healthy -> unhealthy``)
+        instead of staying silent until it happens to recover and fail again.
+        A first HEALTHY result is not a change and fires nothing.
+        """
         in_maintenance = self._in_maintenance()
         for result in results:
-            old = self._probe_states.get(result.name)
+            old = self._probe_states.get(result.name, ProbeStatus.HEALTHY)
             self._probe_states[result.name] = result.status
-            if old is not None and old != result.status:
+            if old != result.status:
                 alert_record = AlertRecord(
                     probe=result.name,
                     old_status=old,

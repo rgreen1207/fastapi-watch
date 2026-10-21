@@ -241,3 +241,65 @@ async def test_background_polling_not_restarted_after_shutdown():
     await registry._shutdown()
     registry.set_started()
     assert registry._poll_task is None
+
+
+# ---------------------------------------------------------------------------
+# A probe failing on its first check alerts
+# ---------------------------------------------------------------------------
+
+class _Fixed(BaseProbe):
+    def __init__(self, status: ProbeStatus):
+        self.name = "fixed"
+        self.status = status
+
+    async def check(self):
+        return ProbeResult(name=self.name, status=self.status)
+
+
+class _RecordingAlerter:
+    def __init__(self):
+        self.alerts = []
+
+    async def notify(self, alert):
+        self.alerts.append(alert)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [ProbeStatus.UNHEALTHY, ProbeStatus.DEGRADED])
+async def test_first_non_healthy_result_alerts(status):
+    alerter = _RecordingAlerter()
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=None, alerters=[alerter])
+    registry.add(_Fixed(status))
+    events = []
+    registry.on_state_change(lambda *event: events.append(event))
+
+    await registry.run_all()
+    await asyncio.sleep(0.05)  # let the alert worker drain
+    assert events == [("fixed", ProbeStatus.HEALTHY, status)]
+    assert [(a.old_status, a.new_status) for a in alerter.alerts] == [(ProbeStatus.HEALTHY, status)]
+    assert len(await registry._storage.get_alerts()) == 1
+    await registry._shutdown()
+
+
+@pytest.mark.asyncio
+async def test_first_healthy_result_is_silent():
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=None)
+    registry.add(_Fixed(ProbeStatus.HEALTHY))
+    events = []
+    registry.on_state_change(lambda *event: events.append(event))
+    await registry.run_all()
+    assert events == []
+    assert await registry._storage.get_alerts() == []
+
+
+@pytest.mark.asyncio
+async def test_first_failure_during_maintenance_is_recorded_but_not_sent():
+    alerter = _RecordingAlerter()
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=None, alerters=[alerter])
+    registry.add(_Fixed(ProbeStatus.UNHEALTHY))
+    registry.set_maintenance()
+    await registry.run_all()
+    await asyncio.sleep(0.05)
+    assert alerter.alerts == []
+    assert len(await registry._storage.get_alerts()) == 1
+    await registry._shutdown()

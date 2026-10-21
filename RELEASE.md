@@ -96,6 +96,10 @@ README.md and DOCS.md showed `auth={"username": ..., "password": ...}` (missing 
 
 **Fix:** the renderer's signature is inspected once at startup: one-argument renderers are called with the report, and renderers taking a second positional argument (as 1.7.1 required) still receive the maintenance flag.
 
+#### A probe failing at startup now alerts
+
+State changes were only recognised from a probe's second result onward, so a dependency that was already down when the service started produced no callback and no alert — and stayed silent until it recovered and failed again. A probe's state before its first result now counts as `HEALTHY`: a first `UNHEALTHY` or `DEGRADED` result fires callbacks and alerters (`healthy → unhealthy`); a first `HEALTHY` result fires nothing, as before.
+
 #### Probes with their own interval poll from startup, not from the first dashboard visit
 
 A probe with its own `poll_interval_ms` is meant to poll in the background, and polling did continue after the last stream client left — but it only ever *started* when the first SSE client connected. Whether background polling happened at all depended on someone having opened the dashboard. It now starts at `set_started()`, or at the first health request when `set_started()` ran outside an event loop.
