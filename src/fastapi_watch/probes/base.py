@@ -184,6 +184,13 @@ class PassiveProbe(BaseProbe):
     The registry's circuit breaker is off by default (``circuit_breaker_enabled=False``):
     a passive probe only reads in-memory counters, so suspending it protects no
     dependency and would show a stale result while traffic recovers.
+
+    ``last_error`` names only the exception type (``"IntegrityError"``), or
+    ``"HTTP <status>"`` for a status-code-only error.  Exception messages often
+    carry DSNs, credentials, or the bound parameters of a failed query, and
+    health endpoints are often public, so the message is logged at debug level
+    instead.  Pass ``expose_error_messages=True`` to report it as
+    ``"<type>: <message>"`` — only where the health endpoints are protected.
     """
 
     # Overridden by FastAPIRouteProbe, which counts requests rather than calls.
@@ -207,6 +214,7 @@ class PassiveProbe(BaseProbe):
         cache_time_window_s: float = 120.0,
         timeout: float | None = None,
         poll_interval_ms: int | None = None,
+        expose_error_messages: bool = False,
     ) -> None:
         _validate_stats_params(
             window_size=window_size,
@@ -226,6 +234,7 @@ class PassiveProbe(BaseProbe):
         self.slow_call_threshold_ms = slow_call_threshold_ms
         self.cache_reporting = cache_reporting
         self.cache_time_window_s = cache_time_window_s
+        self.expose_error_messages = expose_error_messages
         # None = not explicitly set; auto-detected from cache maxsize in watch()
         self._cache_window_size: int | None = cache_window_size
         self._cache_window_size_explicit: bool = cache_window_size is not None
@@ -408,6 +417,17 @@ class PassiveProbe(BaseProbe):
         """
         return self._wrap(func)
 
+    def _error_message(self, exc: Exception) -> str:
+        """``last_error`` text for *exc*: its type, plus its message only when opted in.
+
+        The message (an ``HTTPException``'s ``detail`` included) is logged at
+        debug level instead; see the class docstring.
+        """
+        if self.expose_error_messages:
+            return f"{type(exc).__name__}: {exc}"
+        _LOGGER.debug("fastapi-watch: probe %r observed a failed call", self.name, exc_info=exc)
+        return type(exc).__name__
+
     def _wrap(self, func: Callable) -> Callable:
         has_cache = self.cache_reporting and callable(getattr(func, "cache_info", None))
 
@@ -441,7 +461,7 @@ class PassiveProbe(BaseProbe):
                     rtt_ms,
                     error=is_error,
                     status=status,
-                    error_msg=f"{type(exc).__name__}: {exc}",
+                    error_msg=self._error_message(exc),
                     error_type=type(exc).__name__,
                 )
             except Exception:

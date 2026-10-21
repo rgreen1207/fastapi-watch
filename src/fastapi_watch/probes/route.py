@@ -70,6 +70,10 @@ class FastAPIRouteProbe(PassiveProbe):
             distribution, and error-type breakdown. Defaults to ``window_size``.
         slow_call_threshold_ms: Requests taking longer than this (ms) are counted
             as slow calls. ``None`` disables the counter.
+        expose_error_messages: When ``True``, ``last_error`` includes the
+            exception message (an ``HTTPException``'s ``detail``, for example).
+            Off by default: messages can carry credentials or personal data,
+            and only the exception type (or ``"HTTP <status>"``) is reported.
     """
 
     _count_key = "request_count"
@@ -93,6 +97,7 @@ class FastAPIRouteProbe(PassiveProbe):
         slow_call_threshold_ms: float | None = None,
         cache_reporting: bool = True,
         cache_time_window_s: float = 120.0,
+        expose_error_messages: bool = False,
     ) -> None:
         super().__init__(
             name,
@@ -109,6 +114,7 @@ class FastAPIRouteProbe(PassiveProbe):
             cache_time_window_s=cache_time_window_s,
             timeout=timeout,
             poll_interval_ms=poll_interval_ms,
+            expose_error_messages=expose_error_messages,
         )
         self.min_error_status = min_error_status
 
