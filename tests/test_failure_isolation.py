@@ -68,18 +68,38 @@ class _FailOnceStorage(InMemoryProbeStorage):
 
 
 @pytest.mark.asyncio
-async def test_poll_loop_survives_a_failing_iteration(caplog):
-    registry = HealthRegistry(FastAPI(), poll_interval_ms=1000, storage=_FailOnceStorage())
-    probe = _Flip()
-    registry.add(probe)
+async def test_poll_loop_survives_a_failing_iteration(caplog, monkeypatch):
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=1000)
+    registry.add(_Flip())
 
+    async def _fails(pairs):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(registry, "_execute_probes", _fails)
     with caplog.at_level("ERROR", logger="fastapi_watch"):
         task = asyncio.create_task(registry._poll_loop())
         await asyncio.sleep(0.05)
     try:
-        assert probe.calls == 1
-        assert not task.done()  # still alive after the storage error
+        assert not task.done()  # still alive after the failed iteration
         assert any("poll iteration failed" in r.getMessage() for r in caplog.records)
+    finally:
+        task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_storage_error_is_contained_in_the_probe_run(caplog):
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=1000, storage=_FailOnceStorage())
+    probe = _Flip()
+    registry.add(probe)
+
+    with caplog.at_level("WARNING", logger="fastapi_watch"):
+        task = asyncio.create_task(registry._poll_loop())
+        await asyncio.sleep(0.05)
+    try:
+        assert probe.calls == 1
+        assert not task.done()
+        assert registry._last_results["flip"].status == ProbeStatus.HEALTHY
+        assert any("storage set_latest failed" in r.getMessage() for r in caplog.records)
     finally:
         task.cancel()
 

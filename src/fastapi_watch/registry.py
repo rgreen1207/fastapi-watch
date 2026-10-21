@@ -51,6 +51,14 @@ _LIB_LOGGER = logging.getLogger("fastapi_watch")
 # browsers in single-fetch mode.
 _SSE_KEEPALIVE_S = 15.0
 _SINGLE_FETCH_RETRY_MS = 30_000
+# Storage: returned by _storage_call when an operation fails or times out; a
+# failing operation is logged at most once per interval; stored data of
+# probes no longer registered is pruned at most this often.
+_STORAGE_FAILED: Any = object()
+_STORAGE_LOG_INTERVAL_S = 60.0
+_PRUNE_INTERVAL_S = 600.0
+# Shutdown: how long each probe's aclose() may take.
+_ACLOSE_TIMEOUT_S = 5.0
 
 
 def _iter_app_routes(routes, prefix: str = "") -> Iterator[tuple[Any, str]]:
@@ -491,6 +499,13 @@ class HealthRegistry:
             (default ``""``, keeping ``probe_healthy`` etc.).  Those names
             collide with blackbox_exporter's ``probe_*`` metrics; set e.g.
             ``"fastapi_watch_"`` to namespace them.
+        storage_timeout: Seconds each storage operation may take (keyword-only,
+            default ``2.0``; ``None`` disables).  A storage operation that
+            fails or times out is logged (at most once a minute per operation)
+            and never fails a health check: ``/ready``, ``/status``,
+            ``/metrics`` and the streams are served from this process's last
+            results, ``/history`` and ``/alerts`` return 503, and the
+            dashboard renders without history.
         stream_token_secret: Key that signs the dashboard's short-lived stream
             tokens (keyword-only).  By default the key is derived from the
             *auth* credentials with scrypt, or is random per process for a
@@ -537,9 +552,12 @@ class HealthRegistry:
         metrics_prefix: str = "",
         *,
         stream_token_secret: str | bytes | None = None,
+        storage_timeout: float | None = 2.0,
     ) -> None:
         if probe_timeout is not None and probe_timeout <= 0:
             raise ValueError(f"probe_timeout must be positive or None, got {probe_timeout!r}")
+        if storage_timeout is not None and storage_timeout <= 0:
+            raise ValueError(f"storage_timeout must be positive or None, got {storage_timeout!r}")
         _validate_auth(auth)
         if stream_token_secret is not None and not stream_token_secret:
             raise ValueError("stream_token_secret must not be empty")
@@ -559,6 +577,9 @@ class HealthRegistry:
             "alert_ttl_seconds": float(alert_ttl_seconds),
             "max_alerts": int(max(1, max_alerts)),
         }
+        self._storage_timeout = storage_timeout
+        # op name -> (monotonic time last logged, failures suppressed since)
+        self._storage_failures: dict[str, tuple[float, int]] = {}
         if storage is None:
             self._storage: ProbeStorage = InMemoryProbeStorage(**retention)
         else:
@@ -575,9 +596,15 @@ class HealthRegistry:
         # Per-probe scheduling
         self._probe_last_run: dict[str, float] = {}
         self._last_checked_at: datetime | None = None
-        self._cache_lock = asyncio.Lock()
+        # Last result per probe, as checked by this process.  Health endpoints
+        # are served from here, so they reflect this process's own checks and
+        # keep working while storage is slow or down.  One entry per probe name.
+        self._last_results: dict[str, ProbeResult] = {}
         # id(probe) -> its in-flight run, shared by concurrent callers
         self._inflight: dict[int, asyncio.Task] = {}
+        # Storage pruning of probes no longer registered (monotonic time of the last one)
+        self._last_prune: float | None = None
+        self._prune_task: asyncio.Task | None = None
 
         # Circuit breaker state
         self._circuit_breaker_enabled: bool = circuit_breaker
@@ -1099,7 +1126,11 @@ class HealthRegistry:
         """
         self._poll_interval_ms = self._set_interval(ms)
         if self._poll_interval_ms is None:
-            self._storage.clear_latest()
+            self._last_results.clear()
+            try:
+                self._storage.clear_latest()
+            except Exception as exc:
+                self._log_storage_failure("clear_latest", exc)
             if not self._has_custom_intervals():
                 self._cancel_poll_task()
         elif self._active_connections > 0:
@@ -1167,24 +1198,72 @@ class HealthRegistry:
         return task
 
     async def _run_probe(self, probe: BaseProbe, critical: bool) -> ProbeResult:
-        """Check one probe, then record its result, history, and state change exactly once."""
-        result = await self._safe_check(probe, critical)
+        """Check one probe, then record its result, history, and state change exactly once.
+
+        The result is kept in-process first, so it is reported even when the
+        storage writes fail.  Those writes and the state-change handling run
+        concurrently: a slow backend delays the check by at most one
+        ``storage_timeout``, not one per write.
+        """
+        result, from_cache = await self._check_or_cached(probe, critical)
         checked_at = datetime.now(self._tzinfo)
-        updates: dict = {"checked_at": checked_at}
+        # A cached result served while the circuit is open keeps its own
+        # checked_at: stamping it "now" would make a stale result look fresh.
+        updates: dict = {} if from_cache else {"checked_at": checked_at}
         if getattr(probe, "description", None) is not None and result.description is None:
             updates["description"] = probe.description
         probe_tags = getattr(probe, "tags", None) or []
         if probe_tags and not result.tags:
             updates["tags"] = probe_tags
-        result = result.model_copy(update=updates)
-        run_time = asyncio.get_running_loop().time()
-        async with self._cache_lock:
-            await self._storage.set_latest(result)
-            self._probe_last_run[result.name] = run_time
+        if updates:
+            result = result.model_copy(update=updates)
+        self._last_results[probe.name] = result
+        self._probe_last_run[probe.name] = asyncio.get_running_loop().time()
+        if not from_cache:
             self._last_checked_at = checked_at
-        await self._storage.append_history(result)
-        await self._fire_state_changes([result])
+        await asyncio.gather(
+            self._storage_call("set_latest", result),
+            self._storage_call("append_history", result),
+            self._fire_state_changes([result]),
+        )
         return result
+
+    async def _storage_call(self, op: str, *args: Any) -> Any:
+        """Await ``storage.<op>(*args)``, bounded by ``storage_timeout``.
+
+        Returns the result, or ``_STORAGE_FAILED`` if the call raised or timed
+        out (after logging it, rate-limited).  Never raises an ``Exception``:
+        the monitoring store being down must not take health checks down.
+        The default in-memory backend cannot block, so it skips the timeout.
+        """
+        try:
+            awaitable = getattr(self._storage, op)(*args)
+            if self._storage_timeout is None or type(self._storage) is InMemoryProbeStorage:
+                return await awaitable
+            return await asyncio.wait_for(awaitable, self._storage_timeout)
+        except Exception as exc:
+            self._log_storage_failure(op, exc)
+            return _STORAGE_FAILED
+
+    def _log_storage_failure(self, op: str, exc: BaseException) -> None:
+        """Log a failed storage *op*, at most once per ``_STORAGE_LOG_INTERVAL_S``."""
+        now = time.monotonic()
+        last, suppressed = self._storage_failures.get(op, (None, 0))
+        if last is not None and now - last < _STORAGE_LOG_INTERVAL_S:
+            self._storage_failures[op] = (last, suppressed + 1)
+            return
+        self._storage_failures[op] = (now, 0)
+        timed_out = isinstance(exc, asyncio.TimeoutError) and self._storage_timeout is not None
+        reason = f"timed out after {self._storage_timeout:g} s" if timed_out else f"failed ({type(exc).__name__})"
+        (self._logger or _LIB_LOGGER).warning(
+            "fastapi-watch: storage %s %s%s; health checks continue from in-process results "
+            "(logged at most once per %g s per operation)",
+            op,
+            reason,
+            f", {suppressed} more failure(s) since the last report" if suppressed else "",
+            _STORAGE_LOG_INTERVAL_S,
+            exc_info=None if timed_out else exc,
+        )
 
     def _is_cb_active(self, probe: BaseProbe) -> bool:
         """Return True if the circuit breaker is active for this probe."""
@@ -1224,6 +1303,14 @@ class HealthRegistry:
 
     async def _safe_check(self, probe: BaseProbe, critical: bool) -> ProbeResult:
         """Run one probe with circuit-breaker and timeout handling."""
+        return (await self._check_or_cached(probe, critical))[0]
+
+    async def _check_or_cached(self, probe: BaseProbe, critical: bool) -> tuple[ProbeResult, bool]:
+        """Run one probe with circuit-breaker and timeout handling.
+
+        Returns ``(result, from_cache)``; *from_cache* is True when the circuit
+        is open and the probe's last result is served in place of a check.
+        """
         loop = asyncio.get_running_loop()
         cb_active = self._is_cb_active(probe)
 
@@ -1232,17 +1319,20 @@ class HealthRegistry:
             open_until = self._circuit_open_until.get(probe.name, 0.0)
             if loop.time() < open_until:
                 cb_info = self._cb_info(probe.name, True)
-                cached = await self._storage.get_latest(probe.name)
+                cached = self._last_results.get(probe.name)
+                if cached is None:
+                    stored = await self._storage_call("get_latest", probe.name)
+                    cached = None if stored is _STORAGE_FAILED else stored
                 if cached is not None:
                     details = {**(cached.details or {}), "circuit_breaker": cb_info}
-                    return cached.model_copy(update={"critical": critical, "details": details})
+                    return cached.model_copy(update={"critical": critical, "details": details}), True
                 return ProbeResult(
                     name=probe.name,
                     status=ProbeStatus.UNHEALTHY,
                     critical=critical,
                     error="circuit breaker open — probe temporarily suspended",
                     details={"circuit_breaker": cb_info},
-                )
+                ), False
 
         result = await self._guarded_check(probe, critical)
 
@@ -1284,7 +1374,7 @@ class HealthRegistry:
                 update={"details": {**(result.details or {}), "circuit_breaker": cb_info}}
             )
 
-        return result
+        return result, False
 
     # ------------------------------------------------------------------
     # Per-probe scheduling helpers
@@ -1331,23 +1421,65 @@ class HealthRegistry:
     # ------------------------------------------------------------------
 
     async def _get_results(self) -> list[ProbeResult]:
-        """Return current probe results.
+        """Return the current result of every registered probe, as checked by this process.
 
         Single-fetch probes always run fresh.  Polled probes run when their
-        interval has elapsed or their result is absent from cache.
+        interval has elapsed, when they have not yet run in this process, or
+        when no result is held for them.
+
+        Results come from the in-process copy of each probe's last result, not
+        from storage.  A shared backend (e.g. Redis) also holds other
+        replicas' and other apps' results — under the same probe names, for
+        replicas — and those must not decide this process's readiness.  It
+        also means no storage read per request, so a slow or unavailable
+        backend cannot slow or fail health checks.
         """
         self._ensure_background_polling()
-        cached = await self._storage.get_all_latest()
+        self._schedule_prune()
         now = asyncio.get_running_loop().time()
         to_run = [
             (p, c) for p, c in self._probes
             if self._effective_interval_s(p) is None
-            or p.name not in cached
-            or (p.name in self._probe_last_run and self._is_probe_due(p, now))
+            or p.name not in self._probe_last_run
+            or p.name not in self._last_results
+            or self._is_probe_due(p, now)
         ]
         if to_run:
             await self._execute_probes(to_run)
-        return list((await self._storage.get_all_latest()).values())
+        results: dict[str, ProbeResult] = {}
+        for p, _ in self._probes:
+            result = self._last_results.get(p.name)
+            if result is not None:
+                results.setdefault(p.name, result)
+        return list(results.values())
+
+    def _prune_due(self) -> bool:
+        return self._last_prune is None or time.monotonic() - self._last_prune >= _PRUNE_INTERVAL_S
+
+    def _schedule_prune(self) -> None:
+        """Start a background :meth:`_prune_storage` when one is due; never awaited by a request."""
+        if not self._prune_due() or self._shutting_down:
+            return
+        if self._prune_task is not None and not self._prune_task.done():
+            return
+        self._prune_task = asyncio.get_running_loop().create_task(self._prune_storage())
+
+    async def _prune_storage(self) -> None:
+        """Drop data of probes that are no longer registered, here and in storage.
+
+        Runs at most every ``_PRUNE_INTERVAL_S``: from the first health request
+        and from the poll loop.  Without it, a renamed or removed probe (e.g.
+        after ``discover_routes(refresh=True)`` or a deploy) would keep its
+        results and history in storage until their TTL, or forever with TTL 0.
+        Storage support is optional (``prune(keep)``).
+        """
+        self._last_prune = time.monotonic()
+        keep = {p.name for p, _ in self._probes}
+        for state in (self._last_results, self._probe_last_run, self._probe_states, self._alerted_states):
+            for name in [n for n in state if n not in keep]:
+                del state[name]
+        if callable(getattr(self._storage, "prune", None)):
+            await self._storage_call("prune", keep)
 
     # ------------------------------------------------------------------
     # Polling loop
@@ -1470,6 +1602,38 @@ class HealthRegistry:
             except (asyncio.CancelledError, Exception):
                 pass
             self._alert_worker = None
+        if self._prune_task is not None and not self._prune_task.done():
+            self._prune_task.cancel()
+            try:
+                await self._prune_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._prune_task = None
+        await self._close_probes()
+
+    async def _close_probes(self) -> None:
+        """Await ``aclose()`` on every registered and startup probe that has one.
+
+        Lets probes stop what they run in the background (e.g. the event-loop
+        probe's sampler).  Closes run concurrently, each bounded by
+        ``_ACLOSE_TIMEOUT_S``; a failure is logged and does not stop the rest.
+        """
+        unique = {id(p): p for p in [*(p for p, _ in self._probes), *self._startup_probes]}
+        logger = self._logger or _LIB_LOGGER
+
+        async def _close(probe: BaseProbe) -> None:
+            try:
+                ret = probe.aclose()
+                if inspect.isawaitable(ret):
+                    await asyncio.wait_for(ret, _ACLOSE_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                logger.warning("fastapi-watch: probe %r aclose() timed out after %g s", probe.name, _ACLOSE_TIMEOUT_S)
+            except Exception:
+                logger.exception("fastapi-watch: probe %r aclose() failed", probe.name)
+
+        closers = [_close(p) for p in unique.values() if callable(getattr(p, "aclose", None))]
+        if closers:
+            await asyncio.gather(*closers)
 
     async def _poll_loop(self) -> None:
         """Background loop: run each probe when its interval elapses (1 s granularity).
@@ -1485,6 +1649,8 @@ class HealthRegistry:
                 due = [(p, c) for p, c in self._probes if self._is_probe_due(p, now)]
                 if due:
                     await self._execute_probes(due)
+                if self._prune_due():
+                    await self._prune_storage()
             except Exception:
                 (self._logger or _LIB_LOGGER).exception("fastapi-watch: poll iteration failed")
             await asyncio.sleep(1.0)
@@ -1606,7 +1772,7 @@ class HealthRegistry:
                     new_status=result.status,
                     timestamp=datetime.now(self._tzinfo),
                 )
-                await self._storage.append_alert(alert_record)
+                await self._storage_call("append_alert", alert_record)
                 for cb in self._state_change_callbacks:
                     # User code: one broken callback must not fail the health check
                     # that triggered it, nor stop the callbacks and alerts after it.
@@ -1757,6 +1923,9 @@ class HealthRegistry:
 
         sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
+        def _storage_unavailable() -> Response:
+            return JSONResponse({"error": "storage unavailable"}, status_code=503)
+
         @self.app.get(
             f"{prefix}/live",
             tags=tags,
@@ -1837,11 +2006,16 @@ class HealthRegistry:
             f"{prefix}/history",
             tags=tags,
             summary="Probe result history",
-            description="Returns the last N results for each probe (oldest-first), within the result TTL window.",
+            description=(
+                "Returns the last N results for each probe (oldest-first), within the result TTL window. "
+                "503 when storage is unavailable."
+            ),
             dependencies=auth_deps,
         )
         async def probe_history() -> Response:
-            history = await registry._storage.get_history()
+            history = await registry._storage_call("get_history")
+            if history is _STORAGE_FAILED:
+                return _storage_unavailable()
             payload = {
                 name: [r.model_dump(mode="json") for r in entries]
                 for name, entries in history.items()
@@ -1852,11 +2026,16 @@ class HealthRegistry:
             f"{prefix}/alerts",
             tags=tags,
             summary="Alert history",
-            description="Returns probe state-change alerts retained within the alert TTL window (default 72 hours).",
+            description=(
+                "Returns probe state-change alerts retained within the alert TTL window (default 72 hours). "
+                "503 when storage is unavailable."
+            ),
             dependencies=auth_deps,
         )
         async def alert_history() -> Response:
-            alerts = await registry._storage.get_alerts()
+            alerts = await registry._storage_call("get_alerts")
+            if alerts is _STORAGE_FAILED:
+                return _storage_unavailable()
             return JSONResponse({"alerts": [a.model_dump(mode="json") for a in alerts]})
 
         @self.app.get(
@@ -2087,5 +2266,7 @@ class HealthRegistry:
                     checked_at=registry._last_checked_at,
                     timezone=registry._timezone_name,
                 )
-                history = await registry._storage.get_history() if builtin_dashboard else None
+                history = await registry._storage_call("get_history") if builtin_dashboard else None
+                if history is _STORAGE_FAILED:
+                    history = {}  # the page still renders, from live results only
                 return HTMLResponse(content=_renderer(report, registry._in_maintenance(), request, history))
