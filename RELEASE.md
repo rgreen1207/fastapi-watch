@@ -20,6 +20,22 @@ When a route raised an exception that no exception handler caught, `call_next` r
 
 **Fix:** the middleware records an unhandled exception as a 500 (in the aggregate and under the route template) and re-raises it unchanged, so the response the client receives is the same as before.
 
+#### A naive `until` no longer breaks readiness
+
+`set_maintenance(until=...)` and `POST /health/maintenance {"until": ...}` accepted a datetime without a UTC offset, which `/health/ready` then compared against an aware "now" — raising `TypeError` on every readiness check (500) and on every poll until maintenance was cleared.
+
+**Fix:** a naive `until` is interpreted in the registry's `timezone`. Over HTTP, an `until` that has already passed is rejected with `422` before any state changes, instead of reporting `active: true` and silently expiring (or ending a maintenance window that was already running).
+
+### Security Fixes
+
+#### Maintenance write endpoints require `auth=`
+
+With the default `auth=None`, anyone who could reach the service could `POST /health/maintenance` — pinning `/health/ready` at `200` and suppressing every alerter indefinitely — or `DELETE` it to cut a planned window short.
+
+**Fix:** `POST` and `DELETE /health/maintenance` are mounted only when `auth=` is configured. `GET /health/maintenance` and the `set_maintenance()` / `clear_maintenance()` methods are unaffected. The "health endpoints are publicly accessible" startup warning now always logs (through the `fastapi_watch` logger when no `logger=` is passed — previously it only appeared when one was) and names the routes that were left out.
+
+**Upgrading:** if you toggle maintenance over HTTP without `auth=`, those calls now return `405`. Pass `auth=` to `HealthRegistry`, or call `registry.set_maintenance()` / `registry.clear_maintenance()` from your own authenticated endpoint.
+
 ### Infrastructure
 
 - **CI on pull requests.** A new `ci.yml` workflow runs the suite across Python 3.10–3.15 against FastAPI 0.100 (the oldest supported release) and the latest FastAPI. Previously tests only ran on Python 3.11 at publish time. Optional extras install individually so a driver without wheels for a new Python (currently `aiokafka` on 3.15) skips its own tests rather than blocking the run.

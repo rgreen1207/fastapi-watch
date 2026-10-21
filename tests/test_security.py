@@ -345,30 +345,35 @@ def test_prometheus_label_escapes_backslashes():
 # Maintenance endpoint: overflow/invalid minutes rejected at validation layer
 # ---------------------------------------------------------------------------
 
+# POST/DELETE /maintenance are only mounted when auth is configured.
+_MAINT_AUTH = {"type": "apikey", "key": "k"}
+_MAINT_KEY = {"X-API-Key": "k"}
+
+
 def test_maintenance_huge_minutes_returns_422():
     app = FastAPI()
-    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry = HealthRegistry(app, poll_interval_ms=None, auth=_MAINT_AUTH)
     registry.add(NoOpProbe(name="mem"))
     client = TestClient(app, raise_server_exceptions=False)
-    resp = client.post("/health/maintenance", json={"minutes": 1e308})
+    resp = client.post("/health/maintenance", json={"minutes": 1e308}, headers=_MAINT_KEY)
     assert resp.status_code == 422
 
 
 def test_maintenance_negative_minutes_returns_422():
     app = FastAPI()
-    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry = HealthRegistry(app, poll_interval_ms=None, auth=_MAINT_AUTH)
     registry.add(NoOpProbe(name="mem"))
     client = TestClient(app, raise_server_exceptions=False)
-    resp = client.post("/health/maintenance", json={"minutes": -1})
+    resp = client.post("/health/maintenance", json={"minutes": -1}, headers=_MAINT_KEY)
     assert resp.status_code == 422
 
 
 def test_maintenance_valid_minutes_accepted():
     app = FastAPI()
-    registry = HealthRegistry(app, poll_interval_ms=None)
+    registry = HealthRegistry(app, poll_interval_ms=None, auth=_MAINT_AUTH)
     registry.add(NoOpProbe(name="mem"))
     client = TestClient(app)
-    resp = client.post("/health/maintenance", json={"minutes": 30})
+    resp = client.post("/health/maintenance", json={"minutes": 30}, headers=_MAINT_KEY)
     assert resp.status_code == 200
 
 

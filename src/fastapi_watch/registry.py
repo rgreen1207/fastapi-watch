@@ -217,8 +217,9 @@ class HealthRegistry:
     - ``GET    /health/ready/stream``  — SSE (Server-Sent Events) stream of readiness
     - ``GET    /health/status/stream`` — SSE (Server-Sent Events) stream of full probe detail
     - ``GET    /health/maintenance``   — current maintenance mode status
-    - ``POST   /health/maintenance``   — enable maintenance mode (optional body: ``minutes`` or ``until``)
-    - ``DELETE /health/maintenance``   — disable maintenance mode
+    - ``POST   /health/maintenance``   — enable maintenance mode (optional body: ``minutes`` or ``until``);
+      mounted only when *auth* is set
+    - ``DELETE /health/maintenance``   — disable maintenance mode; mounted only when *auth* is set
     - ``GET    /health/probes``        — probe introspection; lists registered probes without running them
 
     Args:
@@ -373,10 +374,14 @@ class HealthRegistry:
         for group in groups or []:
             self.include(group)
 
-        if auth is None and self._logger:
-            self._logger.warning(
+        if auth is None and serve_routes:
+            # Falls back to the library logger: a security notice must not depend
+            # on the caller having passed logger=.
+            (self._logger or logging.getLogger("fastapi_watch")).warning(
                 "fastapi-watch: health endpoints are publicly accessible (auth=None). "
-                "Pass auth= to HealthRegistry to restrict access in production."
+                "POST/DELETE %s/maintenance are not mounted without auth; use "
+                "set_maintenance()/clear_maintenance() or pass auth= to HealthRegistry.",
+                prefix,
             )
 
     # ------------------------------------------------------------------
@@ -808,13 +813,24 @@ class HealthRegistry:
 
         Args:
             until: When maintenance ends.  ``None`` means indefinite —
-                call :meth:`clear_maintenance` to exit.
+                call :meth:`clear_maintenance` to exit.  A naive datetime is
+                interpreted in the registry's *timezone*.
 
         Returns ``self`` for chaining.
         """
         self._maintenance_active = True
-        self._maintenance_until = until
+        self._maintenance_until = self._aware(until)
         return self
+
+    def _aware(self, moment: datetime | None) -> datetime | None:
+        """Attach the registry timezone to a naive datetime; pass others through.
+
+        Naive values cannot be compared with the aware "now" used by
+        :meth:`_in_maintenance` — left as-is they raise on every readiness check.
+        """
+        if moment is not None and moment.tzinfo is None:
+            return moment.replace(tzinfo=self._tzinfo)
+        return moment
 
     def clear_maintenance(self) -> "HealthRegistry":
         """Exit maintenance mode immediately. Returns ``self`` for chaining."""
@@ -1561,40 +1577,51 @@ class HealthRegistry:
                 "until": until.isoformat() if until is not None else None,
             })
 
-        @self.app.post(
-            f"{prefix}/maintenance",
-            tags=tags,
-            summary="Enable maintenance mode",
-            description=(
-                "Enables maintenance mode. Optional body: ``{\"minutes\": N}`` or "
-                "``{\"until\": \"<ISO datetime>\"}``."
-                " Omit body (or send ``{}``) for indefinite maintenance."
-            ),
-            dependencies=auth_deps,
-        )
-        async def enable_maintenance(body: _MaintenanceRequest = Body(default=_MaintenanceRequest())) -> Response:
-            if body.until is not None:
-                until = body.until
-            elif body.minutes is not None:
-                until = datetime.now(registry._tzinfo) + timedelta(minutes=body.minutes)
-            else:
-                until = None
-            registry.set_maintenance(until=until)
-            return JSONResponse({
-                "active": True,
-                "until": registry._maintenance_until.isoformat() if registry._maintenance_until else None,
-            })
+        # State-changing routes are mounted only behind auth: an open POST would
+        # let anyone pin /ready at 200 and silence alerts.  set_maintenance() and
+        # clear_maintenance() remain available to the application either way.
+        if auth_checker is not None:
 
-        @self.app.delete(
-            f"{prefix}/maintenance",
-            tags=tags,
-            summary="Disable maintenance mode",
-            description="Clears maintenance mode immediately.",
-            dependencies=auth_deps,
-        )
-        async def disable_maintenance() -> Response:
-            registry.clear_maintenance()
-            return JSONResponse({"active": False, "until": None})
+            @self.app.post(
+                f"{prefix}/maintenance",
+                tags=tags,
+                summary="Enable maintenance mode",
+                description=(
+                    "Enables maintenance mode. Optional body: ``{\"minutes\": N}`` or "
+                    "``{\"until\": \"<ISO datetime>\"}``."
+                    " Omit body (or send ``{}``) for indefinite maintenance."
+                    " A naive ``until`` is read in the registry timezone; a past one is rejected with 422."
+                ),
+                dependencies=auth_deps,
+            )
+            async def enable_maintenance(body: _MaintenanceRequest = Body(default=_MaintenanceRequest())) -> Response:
+                now = datetime.now(registry._tzinfo)
+                if body.until is not None:
+                    until = registry._aware(body.until)
+                    # Checked before any state changes: a past "until" would report
+                    # active=True and then silently expire.
+                    if until <= now:
+                        raise HTTPException(status_code=422, detail="until must be in the future")
+                elif body.minutes is not None:
+                    until = now + timedelta(minutes=body.minutes)
+                else:
+                    until = None
+                registry.set_maintenance(until=until)
+                return JSONResponse({
+                    "active": True,
+                    "until": until.isoformat() if until is not None else None,
+                })
+
+            @self.app.delete(
+                f"{prefix}/maintenance",
+                tags=tags,
+                summary="Disable maintenance mode",
+                description="Clears maintenance mode immediately.",
+                dependencies=auth_deps,
+            )
+            async def disable_maintenance() -> Response:
+                registry.clear_maintenance()
+                return JSONResponse({"active": False, "until": None})
 
         if dashboard is not False:
             if callable(dashboard):

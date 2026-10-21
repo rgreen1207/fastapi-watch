@@ -248,38 +248,43 @@ While active: `/health/ready` returns `200 {"status": "maintenance"}`, alerters 
 
 ### HTTP endpoints
 
+`POST` and `DELETE /health/maintenance` change readiness and silence alerts, so they are **only mounted when `auth=` is configured** (see [Authentication](#authentication)). Without auth, `GET /health/maintenance` still reports status and the [Python API](#python-api) works as usual.
+
 ```bash
 # Enable (indefinite)
-curl -X POST https://your-app/health/maintenance
+curl -X POST https://your-app/health/maintenance -H "X-API-Key: $KEY"
 
 # Enable for 30 minutes
-curl -X POST https://your-app/health/maintenance \
+curl -X POST https://your-app/health/maintenance -H "X-API-Key: $KEY" \
   -H "Content-Type: application/json" -d '{"minutes": 30}'
 
 # Enable until a specific time
-curl -X POST https://your-app/health/maintenance \
+curl -X POST https://your-app/health/maintenance -H "X-API-Key: $KEY" \
   -H "Content-Type: application/json" \
   -d '{"until": "2026-04-01T02:00:00+00:00"}'
 
 # Disable
-curl -X DELETE https://your-app/health/maintenance
+curl -X DELETE https://your-app/health/maintenance -H "X-API-Key: $KEY"
 
 # Check status
 curl https://your-app/health/maintenance
 # → {"active": true, "until": "2026-04-01T02:00:00+00:00"}
 ```
 
+An `until` without a UTC offset is read in the registry's `timezone`. An `until` that has already passed is rejected with `422` and leaves any current maintenance window untouched.
+
 ### Deployment workflow
 
 ```bash
 # 1. Enable maintenance before deploying
-curl -X POST https://your-app/health/maintenance -d '{"minutes": 10}'
+curl -X POST https://your-app/health/maintenance -H "X-API-Key: $KEY" \
+  -H "Content-Type: application/json" -d '{"minutes": 10}'
 
 # 2. Deploy / restart
 kubectl rollout restart deployment/my-app
 
 # 3. Clear maintenance (or let the window expire)
-curl -X DELETE https://your-app/health/maintenance
+curl -X DELETE https://your-app/health/maintenance -H "X-API-Key: $KEY"
 ```
 
 ### Python API
@@ -293,7 +298,7 @@ registry.set_maintenance(until=datetime.now(ZoneInfo("UTC")) + timedelta(hours=2
 registry.clear_maintenance()
 ```
 
-Both methods return `self` for chaining. Once `until` passes, maintenance auto-clears.
+Both methods return `self` for chaining. Once `until` passes, maintenance auto-clears. A naive `until` is interpreted in the registry's `timezone`.
 
 ---
 

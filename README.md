@@ -85,8 +85,8 @@ Every route is now monitored with real-traffic data. Health endpoints are live a
 | `GET /health/ready/stream` | SSE stream of readiness | stream |
 | `GET /health/status/stream` | SSE stream of full probe detail | stream |
 | `GET /health/maintenance` | Maintenance mode status | `200` |
-| `POST /health/maintenance` | Enable maintenance mode | `200` |
-| `DELETE /health/maintenance` | Disable maintenance mode | `200` |
+| `POST /health/maintenance` | Enable maintenance mode — mounted only when `auth=` is set | `200` / `422` |
+| `DELETE /health/maintenance` | Disable maintenance mode — mounted only when `auth=` is set | `200` |
 | `GET /health/probes` | Registered probe config (no probe runs) | `200` |
 
 The prefix defaults to `/health` and is configurable: `HealthRegistry(app, prefix="/ops/health")`.

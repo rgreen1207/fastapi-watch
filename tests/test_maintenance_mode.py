@@ -176,3 +176,106 @@ def test_dashboard_no_banner_when_not_in_maintenance():
     html = render_dashboard(report, stream_url="/health/status/stream", maintenance_banner=False)
     # The CSS contains .maintenance-banner but the <div> should not be present
     assert '<div class="maintenance-banner">' not in html
+
+
+# ---------------------------------------------------------------------------
+# Write endpoints require auth; naive and past "until" values
+# ---------------------------------------------------------------------------
+
+_AUTH = {"type": "apikey", "key": "k"}
+_KEY = {"X-API-Key": "k"}
+
+
+def _naive_future(hours: int = 1) -> datetime:
+    """A naive wall-clock time in the registry's default timezone (UTC)."""
+    return _future(hours * 3600).replace(tzinfo=None)
+
+
+def test_write_endpoints_not_mounted_without_auth():
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    client = TestClient(app)
+
+    assert client.post("/health/maintenance", json={}).status_code == 405
+    assert client.delete("/health/maintenance").status_code == 405
+    assert client.get("/health/maintenance").status_code == 200
+    assert registry._in_maintenance() is False
+
+
+def test_write_endpoints_mounted_and_guarded_with_auth():
+    app = FastAPI()
+    HealthRegistry(app, auth=_AUTH)
+    client = TestClient(app)
+
+    assert client.post("/health/maintenance", json={}).status_code == 403
+    assert client.post("/health/maintenance", json={}, headers=_KEY).status_code == 200
+    assert client.delete("/health/maintenance", headers=_KEY).json() == {"active": False, "until": None}
+
+
+def test_programmatic_maintenance_still_works_without_auth():
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    registry.set_maintenance()
+    assert TestClient(app).get("/health/ready").json() == {"status": "maintenance"}
+
+
+def test_public_access_warning_logged_without_a_logger(caplog):
+    with caplog.at_level("WARNING", logger="fastapi_watch"):
+        HealthRegistry(FastAPI())
+    assert any("POST/DELETE /health/maintenance are not mounted" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize("kwargs", [{"auth": _AUTH}, {"serve_routes": False}])
+def test_no_public_access_warning_when_not_exposed(caplog, kwargs):
+    with caplog.at_level("WARNING", logger="fastapi_watch"):
+        HealthRegistry(FastAPI(), **kwargs)
+    assert not [r for r in caplog.records if "publicly accessible" in r.message]
+
+
+def test_naive_until_via_set_maintenance_does_not_break_ready():
+    app = FastAPI()
+    registry = HealthRegistry(app)
+    registry.set_maintenance(until=_naive_future())
+
+    resp = TestClient(app).get("/health/ready")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "maintenance"}
+
+
+def test_naive_until_is_read_in_registry_timezone():
+    from zoneinfo import ZoneInfo
+    registry = HealthRegistry(FastAPI(), timezone="America/Denver", serve_routes=False)
+    registry.set_maintenance(until=datetime(2099, 1, 1, 12, 0))
+
+    assert registry._maintenance_until == datetime(2099, 1, 1, 12, 0, tzinfo=ZoneInfo("America/Denver"))
+
+
+def test_aware_until_is_left_unchanged():
+    registry = HealthRegistry(FastAPI(), timezone="America/Denver", serve_routes=False)
+    until = _future()
+    registry.set_maintenance(until=until)
+    assert registry._maintenance_until is until
+
+
+def test_naive_until_via_post_does_not_break_ready():
+    app = FastAPI()
+    HealthRegistry(app, auth=_AUTH)
+    client = TestClient(app)
+    naive = _naive_future().isoformat()
+
+    post = client.post("/health/maintenance", json={"until": naive}, headers=_KEY)
+    assert post.status_code == 200
+    assert post.json()["until"].endswith("+00:00")
+    assert client.get("/health/ready", headers=_KEY).json() == {"status": "maintenance"}
+
+
+def test_past_until_via_post_rejected_without_ending_current_window():
+    app = FastAPI()
+    registry = HealthRegistry(app, auth=_AUTH)
+    registry.set_maintenance()  # indefinite window already running
+    client = TestClient(app)
+
+    resp = client.post("/health/maintenance", json={"until": _past().isoformat()}, headers=_KEY)
+    assert resp.status_code == 422
+    assert registry._in_maintenance() is True
+    assert registry._maintenance_until is None
