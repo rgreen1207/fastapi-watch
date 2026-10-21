@@ -38,6 +38,12 @@ Callbacks registered with `on_state_change()` ran unguarded inside the probe run
 
 **Fix:** each callback is isolated — failures are logged with a traceback and the remaining callbacks and alerters still run. A failing poll iteration is logged and the loop continues; a poll task that has exited is restarted when the next streaming client connects. Errors are logged through `logger=` when given, otherwise the `fastapi_watch` logger.
 
+#### `CeleryProbe` no longer reports healthy workers as unhealthy
+
+`CeleryProbe(timeout=...)` was used both as the per-broadcast reply wait and — through `BaseProbe.timeout` — as the registry's deadline for the whole check. A Celery broadcast without a reply limit collects replies for the full timeout, so the deadline expired first and a healthy, responsive worker came back `UNHEALTHY` (always, with `detailed=True`, which issues seven broadcasts).
+
+**Fix:** the constructor's `timeout` keeps its meaning (per-broadcast wait, now also exposed as `reply_timeout`), and the probe's overall deadline covers every broadcast it issues plus a 2 s margin: `timeout + 2` for ping-only, `7 × timeout + 2` with `detailed=True`.
+
 ### Security Fixes
 
 #### Maintenance write endpoints require `auth=`

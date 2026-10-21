@@ -10,6 +10,9 @@ _TASK_FIELDS = ("id", "name", "args", "kwargs", "time_start", "worker_pid")
 # Fields kept from each task dict returned by inspect.scheduled()
 _SCHEDULED_FIELDS = ("eta", "priority", "request")
 
+# Slack on top of the broadcast waits for broker connect/teardown.
+_DEADLINE_MARGIN_S = 2.0
+
 
 def _pluck(d: dict, keys: tuple) -> dict:
     return {k: d[k] for k in keys if k in d}
@@ -55,6 +58,9 @@ class CeleryProbe(BaseProbe):
         timeout: Seconds to wait for each inspector broadcast reply.
             Workers that are alive respond well within 1 s; the timeout
             only matters when workers are unreachable (default ``1.0``).
+            A broadcast collects replies for this long, so the probe's own
+            overall deadline (its ``timeout`` attribute, used by the registry)
+            is set to cover every broadcast it issues plus a margin.
         min_workers: Minimum number of workers that must be online for the
             probe to be healthy. ``0`` (default) means workers are optional.
         detailed: When ``True``, collects per-worker active/reserved/scheduled
@@ -81,7 +87,12 @@ class CeleryProbe(BaseProbe):
     ) -> None:
         self.app = app
         self.name = name
-        self.timeout = timeout
+        self.reply_timeout = timeout
+        # Without a reply limit each broadcast waits the full reply_timeout, so
+        # an overall deadline equal to it would expire before a healthy ping
+        # returned.  Cover every broadcast (ping, plus six more when detailed).
+        broadcasts = 7 if detailed else 1
+        self.timeout = timeout * broadcasts + _DEADLINE_MARGIN_S
         self.min_workers = min_workers
         self.detailed = detailed
         self.poll_interval_ms = poll_interval_ms
@@ -91,7 +102,7 @@ class CeleryProbe(BaseProbe):
     # ------------------------------------------------------------------
 
     def _inspect(self) -> dict[str, Any]:
-        inspector = self.app.control.inspect(timeout=self.timeout)
+        inspector = self.app.control.inspect(timeout=self.reply_timeout)
 
         ping = inspector.ping() or {}
         workers = list(ping.keys())

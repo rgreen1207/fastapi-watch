@@ -1,6 +1,9 @@
 """Tests for CeleryProbe."""
+import time
 import pytest
 from unittest.mock import MagicMock
+from fastapi import FastAPI
+from fastapi_watch import HealthRegistry
 from fastapi_watch.models import ProbeStatus
 from fastapi_watch.probes.celery import CeleryProbe, _clean_task, _clean_scheduled
 
@@ -366,3 +369,54 @@ async def test_inspect_called_with_configured_timeout():
     probe = CeleryProbe(app, timeout=2.5)
     await probe.check()
     app.control.inspect.assert_called_once_with(timeout=2.5)
+
+
+# ---------------------------------------------------------------------------
+# Broadcast wait vs. overall deadline
+# ---------------------------------------------------------------------------
+
+class _BlockingInspector:
+    """Mimics celery: with no reply limit, a broadcast waits the full timeout."""
+
+    def __init__(self, timeout):
+        self.timeout = timeout
+
+    def _wait(self, reply):
+        time.sleep(self.timeout)
+        return reply
+
+    def ping(self):
+        return self._wait({"worker1": {"ok": "pong"}})
+
+    def active(self):
+        return self._wait({"worker1": []})
+
+    reserved = scheduled = active
+    registered = active
+
+    def stats(self):
+        return self._wait({"worker1": {}})
+
+    def active_queues(self):
+        return self._wait({"worker1": []})
+
+
+def _blocking_app():
+    app = MagicMock()
+    app.control.inspect.side_effect = lambda timeout: _BlockingInspector(timeout)
+    return app
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("detailed", [False, True])
+async def test_healthy_worker_not_cut_off_by_registry_deadline(detailed):
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=None)
+    registry.add(CeleryProbe(_blocking_app(), timeout=0.05, min_workers=1, detailed=detailed))
+    [result] = await registry.run_all()
+    assert result.status == ProbeStatus.HEALTHY, result.error
+
+
+def test_overall_deadline_covers_every_broadcast():
+    assert CeleryProbe(MagicMock(), timeout=1.0).timeout == pytest.approx(1.0 + 2.0)
+    assert CeleryProbe(MagicMock(), timeout=1.0, detailed=True).timeout == pytest.approx(7.0 + 2.0)
+    assert CeleryProbe(MagicMock(), timeout=1.0).reply_timeout == 1.0
