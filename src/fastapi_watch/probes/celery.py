@@ -1,7 +1,7 @@
-import asyncio
 import time
 from typing import Any
 
+from .._executor import SingleFlight, StillRunning
 from ..models import ProbeResult, ProbeStatus
 from .base import BaseProbe, _failure_message
 
@@ -67,6 +67,11 @@ class CeleryProbe(BaseProbe):
             tasks, registered task names, queue bindings, and pool stats.
             Disabled by default to minimise broadcast traffic in production.
 
+    The inspect calls are blocking, so they run in fastapi-watch's own small
+    thread pool rather than the event loop's default executor.  If a broker
+    hangs past the probe's deadline, the next check reports
+    ``"previous check still running"`` instead of starting another call.
+
     Example::
 
         # Production — ping only
@@ -96,9 +101,10 @@ class CeleryProbe(BaseProbe):
         self.min_workers = min_workers
         self.detailed = detailed
         self.poll_interval_ms = poll_interval_ms
+        self._inspect_call = SingleFlight()
 
     # ------------------------------------------------------------------
-    # Synchronous inspect — called via run_in_executor
+    # Synchronous inspect — run in fastapi-watch's thread pool
     # ------------------------------------------------------------------
 
     def _inspect(self) -> dict[str, Any]:
@@ -153,8 +159,7 @@ class CeleryProbe(BaseProbe):
     async def check(self) -> ProbeResult:
         start = time.perf_counter()
         try:
-            loop = asyncio.get_running_loop()
-            data = await loop.run_in_executor(None, self._inspect)
+            data = await self._inspect_call.run(self._inspect)
             latency = (time.perf_counter() - start) * 1000
 
             workers_online: int = data["workers_online"]
@@ -200,6 +205,13 @@ class CeleryProbe(BaseProbe):
                 details=data,
             )
 
+        except StillRunning:
+            return ProbeResult(
+                name=self.name,
+                status=ProbeStatus.UNHEALTHY,
+                latency_ms=0.0,
+                error="previous check still running",
+            )
         except Exception as exc:
             latency = (time.perf_counter() - start) * 1000
             return ProbeResult(
