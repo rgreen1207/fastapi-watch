@@ -4,6 +4,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi import FastAPI
@@ -97,3 +98,113 @@ def test_static_assets_ship_with_the_package():
     static = files("fastapi_watch") / "static"
     assert (static / "dashboard.css").is_file()
     assert (static / "dashboard.js").is_file()
+
+
+# ---------------------------------------------------------------------------
+# Embedded data stays small: only the fields the page script reads
+# ---------------------------------------------------------------------------
+
+_POINT_KEYS = {"checked_at", "status", "latency_ms", "details"}
+_POINT_DETAIL_KEYS = {
+    "p50_rtt_ms", "p95_rtt_ms", "p99_rtt_ms", "error_rate", "requests_per_minute", "lag_ms", "warn_ms", "fail_ms", "routes",
+}
+_ROUTE_KEYS = {"request_count", "p95_rtt_ms", "error_rate", "requests_per_minute"}
+
+
+def _route_stats(count: int) -> dict:
+    """One route as RequestMetricsProbe reports it."""
+    return {
+        "request_count": count, "error_count": count // 10, "error_rate": 0.1, "consecutive_errors": 0,
+        "avg_rtt_ms": 12.34, "p50_rtt_ms": 10.5, "p95_rtt_ms": 40.25, "p99_rtt_ms": 80.75, "requests_per_minute": 120.5,
+    }
+
+
+def _request_metrics_history(routes: int = 150, entries: int = 120) -> list[ProbeResult]:
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    return [
+        ProbeResult(
+            name="request_metrics",
+            status=ProbeStatus.HEALTHY,
+            latency_ms=12.34,
+            checked_at=start + timedelta(minutes=k),
+            details={
+                **_route_stats(routes * 100),
+                "routes": {f"/api/v1/resource{i}/{{item_id}}": _route_stats(i * 10 + k) for i in range(routes)},
+            },
+        )
+        for k in range(entries)
+    ]
+
+
+def test_page_with_many_routes_and_full_history_stays_small():
+    # Before slimming, this page embedded every detail of every route of every
+    # entry: about 4 MB, rebuilt on each load and auto-reload.
+    history = _request_metrics_history()
+    html = render_dashboard(HealthReport.from_results([history[-1]]), stream_url="/s",
+                            history={"request_metrics": history})
+    assert len(html.encode()) < 300_000
+
+
+def test_embedded_history_keeps_only_charted_fields():
+    history = _request_metrics_history(routes=20, entries=5)
+    history[0] = history[0].model_copy(update={"error": "boom", "tags": ["x"], "description": "d"})
+    html = render_dashboard(HealthReport.from_results([history[-1]]), stream_url="/s",
+                            history={"request_metrics": history})
+    points = _embedded(html)["history"]["request_metrics"]
+
+    assert len(points) == 5
+    newest = history[-1].details["routes"]
+    top = sorted(newest, key=lambda p: (-newest[p]["request_count"], p))[:8]
+    for point in points:
+        assert set(point) <= _POINT_KEYS
+        assert set(point["details"]) <= _POINT_DETAIL_KEYS
+        # The same busiest routes of the newest entry in every entry, so each line spans the history.
+        assert list(point["details"]["routes"]) == top
+        for stats in point["details"]["routes"].values():
+            assert set(stats) == _ROUTE_KEYS
+    assert points[-1]["details"]["p95_rtt_ms"] == 40.25
+    assert points[-1]["details"]["routes"][top[0]]["p95_rtt_ms"] == 40.25
+
+
+def test_embedded_history_keeps_event_loop_fields_and_drops_others():
+    result = ProbeResult(
+        name="loop", status=ProbeStatus.DEGRADED, latency_ms=3.0, checked_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        details={"lag_ms": 120.0, "warn_ms": 100, "fail_ms": 500, "message": "slow", "samples": list(range(100))},
+    )
+    bare = ProbeResult(name="loop", status=ProbeStatus.HEALTHY, checked_at=datetime(2026, 1, 1, 0, 1, tzinfo=timezone.utc))
+    html = render_dashboard(HealthReport.from_results([bare]), stream_url="/s", history={"loop": [result, bare]})
+    first, second = _embedded(html)["history"]["loop"]
+    assert first["details"] == {"lag_ms": 120.0, "warn_ms": 100, "fail_ms": 500}
+    assert first["status"] == "degraded" and first["latency_ms"] == 3.0
+    assert "details" not in second
+
+
+def test_embedded_history_capped_per_probe():
+    from fastapi_watch.dashboard import _MAX_CHART_POINTS
+
+    history = _request_metrics_history(routes=1, entries=_MAX_CHART_POINTS + 50)
+    html = render_dashboard(HealthReport.from_results([history[-1]]), stream_url="/s",
+                            history={"request_metrics": history})
+    points = _embedded(html)["history"]["request_metrics"]
+    assert len(points) == _MAX_CHART_POINTS
+    assert points[-1]["checked_at"].startswith(history[-1].checked_at.isoformat()[:19])
+
+
+def test_embedded_current_probe_keeps_details_but_trims_routes():
+    [result] = _request_metrics_history(routes=150, entries=1)
+    html = render_dashboard(HealthReport.from_results([result]), stream_url="/s")
+    [probe] = _embedded(html)["probes"]
+    assert probe["details"]["avg_rtt_ms"] == 12.34  # every other detail is kept
+    assert probe["details"]["consecutive_errors"] == 0
+    assert len(probe["details"]["routes"]) == 8
+    assert list(probe["details"]["routes"])[0] == "/api/v1/resource149/{item_id}"
+    # The server-rendered "All fields" table still lists every route.
+    markup = html.split('<script type="application/json"')[0]
+    assert markup.count("/api/v1/resource") == 150
+
+
+def test_route_ranking_matches_the_page_script():
+    from fastapi_watch.dashboard import _top_routes
+
+    routes = {"/b": {"request_count": 5}, "/a": {"request_count": 5}, "/c": {"request_count": 9}, "/d": "junk", "/e": {}}
+    assert _top_routes(routes) == ["/c", "/a", "/b", "/d", "/e"]
