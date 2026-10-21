@@ -269,6 +269,12 @@ class HealthRegistry:
         startup_probes: Probes that must pass for ``/health/startup`` to return 200.
             These are separate from the main probe registry and are not shown in
             ``/health/status``.
+        probe_timeout: Seconds a probe may run before it is reported UNHEALTHY
+            (default ``30``).  Applies to every probe that does not set its own
+            ``timeout``.  Every health endpoint waits on the probes it runs, so
+            this bound is what keeps one hung dependency from hanging them all.
+            ``None`` disables the default (probes without a ``timeout`` may then
+            run indefinitely).
 
     Example::
 
@@ -306,10 +312,14 @@ class HealthRegistry:
         alert_ttl_seconds: float = 259200.0,
         max_alerts: int = 120,
         storage: ProbeStorage | None = None,
+        probe_timeout: float | None = 30.0,
     ) -> None:
+        if probe_timeout is not None and probe_timeout <= 0:
+            raise ValueError(f"probe_timeout must be positive or None, got {probe_timeout!r}")
         self.app = app
         self.prefix = prefix
         self._logger = logger
+        self._probe_timeout = probe_timeout
         self._grace_period_ms: int = max(0, grace_period_ms)
         self._timezone_name: str = timezone
         self._tzinfo: ZoneInfo = ZoneInfo(timezone)
@@ -968,18 +978,25 @@ class HealthRegistry:
                     details={"circuit_breaker": cb_info},
                 )
 
-        # Run the probe
+        # Run the probe.  Every probe is bounded: all endpoints await the whole
+        # batch, so a single hung check would otherwise hang every one of them.
+        timeout = probe.timeout if probe.timeout is not None else self._probe_timeout
         try:
             coro = probe.check()
-            result = (
-                await asyncio.wait_for(coro, timeout=probe.timeout)
-                if probe.timeout is not None
-                else await coro
-            )
+            result = await asyncio.wait_for(coro, timeout) if timeout is not None else await coro
             result = (
                 result
                 if result.critical == critical
                 else result.model_copy(update={"critical": critical})
+            )
+        except asyncio.TimeoutError:
+            if self._logger:
+                self._logger.warning("Probe %r timed out after %g s", probe.name, timeout)
+            result = ProbeResult(
+                name=probe.name,
+                status=ProbeStatus.UNHEALTHY,
+                critical=critical,
+                error=f"probe timed out after {timeout:g} s",
             )
         except Exception as exc:
             if self._logger:

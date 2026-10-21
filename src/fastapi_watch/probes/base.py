@@ -75,7 +75,7 @@ class BaseProbe(ABC):
     name: str = "unnamed"
     description: str | None = None
     tags: list[str] | None = None
-    timeout: float | None = None  # seconds; None means no timeout
+    timeout: float | None = None  # seconds; None means the registry's probe_timeout
     poll_interval_ms: int | None = None
     circuit_breaker_threshold: int | None = None
     circuit_breaker_cooldown_ms: int | None = None

@@ -1,4 +1,5 @@
 import asyncio
+import httpx
 import json
 import logging
 import pytest
@@ -587,7 +588,76 @@ async def test_probe_timeout_becomes_unhealthy():
     registry.add(SlowProbe())
     results = await registry.run_all()
     assert results[0].status == ProbeStatus.UNHEALTHY
-    assert results[0].error == "probe check failed"
+    assert results[0].error == "probe timed out after 0.1 s"
+
+
+class _HangingProbe(NoOpProbe):
+    async def check(self):
+        await asyncio.sleep(3600)
+
+
+@pytest.mark.asyncio
+async def test_registry_default_timeout_bounds_probes_without_one():
+    registry = HealthRegistry(FastAPI(), probe_timeout=0.05)
+    registry.add(_HangingProbe(name="hang"))
+    results = await asyncio.wait_for(registry.run_all(), 2)
+    assert results[0].status == ProbeStatus.UNHEALTHY
+    assert results[0].error == "probe timed out after 0.05 s"
+
+
+@pytest.mark.asyncio
+async def test_probe_timeout_overrides_registry_default():
+    probe = _HangingProbe(name="hang")
+    probe.timeout = 0.05
+    registry = HealthRegistry(FastAPI(), probe_timeout=3600)
+    registry.add(probe)
+    results = await asyncio.wait_for(registry.run_all(), 2)
+    assert results[0].error == "probe timed out after 0.05 s"
+
+
+def test_registry_default_timeout_is_30_seconds():
+    assert HealthRegistry(FastAPI())._probe_timeout == 30.0
+
+
+@pytest.mark.asyncio
+async def test_probe_timeout_none_disables_default():
+    class Slowish(NoOpProbe):
+        async def check(self):
+            await asyncio.sleep(0.05)
+            return await super().check()
+
+    registry = HealthRegistry(FastAPI(), probe_timeout=None)
+    registry.add(Slowish(name="slowish"))
+    assert (await registry.run_all())[0].status == ProbeStatus.HEALTHY
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_registry_rejects_non_positive_timeout(bad):
+    with pytest.raises(ValueError, match="probe_timeout"):
+        HealthRegistry(FastAPI(), probe_timeout=bad)
+
+
+@pytest.mark.asyncio
+async def test_hung_probe_does_not_hang_ready():
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None, probe_timeout=0.05)
+    registry.add(_HangingProbe(name="hang"))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as client:
+        resp = await asyncio.wait_for(client.get("/health/ready"), 2)
+    assert resp.status_code == 503
+    assert resp.json()["failing"] == ["hang"]
+
+
+@pytest.mark.asyncio
+async def test_timeout_logged_as_warning_without_traceback(caplog):
+    logger = logging.getLogger("test.timeout")
+    registry = HealthRegistry(FastAPI(), probe_timeout=0.05, logger=logger)
+    registry.add(_HangingProbe(name="hang"))
+    with caplog.at_level("WARNING", logger="test.timeout"):
+        await registry.run_all()
+    [record] = [r for r in caplog.records if "timed out" in r.getMessage()]
+    assert record.levelname == "WARNING"
+    assert record.exc_info is None
 
 
 @pytest.mark.asyncio

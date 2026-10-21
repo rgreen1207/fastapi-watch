@@ -695,7 +695,7 @@ async def test_unhealthy_on_exception(monkeypatch):
 - `name` must be set — class attribute or `self.name = ...` in `__init__`.
 - `check()` must be `async` and return `ProbeResult`.
 - Set `latency_ms` for probes where response time matters.
-- Set `timeout` if the underlying call can hang indefinitely.
+- Every probe is bounded by the registry's `probe_timeout` (30 s by default); set `timeout` to use a tighter bound.
 - Do not call `registry.run_all()` from inside `check()`.
 
 ---
@@ -1524,6 +1524,7 @@ The endpoint is subject to the same `auth` as all other health endpoints.
 | `alert_ttl_seconds` | `float` | `259200.0` | How long alert records are retained |
 | `max_alerts` | `int` | `120` | Hard cap on stored alerts |
 | `storage` | `ProbeStorage \| None` | `None` | Custom storage backend |
+| `probe_timeout` | `float \| None` | `30.0` | Seconds before a probe without its own `timeout` is reported UNHEALTHY. `None` disables the default |
 | `timezone` | `str` | `"UTC"` | IANA timezone for `checked_at` timestamps |
 | `groups` | `list[ProbeGroup] \| None` | `None` | ProbeGroups to include at startup |
 | `dashboard` | `bool \| Callable \| Path` | `True` | `True` = built-in dashboard; `False` = disabled; Callable = custom renderer; `.html`/`.htm` file path = served as-is. `.py` files are rejected. |
@@ -1557,7 +1558,7 @@ The endpoint is subject to the same `auth` as all other health endpoints.
 | Attribute | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `name` | `str` | `"unnamed"` | Label in health reports. Must contain only `[A-Za-z0-9_\-.:]+` — spaces, quotes, and newlines are rejected at `registry.add()` time. |
-| `timeout` | `float \| None` | `None` | Per-probe timeout in seconds |
+| `timeout` | `float \| None` | `None` | Per-probe timeout in seconds. `None` uses the registry's `probe_timeout` (30 s by default) |
 | `poll_interval_ms` | `int \| None` | `None` | Per-probe poll interval override |
 | `circuit_breaker_threshold` | `int \| None` | `None` | Per-probe circuit threshold |
 | `circuit_breaker_cooldown_ms` | `int \| None` | `None` | Per-probe circuit cooldown |
