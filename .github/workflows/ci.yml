@@ -17,6 +17,8 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+    # Pre-release Pythons report problems early without blocking the PR.
+    continue-on-error: ${{ matrix.experimental == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -24,6 +26,12 @@ jobs:
         # Oldest supported release and the newest available.  The two straddle
         # FastAPI 0.137's switch from flat route copies to _IncludedRouter.
         fastapi: ["0.100.*", "latest"]
+        # Next Python, pre-release.  Promote into python-version (and add the
+        # classifier) once it is final and this job is green.
+        include:
+          - python-version: "3.16"
+            fastapi: "latest"
+            experimental: true
 
     steps:
       - uses: actions/checkout@v4

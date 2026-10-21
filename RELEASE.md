@@ -46,6 +46,7 @@ With the default `auth=None`, anyone who could reach the service could `POST /he
 
 - **CI on pull requests.** A new `ci.yml` workflow runs the suite across Python 3.10–3.15 against FastAPI 0.100 (the oldest supported release) and the latest FastAPI. Previously tests only ran on Python 3.11 at publish time. Optional extras install individually so a driver without wheels for a new Python (currently `aiokafka` on 3.15) skips its own tests rather than blocking the run.
 - **Python 3.15** added to the supported classifiers.
+- **Python 3.16 readiness.** CI also runs against the 3.16 pre-release as a non-blocking job; the classifier will be added once 3.16 is final. `asyncio.iscoroutinefunction`, which 3.16 removes, is no longer used.
 - `fastapi_watch.__version__` reported `1.7.0` in the 1.7.1 release; it now matches the package version.
 
 ---
