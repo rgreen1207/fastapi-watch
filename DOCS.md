@@ -996,6 +996,7 @@ Works with both `async def` and `def`. Preserves function signature — FastAPI 
 | `error_types` | Count per exception class over the last `cache_window_size` errors (exceptions only, not status-code-only errors) |
 | `cache_hits` / `cache_misses` | Hit and miss counts over the last `cache_window_size` lookups or `cache_time_window_s` seconds (auto-tracked when `@probe.watch` wraps an `@lru_cache` / `@alru_cache` function; also populated manually via `record_cache_hit()` / `record_cache_miss()`) |
 | `cache_maxsize` / `cache_currsize` | LRU cache capacity and current fill level (reported when auto-tracking is active) |
+| `last_error` | The most recent error: the exception type (`"HTTPException"`, `"IntegrityError"`), or `"HTTP 503"` for an error status returned without raising. The message is not included unless `expose_error_messages=True` |
 | `last_error_at` | ISO timestamp of the most recent error; always shown once any error has occurred |
 | `last_success_at` | ISO timestamp of the most recent success; shown only when ≥99% of the outcome window are failures |
 
@@ -1026,6 +1027,9 @@ Before the first request, `check()` returns `HEALTHY` with `"no requests observe
 | `cache_time_window_s` | `120.0` | When `cache_window_size` is not set, count hits/misses over the last T seconds (default 120 s) |
 | `cache_reporting` | `True` | Set to `False` to disable automatic cache tracking even when wrapping `@lru_cache` / `@alru_cache` functions |
 | `circuit_breaker_enabled` | `False` | Passive probes only read in-memory stats, so the circuit breaker is off by default; set `True` to opt in |
+| `expose_error_messages` | `False` | Include the exception message in `last_error` (`"HTTPException: 503: <detail>"`). Messages can carry credentials, connection strings, or the bound parameters of a failed query, so leave this off unless the health endpoints require `auth` |
+
+Out-of-range settings raise `ValueError` when the probe is created: `window_size` and `cache_window_size` must be positive, `ema_alpha` must be in (0, 1], and `max_error_rate` in [0, 1]. The same rules apply to every passive probe and to `FastAPIWebSocketProbe`.
 
 **With ProbeGroup:**
 
@@ -1096,6 +1100,8 @@ registry.add(EventLoopProbe(warn_ms=5.0, fail_ms=20.0))
 
 Details: `lag_ms` (worst lag since the previous check), `current_lag_ms` (an immediate measurement), `warn_ms`, `fail_ms`. Returns DEGRADED at `warn_ms` or above, UNHEALTHY at `fail_ms` or above.
 
+`await probe.aclose()` cancels the sampler; the registry calls it at shutdown (and `ThresholdProbe` passes it on to the probe it wraps). A later check starts a new sampler.
+
 ---
 
 ### TCP / DNS reachability
@@ -1110,6 +1116,8 @@ registry.add(TCPProbe(host="redis.internal", port=6379, name="redis-tcp", timeou
 ```
 
 Details: `host`, `port`, `resolved_ips`, `connect_ms`.
+
+The name is resolved once per check, then the probe connects to the resolved addresses in order until one accepts. The lookup is a blocking call, so it runs in fastapi-watch's own small thread pool (see [Blocking checks](#blocking-checks-and-the-thread-pool)); if a DNS server hangs past the probe's deadline, later checks report `"previous check still running"` until that lookup returns.
 
 ---
 
@@ -1334,6 +1342,14 @@ registry.add(CeleryProbe(celery, min_workers=1, detailed=True))  # full inspecti
 
 `min_workers=0` (default) treats zero online workers as healthy — suitable for scale-to-zero.
 
+With `detailed=True`, each worker lists its `active`, `reserved`, and `scheduled` tasks by `id`, `name`, `time_start`, and `worker_pid`. Task `args` and `kwargs` are left out: they are application data (email addresses, tokens, personal data) and health endpoints are often public. Pass `include_task_args=True` to include them where the endpoints require `auth`. Each list holds at most 50 tasks; when one is cut, the worker's `truncated` dict gives the number left out (e.g. `{"active": 70}`), while `active_tasks` / `reserved_tasks` / `scheduled_tasks` stay the full counts.
+
+The inspect calls are blocking, so they run in fastapi-watch's own thread pool (see below). If the broker hangs past the probe's deadline, later checks report `"previous check still running"` instead of starting another inspect.
+
+#### Blocking checks and the thread pool
+
+`CeleryProbe`, `TCPProbe` (DNS lookup), and the built-in alerters make blocking calls. They run in a private pool of at most 4 daemon threads named `fastapi-watch_N`, never in the event loop's default executor, which your application's own `run_in_executor` calls use. The registry's timeout cancels a check but cannot stop a thread that is already blocked, so each probe has at most one blocking call in flight: while it is still running, the probe reports UNHEALTHY with `"previous check still running"` and submits nothing new. A hung dependency therefore holds one thread, not one per poll, and the threads never delay interpreter exit.
+
 ---
 
 ### SQLAlchemy
@@ -1392,7 +1408,7 @@ registry.add(db_probe)
 |-------|-------|----------|---------|
 | `RabbitMQProbe` | `rabbitmq` | `url`, `management_url` | `connected`; + `server`, `totals`, `queues` when `management_url` set |
 | `KafkaProbe` | `kafka` | `bootstrap_servers` | `broker_count`, `controller_id`, `topics` |
-| `CeleryProbe` | `celery` | `app`, `min_workers`, `detailed` | `workers_online`, `workers` |
+| `CeleryProbe` | `celery` | `app`, `min_workers`, `detailed`, `include_task_args` | `workers_online`, `workers` |
 
 #### HTTP / document stores
 
@@ -1429,6 +1445,8 @@ registry = HealthRegistry(
 ```
 
 Alerters are called concurrently from a background worker queue. A failed alerter never blocks health checks or silences other alerters.
+
+The built-in alerters post from fastapi-watch's own thread pool (see [Blocking checks](#blocking-checks-and-the-thread-pool)), and `timeout` bounds the whole request — connecting, sending, and waiting for the response status — not just each socket read, so an endpoint that answers slowly cannot hold a thread past it. The request then fails with `TimeoutError`, which is logged like any other alerter failure. Resolving the webhook's hostname is bounded only by the system resolver's own timeouts.
 
 ### `SlackAlerter`
 
@@ -1660,6 +1678,8 @@ Alerters are dispatched concurrently per state change, each bounded by a 30-seco
 ### Probe error messages
 
 When a probe's check fails with an exception, HTTP clients see only the exception *type* — e.g. `"probe check failed: ConnectionRefusedError"` — so the failure is diagnosable from the dashboard without exposing the message. Full exception details (which may contain connection strings, passwords, or internal hostnames from third-party libraries) go only to logs: the configured `logger=` for exceptions escaping `check()`, and the `fastapi_watch` logger at debug level for failures the built-in probes catch themselves.
+
+Passive probes follow the same rule for the calls they observe: `last_error` is the exception type (`"IntegrityError"`, `"HTTPException"`) or `"HTTP 503"`, never the message or an `HTTPException`'s `detail`, which can hold the bound parameters of a failed query or other personal data. The message is logged at debug level on the `fastapi_watch` logger. `expose_error_messages=True` opts a probe back in. Likewise `CeleryProbe(detailed=True)` omits task arguments unless `include_task_args=True`.
 
 ### Probe names
 
