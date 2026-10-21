@@ -1,13 +1,11 @@
 """Tests for KafkaProbe — mocked so no real Kafka needed."""
+import importlib.util
+
 import pytest
 from unittest.mock import AsyncMock, patch
 from fastapi_watch.models import ProbeStatus
 
-try:
-    from aiokafka.admin import AIOKafkaAdminClient
-    HAS_AIOKAFKA = True
-except ImportError:
-    HAS_AIOKAFKA = False
+HAS_AIOKAFKA = importlib.util.find_spec("aiokafka") is not None
 
 pytestmark = pytest.mark.skipif(not HAS_AIOKAFKA, reason="aiokafka not installed")
 

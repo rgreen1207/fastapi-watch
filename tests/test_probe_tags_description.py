@@ -355,7 +355,7 @@ def test_probe_group_tags_via_groups_param():
     group.add(probe)
 
     app = FastAPI()
-    registry = HealthRegistry(app, groups=[group], poll_interval_ms=None)
+    HealthRegistry(app, groups=[group], poll_interval_ms=None)
 
     assert "infra" in probe.tags
 

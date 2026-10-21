@@ -93,7 +93,7 @@ def test_stream_probe_filter_single_fetch():
 
     resp = client.get("/health/status/stream?probe=svc-a")
     assert resp.status_code == 200
-    data_lines = [l for l in resp.text.splitlines() if l.startswith("data:")]
+    data_lines = [line for line in resp.text.splitlines() if line.startswith("data:")]
     assert len(data_lines) == 1
     payload = json.loads(data_lines[0][len("data:"):].strip())
     names = {p["name"] for p in payload["probes"]}
@@ -109,7 +109,7 @@ def test_ready_stream_probe_filter_single_fetch():
 
     resp = client.get("/health/ready/stream?probe=svc-a")
     assert resp.status_code == 200
-    data_lines = [l for l in resp.text.splitlines() if l.startswith("data:")]
+    data_lines = [line for line in resp.text.splitlines() if line.startswith("data:")]
     assert len(data_lines) == 1
     payload = json.loads(data_lines[0][len("data:"):].strip())
     names = {p["name"] for p in payload["probes"]}

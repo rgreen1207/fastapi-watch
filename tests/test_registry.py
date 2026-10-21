@@ -446,7 +446,7 @@ def test_sse_endpoints_single_fetch_mode():
         resp = client.get(path)
         assert resp.status_code == 200
         assert "text/event-stream" in resp.headers["content-type"]
-        data_lines = [l for l in resp.text.splitlines() if l.startswith("data:")]
+        data_lines = [line for line in resp.text.splitlines() if line.startswith("data:")]
         assert len(data_lines) == 1
         data = json.loads(data_lines[0][len("data:"):].strip())
         assert "status" in data
@@ -1364,9 +1364,6 @@ async def test_webhook_not_fired_on_first_run():
 
     async def fake_dispatch(self, alert):
         posted.append(alert.probe)
-
-    import fastapi_watch.registry as reg_module
-    monkeypatch_attr = reg_module.HealthRegistry._dispatch_alert
 
     app = FastAPI()
     registry = HealthRegistry(app, webhook_url="http://hooks.example.com/health")

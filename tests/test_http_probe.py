@@ -333,7 +333,7 @@ async def test_cache_window_auto_sized_from_maxsize():
     def get_value(key: int) -> int:
         return key
 
-    watched = probe.watch(get_value)
+    probe.watch(get_value)
     assert probe._cache_window_size == 5
 
 

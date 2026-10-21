@@ -18,11 +18,6 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-
-class _MaintenanceRequest(BaseModel):
-    minutes: float | None = Field(None, gt=0, le=525600)  # max 1 year
-    until: datetime | None = None
-
 from .alerts import BaseAlerter, WebhookAlerter
 from .dashboard import render_dashboard
 from .models import AlertRecord, HealthReport, ProbeResult, ProbeStatus
@@ -30,6 +25,13 @@ from .prometheus import render_prometheus, validate_metrics_prefix
 from .probe_group import ProbeGroup
 from .probes.base import BaseProbe, _failure_message
 from .storage import InMemoryProbeStorage, ProbeStorage
+
+
+class _MaintenanceRequest(BaseModel):
+    """Body of ``POST /health/maintenance``: a duration or an end time (both optional)."""
+
+    minutes: float | None = Field(None, gt=0, le=525600)  # max 1 year
+    until: datetime | None = None
 
 _MIN_POLL_INTERVAL_MS = 1000
 _AUTO_HTTP_METHODS = frozenset({"HEAD", "OPTIONS"})

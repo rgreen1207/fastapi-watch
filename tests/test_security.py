@@ -235,7 +235,7 @@ def test_html_dashboard_file_accepted(tmp_path):
     html_file = tmp_path / "dashboard.html"
     html_file.write_text("<!DOCTYPE html><html><body>custom</body></html>")
     app = FastAPI()
-    registry = HealthRegistry(app, dashboard=html_file, poll_interval_ms=None)
+    HealthRegistry(app, dashboard=html_file, poll_interval_ms=None)
     client = TestClient(app)
     resp = client.get("/health/dashboard")
     assert resp.status_code == 200

@@ -1,13 +1,11 @@
 """Tests for MemcachedProbe — mocked so no real Memcached needed."""
+import importlib.util
+
 import pytest
 from unittest.mock import AsyncMock, patch
 from fastapi_watch.models import ProbeStatus
 
-try:
-    import aiomcache
-    HAS_AIOMCACHE = True
-except ImportError:
-    HAS_AIOMCACHE = False
+HAS_AIOMCACHE = importlib.util.find_spec("aiomcache") is not None
 
 pytestmark = pytest.mark.skipif(not HAS_AIOMCACHE, reason="aiomcache not installed")
 
