@@ -163,10 +163,20 @@ class RequestMetricsMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next) -> Response:
         start = time.perf_counter()
-        response = await call_next(request)
-        rtt_ms = round((time.perf_counter() - start) * 1000, 2)
-        status_code = response.status_code
+        try:
+            response = await call_next(request)
+        except Exception:
+            # Unhandled exceptions become a 500 in Starlette's ServerErrorMiddleware,
+            # which sits outside every user middleware — so this is the only place
+            # the request can be counted.  Re-raise so that response is unchanged.
+            self._record(request, 500, start)
+            raise
+        self._record(request, response.status_code, start)
+        return response
 
+    def _record(self, request: Request, status_code: int, start: float) -> None:
+        """Record one finished request in the aggregate and its per-route bucket."""
+        rtt_ms = round((time.perf_counter() - start) * 1000, 2)
         self._aggregate.record(status_code, rtt_ms)
 
         if self.per_route:
@@ -175,8 +185,6 @@ class RequestMetricsMiddleware(BaseHTTPMiddleware):
             route = request.scope.get("route")
             path = getattr(route, "path", None) or request.url.path or "<unmatched>"
             self._get_or_create(path).record(status_code, rtt_ms)
-
-        return response
 
 
 # ---------------------------------------------------------------------------

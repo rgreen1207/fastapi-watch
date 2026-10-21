@@ -135,3 +135,86 @@ async def test_probe_latency_ms_equals_avg_rtt():
     snap = middleware._aggregate.snapshot()
     result = await probe.check()
     assert result.latency_ms == snap["avg_rtt_ms"]
+
+
+# ---------------------------------------------------------------------------
+# Unhandled exceptions
+# ---------------------------------------------------------------------------
+
+def _installed_middleware(app: FastAPI) -> RequestMetricsMiddleware:
+    """Return the instance Starlette built from ``app.add_middleware``."""
+    node = app.middleware_stack
+    while not isinstance(node, RequestMetricsMiddleware):
+        node = node.app
+    return node
+
+
+def _crashing_app() -> FastAPI:
+    app = FastAPI()
+
+    @app.get("/items/{item_id}")
+    async def crash(item_id: int):
+        raise RuntimeError("unhandled")
+
+    @app.get("/ok")
+    async def ok_route():
+        return {"status": "ok"}
+
+    return app
+
+
+@pytest.mark.asyncio
+async def test_unhandled_exception_counted_as_500_via_add_middleware():
+    app = _crashing_app()
+    app.add_middleware(RequestMetricsMiddleware, per_route=True)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    assert client.get("/items/1").status_code == 500
+    middleware = _installed_middleware(app)
+    snap = middleware._aggregate.snapshot()
+    assert snap["request_count"] == 1
+    assert snap["error_count"] == 1
+    assert middleware._routes["/items/{item_id}"].snapshot()["error_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_unhandled_exception_still_propagates():
+    app = _crashing_app()
+    app.add_middleware(RequestMetricsMiddleware)
+
+    with pytest.raises(Exception) as excinfo:
+        TestClient(app).get("/items/1")
+
+    # Starlette <0.28 runs BaseHTTPMiddleware in an anyio task group, which
+    # delivers the original error inside an ExceptionGroup.
+    def _contains_original(exc: BaseException) -> bool:
+        if isinstance(exc, RuntimeError) and str(exc) == "unhandled":
+            return True
+        return any(_contains_original(inner) for inner in getattr(exc, "exceptions", ()))
+
+    assert _contains_original(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_unhandled_exception_counted_once_when_wrapping_app_directly():
+    app = _crashing_app()
+    middleware = RequestMetricsMiddleware(app)
+    client = TestClient(middleware, raise_server_exceptions=False)
+
+    assert client.get("/items/1").status_code == 500
+    client.get("/ok")
+    snap = middleware._aggregate.snapshot()
+    assert snap["request_count"] == 2
+    assert snap["error_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_unhandled_exception_makes_probe_unhealthy():
+    app = _crashing_app()
+    app.add_middleware(RequestMetricsMiddleware)
+    client = TestClient(app, raise_server_exceptions=False)
+    for _ in range(5):
+        client.get("/items/1")
+
+    result = await RequestMetricsProbe(_installed_middleware(app)).check()
+    assert result.status == ProbeStatus.UNHEALTHY

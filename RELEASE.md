@@ -14,6 +14,12 @@
 
 **Behavior change:** probes now go unhealthy promptly during an outage and recover once the window clears. If you tuned `max_error_rate` around the old lifetime figure, revisit it.
 
+#### `RequestMetricsMiddleware` now counts unhandled exceptions
+
+When a route raised an exception that no exception handler caught, `call_next` re-raised it and the request was never recorded. Starlette turns those exceptions into a 500 in `ServerErrorMiddleware`, which sits outside every user middleware, so the most serious failures — real crashes — were invisible to `request_count`, `error_count`, `error_rate`, and the per-route breakdown. Only 500s produced by an exception handler were counted.
+
+**Fix:** the middleware records an unhandled exception as a 500 (in the aggregate and under the route template) and re-raises it unchanged, so the response the client receives is the same as before.
+
 ### Infrastructure
 
 - **CI on pull requests.** A new `ci.yml` workflow runs the suite across Python 3.10–3.15 against FastAPI 0.100 (the oldest supported release) and the latest FastAPI. Previously tests only ran on Python 3.11 at publish time. Optional extras install individually so a driver without wheels for a new Python (currently `aiokafka` on 3.15) skips its own tests rather than blocking the run.
