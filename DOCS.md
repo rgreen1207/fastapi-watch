@@ -63,6 +63,8 @@ registry = HealthRegistry(app, dashboard=False) # dashboard off
 
 **Time range** — 15 min, 1 hour, 2 hours, or all retained history (remembered per browser). Graphs draw from the registry's stored history, which is embedded in the page and extended by live updates. How far back "All" reaches depends on `history_size` and `result_ttl_seconds` (120 results per probe and 2 hours by default); use a custom `storage=` backend for longer retention.
 
+The page stays light however much a probe reports: it embeds only the fields its graphs read (status, latency, percentiles, error rate, throughput, and event-loop lag; for routes, only the eight busiest), at most 2,000 results per probe. An open tab keeps live points for the longer of 2 hours and the embedded history's span, and at most 2,000 points per probe, so leaving it open for days does not grow its memory.
+
 **Status over time** — one lane per probe, colored by status, with a tick at every state change. Gaps in the data are left blank rather than drawn as healthy.
 
 **Probe rows** — the probe's name, description, tags, status, current latency, and any error on the left; on the right, the graphs its results support:
