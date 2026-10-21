@@ -62,6 +62,20 @@ FastAPI 0.137 stores included routers as `_IncludedRouter` wrappers whose routes
 
 **Fix:** `RequestMetricsProbe(app)` accepts the app and resolves the live middleware from `app.middleware_stack` on its first check. If the stack is built without the middleware, the probe reports UNHEALTHY with a configuration error rather than silently showing no traffic. Passing a middleware instance still works. `RequestMetricsProbe` also defaults to `circuit_breaker_enabled=False` (see the passive-probe circuit breaker change below).
 
+#### Dashboard live updates
+
+Three problems with the built-in dashboard's live (SSE) updates:
+
+- The per-route breakdown from `RequestMetricsProbe` rendered as "—" on the page and in every live update, although it was computed and streamed each time. It is now shown as a compact table (route, requests, errors, error rate, p95), escaped like every other value.
+- Live updates refreshed each probe card but never the summary line ("N / M probes healthy"), and a probe that first appeared after page load never got a card. The summary now updates with every event, and when the set of probes changes the page reloads once to pick it up (guarded against reload loops).
+- The stream URL was absolute (`/health/status/stream`), so a dashboard served under a mount or a proxy `root_path` connected to the wrong URL and never updated. It now includes the request's `root_path`.
+
+#### Custom dashboard renderers with the documented signature
+
+`dashboard=` documented a callable `(report) -> str`, but the registry called it with `(report, maintenance)`, so a renderer written to the documentation raised `TypeError` and `/health/dashboard` returned 500.
+
+**Fix:** the renderer's signature is inspected once at startup: one-argument renderers are called with the report, and renderers taking a second positional argument (as 1.7.1 required) still receive the maintenance flag.
+
 ### Performance
 
 #### Per-route request metrics no longer grow without bound

@@ -113,9 +113,29 @@ def _fmt_detail_value(key: str, value: Any) -> str:
     if key in ("status_distribution", "error_types") and isinstance(value, dict):
         parts = ", ".join(f"{k}: {v}" for k, v in sorted(value.items()))
         return _e(parts) if parts else "—"
+    if key == "routes" and isinstance(value, dict):
+        return _routes_table(value)
     if isinstance(value, dict):
         return "—"
     return _e(value)
+
+
+def _routes_table(routes: dict) -> str:
+    """Render RequestMetricsProbe's per-route breakdown as a compact table."""
+    if not routes:
+        return "—"
+    rows = "".join(
+        f"<tr><td>{_e(path)}</td><td>{_e(stats.get('request_count', 0))}</td>"
+        f"<td>{_e(stats.get('error_count', 0))}</td>"
+        f"<td>{_fmt_detail_value('error_rate', stats.get('error_rate'))}</td>"
+        f"<td>{_fmt_detail_value('p95_rtt_ms', stats.get('p95_rtt_ms'))}</td></tr>"
+        for path, stats in sorted(routes.items())
+        if isinstance(stats, dict)
+    )
+    return (
+        '<table class="routes-table"><thead><tr><th>Route</th><th>Requests</th>'
+        f"<th>Errors</th><th>Error rate</th><th>p95</th></tr></thead><tbody>{rows}</tbody></table>"
+    )
 
 
 def _fmt_detail_key(key: str) -> str:
@@ -273,6 +293,11 @@ body {
   color: #64748b;
   margin-bottom: 14px;
 }
+
+.routes-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.routes-table th, .routes-table td { text-align: left; padding: 2px 6px; white-space: nowrap; }
+.routes-table th { color: #64748b; font-weight: 600; }
+.routes-table td:first-child { white-space: normal; word-break: break-all; }
 
 .probe-grid {
   display: grid;
@@ -683,8 +708,55 @@ _JS = r"""
     if ((key === 'status_distribution' || key === 'error_types') && typeof val === 'object' && val !== null) {
       return Object.keys(val).sort().map(function(dictKey) { return escAttr(dictKey) + ': ' + escAttr(String(val[dictKey])); }).join(', ');
     }
+    if (key === 'routes' && typeof val === 'object' && val !== null) return routesTable(val);
     if (typeof val === 'object') return '—';
     return escAttr(String(val));
+  }
+
+  // Mirrors the server-side _routes_table() so live updates match the first render.
+  function routesTable(routes) {
+    var paths = Object.keys(routes).sort();
+    if (!paths.length) return '—';
+    var rows = paths.map(function(path) {
+      var s = routes[path] || {};
+      return '<tr><td>' + escAttr(path) + '</td><td>' + escAttr(String(s.request_count || 0)) +
+        '</td><td>' + escAttr(String(s.error_count || 0)) + '</td><td>' + fmtDetailVal('error_rate', s.error_rate) +
+        '</td><td>' + fmtDetailVal('p95_rtt_ms', s.p95_rtt_ms) + '</td></tr>';
+    }).join('');
+    return '<table class="routes-table"><thead><tr><th>Route</th><th>Requests</th><th>Errors</th>' +
+      '<th>Error rate</th><th>p95</th></tr></thead><tbody>' + rows + '</tbody></table>';
+  }
+
+  function summaryText(probes) {
+    var total = probes.length, healthy = 0, degraded = 0;
+    probes.forEach(function(p) {
+      if (p.status === 'healthy') healthy++;
+      else if (p.status === 'degraded') degraded++;
+    });
+    var unhealthy = total - healthy - degraded;
+    var noun = 'probe' + (total !== 1 ? 's' : '');
+    if (degraded || unhealthy) {
+      return healthy + ' healthy, ' + degraded + ' degraded, ' + unhealthy + ' unhealthy / ' + total + ' ' + noun;
+    }
+    return healthy + ' / ' + total + ' ' + noun + ' healthy';
+  }
+
+  // Cards are server-rendered; when the set of probes changes (one added or
+  // removed after page load) reload once to pick it up.  The timestamp guard
+  // stops a reload loop should the page and stream ever disagree.
+  function probeSetChanged(probes) {
+    var shown = Array.prototype.map.call(document.querySelectorAll('.probe-card'), function(c) {
+      return c.getAttribute('data-probe');
+    }).sort().join('\n');
+    return shown !== probes.map(function(p) { return p.name; }).sort().join('\n');
+  }
+
+  function reloadForNewProbes() {
+    var key = 'fastapi-watch-reloaded-at', now = Date.now(), last = 0;
+    try { last = parseInt(sessionStorage.getItem(key) || '0', 10); } catch (_) {}
+    if (now - last < 30000) return;
+    try { sessionStorage.setItem(key, String(now)); } catch (_) {}
+    window.location.reload();
   }
 
   function statusLabel(status) {
@@ -770,7 +842,11 @@ _JS = r"""
       checkedEl.textContent = 'Last checked ' + report.checked_at.replace('T', ' ').slice(0, 19) + ' ' + tz;
     }
 
-    (report.probes || []).forEach(updateCard);
+    var probes = report.probes || [];
+    var summaryEl = document.getElementById('probe-summary');
+    if (summaryEl) summaryEl.textContent = summaryText(probes);
+    if (probeSetChanged(probes)) reloadForNewProbes();
+    probes.forEach(updateCard);
   }
 
   // Combined filter: tags + search text
@@ -1085,7 +1161,7 @@ def render_dashboard(
     {_glossary_html()}
     <input id="probe-search" class="probe-search" type="search" placeholder="Search probes…" autocomplete="off" />
     {tag_filter_html}
-    <div class="section-title">{summary}</div>
+    <div class="section-title" id="probe-summary">{summary}</div>
     <div class="probe-grid">
 {probe_cards}
     </div>

@@ -423,3 +423,94 @@ def test_detail_key_quotes_are_escaped():
     html = render_dashboard(_make_report(probes), stream_url="/health/status/stream")
     assert '"quoted_key"' not in html
     assert "&quot;" in html
+
+
+# ---------------------------------------------------------------------------
+# Per-route breakdown, live summary, stream URL under a prefix
+# ---------------------------------------------------------------------------
+
+def _report_with_routes(routes: dict) -> HealthReport:
+    probe = ProbeResult(name="request_metrics", status=ProbeStatus.HEALTHY, details={"routes": routes})
+    return HealthReport.from_results([probe])
+
+
+def test_routes_breakdown_rendered_as_table():
+    html = render_dashboard(
+        _report_with_routes({"/users/{id}": {"request_count": 4, "error_count": 1, "error_rate": 0.25, "p95_rtt_ms": 9.5}}),
+        stream_url="/health/status/stream",
+    )
+    assert '<table class="routes-table">' in html
+    assert "<td>/users/{id}</td><td>4</td><td>1</td><td>25.00%</td><td>9.50 ms</td>" in html
+
+
+def test_routes_breakdown_is_escaped():
+    html = render_dashboard(_report_with_routes({"/<script>": {"request_count": 1}}), stream_url="/s")
+    assert "<td>/&lt;script&gt;</td>" in html
+    assert "<td>/<script></td>" not in html
+
+
+def test_empty_routes_breakdown_renders_dash():
+    html = render_dashboard(_report_with_routes({}), stream_url="/s")
+    markup = html.split("<script>")[0]  # the embedded JS contains the table template too
+    assert '<table class="routes-table">' not in markup
+
+
+def test_summary_has_an_id_and_live_update_hooks():
+    html = render_dashboard(HealthReport.from_results([]), stream_url="/s")
+    assert 'id="probe-summary"' in html
+    for hook in ("function summaryText", "function routesTable", "function probeSetChanged", "probe-summary"):
+        assert hook in html
+
+
+@pytest.mark.parametrize("root_path", ["/api", "/api/"])
+def test_stream_url_includes_root_path(root_path):
+    app = FastAPI()
+    HealthRegistry(app)
+    html = TestClient(app, root_path=root_path).get("/health/dashboard").text
+    assert 'data-stream-url="/api/health/status/stream"' in html
+
+
+def test_stream_url_when_registry_app_is_mounted():
+    outer, inner = FastAPI(), FastAPI()
+    HealthRegistry(inner)
+    outer.mount("/svc", inner)
+    html = TestClient(outer).get("/svc/health/dashboard").text
+    assert 'data-stream-url="/svc/health/status/stream"' in html
+
+
+def test_stream_url_without_prefix_is_unchanged():
+    app = FastAPI()
+    HealthRegistry(app)
+    assert 'data-stream-url="/health/status/stream"' in TestClient(app).get("/health/dashboard").text
+
+
+# ---------------------------------------------------------------------------
+# Custom renderer signatures
+# ---------------------------------------------------------------------------
+
+def _dashboard_text(renderer) -> tuple[int, str]:
+    app = FastAPI()
+    registry = HealthRegistry(app, dashboard=renderer)
+    registry.set_maintenance()
+    resp = TestClient(app, raise_server_exceptions=False).get("/health/dashboard")
+    return resp.status_code, resp.text
+
+
+def test_documented_one_arg_renderer():
+    assert _dashboard_text(lambda report: f"<p>{report.status.value}</p>") == (200, "<p>healthy</p>")
+
+
+def test_two_arg_renderer_still_receives_maintenance():
+    assert _dashboard_text(lambda report, maintenance: f"<p>{maintenance}</p>") == (200, "<p>True</p>")
+
+
+def test_var_positional_renderer_receives_both():
+    assert _dashboard_text(lambda *args: f"<p>{len(args)}</p>") == (200, "<p>2</p>")
+
+
+def test_callable_object_renderer():
+    class Renderer:
+        def __call__(self, report):
+            return "<p>obj</p>"
+
+    assert _dashboard_text(Renderer()) == (200, "<p>obj</p>")

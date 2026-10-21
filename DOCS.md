@@ -1526,7 +1526,7 @@ The endpoint is subject to the same `auth` as all other health endpoints.
 | `probe_timeout` | `float \| None` | `30.0` | Seconds before a probe without its own `timeout` is reported UNHEALTHY. `None` disables the default |
 | `timezone` | `str` | `"UTC"` | IANA timezone for `checked_at` timestamps |
 | `groups` | `list[ProbeGroup] \| None` | `None` | ProbeGroups to include at startup |
-| `dashboard` | `bool \| Callable \| Path` | `True` | `True` = built-in dashboard; `False` = disabled; Callable = custom renderer; `.html`/`.htm` file path = served as-is. `.py` files are rejected. |
+| `dashboard` | `bool \| Callable \| Path` | `True` | `True` = built-in dashboard; `False` = disabled; Callable = custom renderer `(report) -> str` (or `(report, maintenance) -> str` to also receive the maintenance flag); `.html`/`.htm` file path = served as-is. `.py` files are rejected. |
 | `serve_routes` | `bool` | `True` | `True` = register all health endpoints on the app. `False` = skip route registration entirely — use `get_report()` to expose status on your own endpoint. |
 | `circuit_breaker` | `bool` | `True` | Enable/disable circuit breaker |
 | `circuit_breaker_threshold` | `int` | `5` | Consecutive failures before circuit opens |

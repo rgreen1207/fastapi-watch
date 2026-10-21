@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import fnmatch
+import inspect
 import logging
 import re
 import secrets
@@ -143,6 +144,22 @@ def _endpoint_keys(route) -> set:
     return {endpoint, getattr(endpoint, "__wrapped__", endpoint)}
 
 
+def _takes_two_positional(fn: Callable) -> bool:
+    """True if *fn* can be called with two positional arguments.
+
+    When the signature cannot be inspected (some builtins and C extensions),
+    assume it can — that is how every renderer was called before 1.7.2.
+    """
+    try:
+        params = list(inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):
+        return True
+    if any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in params):
+        return True
+    positional = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    return sum(p.kind in positional for p in params) >= 2
+
+
 def _parse_csv_filter(value: str | None) -> frozenset[str] | None:
     """Parse a comma-separated ``?tag=`` / ``?probe=`` query param into a frozenset.
 
@@ -264,7 +281,9 @@ class HealthRegistry:
         history_size: Number of past results kept per probe (default 120).
         groups: :class:`~fastapi_watch.ProbeGroup` instances to merge at startup.
         dashboard: ``True`` (default) — built-in HTML dashboard.  ``False`` — omit the
-            route.  Callable ``(report: HealthReport) -> str`` — custom renderer.
+            route.  Callable ``(report: HealthReport) -> str`` — custom renderer;
+            a callable taking a second positional argument also receives the
+            maintenance flag, ``(report, maintenance) -> str``.
             ``str`` or ``Path`` — path to a ``.html`` or ``.htm`` file served as-is.
         serve_routes: ``True`` (default) — register all health endpoints on the app.
             ``False`` — skip route registration entirely.  Use :meth:`get_report`
@@ -1654,13 +1673,19 @@ class HealthRegistry:
 
         if dashboard is not False:
             if callable(dashboard):
-                _renderer: Callable[..., str] = dashboard
+                user_renderer = dashboard
+                # The documented form is (report) -> str; 1.7.1 always passed
+                # (report, maintenance), so keep honoring renderers written that way.
+                pass_maintenance = _takes_two_positional(user_renderer)
+
+                def _renderer(report: HealthReport, maintenance: bool, request: Request) -> str:
+                    return user_renderer(report, maintenance) if pass_maintenance else user_renderer(report)
             elif isinstance(dashboard, (str, Path)):
                 dashboard_path = Path(dashboard).resolve()
                 if dashboard_path.suffix in (".html", ".htm"):
                     _html_content = dashboard_path.read_text(encoding="utf-8")
 
-                    def _renderer(report: HealthReport, maintenance: bool = False) -> str:
+                    def _renderer(report: HealthReport, maintenance: bool, request: Request) -> str:
                         return _html_content
                 else:
                     raise ValueError(
@@ -1668,12 +1693,14 @@ class HealthRegistry:
                         "To use a custom renderer, pass a callable instead of a file path."
                     )
             else:
-                _stream_url = f"{prefix}/status/stream"
 
-                def _renderer(report: HealthReport, maintenance: bool = False) -> str:
+                def _renderer(report: HealthReport, maintenance: bool, request: Request) -> str:
+                    # root_path carries any mount or proxy prefix the app is served
+                    # under; without it the page would stream from the wrong URL.
+                    root_path = request.scope.get("root_path", "").rstrip("/")
                     return render_dashboard(
                         report,
-                        stream_url=_stream_url,
+                        stream_url=f"{root_path}{prefix}/status/stream",
                         maintenance_banner=maintenance,
                     )
 
@@ -1685,11 +1712,11 @@ class HealthRegistry:
                 response_class=HTMLResponse,
                 dependencies=auth_deps,
             )
-            async def health_dashboard() -> HTMLResponse:
+            async def health_dashboard(request: Request) -> HTMLResponse:
                 results = await registry._get_results()
                 report = HealthReport.from_results(
                     results,
                     checked_at=registry._last_checked_at,
                     timezone=registry._timezone_name,
                 )
-                return HTMLResponse(content=_renderer(report, registry._in_maintenance()))
+                return HTMLResponse(content=_renderer(report, registry._in_maintenance(), request))
