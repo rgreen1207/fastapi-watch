@@ -129,6 +129,13 @@ class BaseProbe(ABC):
     async def check(self) -> ProbeResult:
         """Execute the health check and return a :class:`~fastapi_watch.models.ProbeResult`."""
 
+    async def aclose(self) -> None:
+        """Release anything the probe started (background tasks, connections).
+
+        Called once when the registry shuts down.  The default does nothing;
+        override it in probes that hold resources.
+        """
+
 
 class PassiveProbe(BaseProbe):
     """Base class for custom **passive** health probes.

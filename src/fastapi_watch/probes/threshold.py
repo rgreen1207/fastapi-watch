@@ -91,6 +91,10 @@ class ThresholdProbe(BaseProbe):
             else inner_probe.poll_interval_ms
         )
 
+    async def aclose(self) -> None:
+        """Close the wrapped probe (the registry only knows about this one)."""
+        await self._inner.aclose()
+
     async def check(self) -> ProbeResult:
         result = await self._inner.check()
 
