@@ -70,6 +70,16 @@ Three problems with the built-in dashboard's live (SSE) updates:
 - Live updates refreshed each probe card but never the summary line ("N / M probes healthy"), and a probe that first appeared after page load never got a card. The summary now updates with every event, and when the set of probes changes the page reloads once to pick it up (guarded against reload loops).
 - The stream URL was absolute (`/health/status/stream`), so a dashboard served under a mount or a proxy `root_path` connected to the wrong URL and never updated. It now includes the request's `root_path`.
 
+#### Dashboard live updates work with header-based `auth=`
+
+With `auth={"type": "apikey", ...}` (or a callable checking a header), the dashboard page loaded but its live updates never did: a browser `EventSource` cannot send headers, so `/health/status/stream` answered `403` to every connection.
+
+**Fix:** the authenticated dashboard page embeds a short-lived signed token in its stream URL (valid 5 minutes, checked when the stream connects). The two stream endpoints accept that token or normal credentials; nothing else accepts it, and the credentials never appear in the page. For `basic`/`apikey` auth the signing key is derived from the configured credentials, so tokens are honored across worker processes and replicas; a callable `auth` uses a per-process key. When a reconnect is refused after the token expires, the page reloads itself to obtain a fresh one.
+
+#### Documented `auth=` examples now work
+
+README.md and DOCS.md showed `auth={"username": ..., "password": ...}` (missing `"type": "basic"`) and `auth={"token": ...}` (not a supported form); both raised `ValueError` at startup. The examples are corrected, and a test now constructs a registry from every `auth=` example in the docs.
+
 #### Custom dashboard renderers with the documented signature
 
 `dashboard=` documented a callable `(report) -> str`, but the registry called it with `(report, maintenance)`, so a renderer written to the documentation raised `TypeError` and `/health/dashboard` returned 500.

@@ -751,12 +751,18 @@ _JS = r"""
     return shown !== probes.map(function(p) { return p.name; }).sort().join('\n');
   }
 
-  function reloadForNewProbes() {
-    var key = 'fastapi-watch-reloaded-at', now = Date.now(), last = 0;
+  // At most one reload per 30 s (across reloads, via sessionStorage), and a
+  // reload asked for inside that window is deferred rather than dropped.
+  var reloadPending = false;
+  function reloadPage() {
+    if (reloadPending) return;
+    reloadPending = true;
+    var key = 'fastapi-watch-reloaded-at', last = 0;
     try { last = parseInt(sessionStorage.getItem(key) || '0', 10); } catch (_) {}
-    if (now - last < 30000) return;
-    try { sessionStorage.setItem(key, String(now)); } catch (_) {}
-    window.location.reload();
+    setTimeout(function () {
+      try { sessionStorage.setItem(key, String(Date.now())); } catch (_) {}
+      window.location.reload();
+    }, Math.max(0, 30000 - (Date.now() - last)));
   }
 
   function statusLabel(status) {
@@ -845,7 +851,7 @@ _JS = r"""
     var probes = report.probes || [];
     var summaryEl = document.getElementById('probe-summary');
     if (summaryEl) summaryEl.textContent = summaryText(probes);
-    if (probeSetChanged(probes)) reloadForNewProbes();
+    if (probeSetChanged(probes)) reloadPage();
     probes.forEach(updateCard);
   }
 
@@ -940,6 +946,9 @@ _JS = r"""
 
   source.onerror = function () {
     if (liveDot) liveDot.className = 'live-dot';
+    // CLOSED means the browser gave up (e.g. a non-200 such as an expired
+    // stream token); a fresh page load gets a new token and reconnects.
+    if (source.readyState === 2) reloadPage();
   };
 })();
 """

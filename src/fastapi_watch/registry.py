@@ -1,11 +1,14 @@
 import asyncio
 import base64
 import fnmatch
+import hashlib
+import hmac
 import inspect
 import logging
 import re
 import secrets
 import signal as _signal
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, AsyncGenerator, Awaitable, Callable, Iterator
@@ -142,6 +145,39 @@ def _endpoint_keys(route) -> set:
     if endpoint is None:
         return set()
     return {endpoint, getattr(endpoint, "__wrapped__", endpoint)}
+
+
+_STREAM_TOKEN_TTL_S = 300
+
+
+def _stream_token_key(auth: dict | Callable) -> bytes:
+    """Return the key that signs dashboard stream tokens.
+
+    Derived from the configured credentials, so every worker process and replica
+    sharing them accepts each other's tokens (the stream request may land on a
+    different worker than the page did).  A callable *auth* has no shared secret,
+    so it gets a per-process random key: tokens then only validate on the worker
+    that issued them.
+    """
+    if isinstance(auth, dict):
+        material = auth.get("key") or f"{auth.get('username')}:{auth.get('password')}"
+        return hashlib.sha256(b"fastapi-watch/stream-token\x00" + str(material).encode()).digest()
+    return secrets.token_bytes(32)
+
+
+def _mint_stream_token(key: bytes) -> str:
+    """Return ``"<expiry>.<hmac>"``, valid for ``_STREAM_TOKEN_TTL_S`` seconds."""
+    expiry = str(int(time.time()) + _STREAM_TOKEN_TTL_S)
+    return f"{expiry}.{hmac.new(key, expiry.encode(), hashlib.sha256).hexdigest()}"
+
+
+def _valid_stream_token(key: bytes, token: str) -> bool:
+    """True if *token* was signed with *key* and has not expired."""
+    expiry, _, signature = token.partition(".")
+    if not expiry.isdigit():
+        return False
+    expected = hmac.new(key, expiry.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(signature, expected) and int(expiry) >= time.time()
 
 
 def _takes_two_positional(fn: Callable) -> bool:
@@ -1388,6 +1424,20 @@ class HealthRegistry:
 
         auth_checker = _make_auth_checker(self._auth)
         auth_deps = [Depends(auth_checker)] if auth_checker else []
+        stream_deps = auth_deps
+        token_key: bytes | None = None
+        if auth_checker is not None:
+            # A browser EventSource cannot send headers, so the authenticated
+            # dashboard page hands its stream a short-lived signed token instead.
+            token_key = _stream_token_key(self._auth)
+
+            async def _stream_auth(request: Request) -> None:
+                token = request.query_params.get("token")
+                if token and _valid_stream_token(token_key, token):
+                    return
+                await auth_checker(request)
+
+            stream_deps = [Depends(_stream_auth)]
 
         def _make_sse_report(results: list[ProbeResult]) -> str:
             return HealthReport.from_results(
@@ -1551,7 +1601,7 @@ class HealthRegistry:
             tags=tags,
             summary="Readiness stream",
             description="SSE (Server-Sent Events) stream of readiness. Poll loop stops when last client disconnects.",
-            dependencies=auth_deps,
+            dependencies=stream_deps,
         )
         async def readiness_stream(
             request: Request,
@@ -1574,7 +1624,7 @@ class HealthRegistry:
             tags=tags,
             summary="Health status stream",
             description="SSE (Server-Sent Events) stream of full probe results. Poll loop stops when last client disconnects.",
-            dependencies=auth_deps,
+            dependencies=stream_deps,
         )
         async def status_stream(
             request: Request,
@@ -1698,11 +1748,10 @@ class HealthRegistry:
                     # root_path carries any mount or proxy prefix the app is served
                     # under; without it the page would stream from the wrong URL.
                     root_path = request.scope.get("root_path", "").rstrip("/")
-                    return render_dashboard(
-                        report,
-                        stream_url=f"{root_path}{prefix}/status/stream",
-                        maintenance_banner=maintenance,
-                    )
+                    stream_url = f"{root_path}{prefix}/status/stream"
+                    if token_key is not None:
+                        stream_url += f"?token={_mint_stream_token(token_key)}"
+                    return render_dashboard(report, stream_url=stream_url, maintenance_banner=maintenance)
 
             @self.app.get(
                 f"{prefix}/dashboard",

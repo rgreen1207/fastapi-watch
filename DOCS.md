@@ -1586,10 +1586,10 @@ Health endpoints are publicly accessible by default (`auth=None`). A warning is 
 
 ```python
 # HTTP Basic auth
-registry = HealthRegistry(app, auth={"username": "ops", "password": "secret"})
+registry = HealthRegistry(app, auth={"type": "basic", "username": "ops", "password": "secret"})
 
-# Bearer token
-registry = HealthRegistry(app, auth={"token": "my-secret-token"})
+# API key header (default header: X-API-Key)
+registry = HealthRegistry(app, auth={"type": "apikey", "key": "my-secret-key", "header": "X-API-Key"})
 
 # Custom callable — must return exactly True to grant access
 HEALTH_KEY = "load-from-your-secrets-manager"
@@ -1603,6 +1603,8 @@ registry = HealthRegistry(app, auth=my_auth)
 The auth callable **must return exactly `True`** (the boolean). Returning `None`, `0`, `""`, or any other truthy value is treated as denial and returns `403`. This prevents accidental access grants from callables that return a user object or empty string on failure.
 
 Comparison of static credentials uses `secrets.compare_digest` to prevent timing attacks.
+
+**Dashboard live updates under auth.** A browser `EventSource` cannot send headers, so the authenticated dashboard page embeds a short-lived signed token (`?token=…`, valid 5 minutes, checked when the stream connects) in its stream URL. `/health/status/stream` and `/health/ready/stream` accept either that token or normal credentials; no other endpoint accepts it, and the credentials themselves never appear in the page. For `basic` and `apikey` auth the signing key is derived from the configured credentials, so tokens work across worker processes and replicas. A callable `auth` has no shared secret, so its tokens only validate on the process that issued them — with several workers behind a load balancer, prefer `basic`/`apikey` or route the dashboard with session affinity. If a reconnect is refused after the token expires, the page reloads itself to get a fresh one.
 
 ### Response fields and information disclosure
 

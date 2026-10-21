@@ -227,7 +227,7 @@ Webhook URLs are validated at construction time — private/loopback/link-local 
 Health endpoints are **publicly accessible by default** — set `auth` in production:
 
 ```python
-registry = HealthRegistry(app, auth={"username": "ops", "password": "secret"})
+registry = HealthRegistry(app, auth={"type": "basic", "username": "ops", "password": "secret"})
 ```
 
 To manually reset a circuit breaker (e.g. after you've fixed the underlying issue and don't want to wait for the cooldown):

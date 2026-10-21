@@ -1,5 +1,7 @@
 """Security hardening tests."""
+import ast
 import logging
+import re
 import pytest
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -488,3 +490,22 @@ async def test_logger_does_not_embed_raw_exception_string():
     combined = " ".join(str(a) for a in format_args)
     assert "hunter2" not in combined
     assert "connection_string" not in combined
+
+
+# ---------------------------------------------------------------------------
+# Documented auth examples must actually work
+# ---------------------------------------------------------------------------
+
+def _documented_auth_dicts():
+    """Every ``auth={...}`` literal in README.md and DOCS.md, as a test parameter."""
+    root = Path(__file__).resolve().parent.parent
+    found = []
+    for doc in ("README.md", "DOCS.md"):
+        for match in re.finditer(r"auth=(\{[^}]*\})", (root / doc).read_text(encoding="utf-8")):
+            found.append(pytest.param(ast.literal_eval(match.group(1)), id=f"{doc}:{match.group(1)[:40]}"))
+    return found
+
+
+@pytest.mark.parametrize("auth", _documented_auth_dicts())
+def test_documented_auth_examples_construct(auth):
+    HealthRegistry(FastAPI(), auth=auth)
