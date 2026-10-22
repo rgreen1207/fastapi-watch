@@ -177,9 +177,10 @@ async def test_one_pending_marker_per_probe():
         await registry._shutdown()
 
 
-def test_negative_min_interval_is_rejected():
+@pytest.mark.parametrize("value", [-1, float("inf"), float("nan")])
+def test_negative_or_infinite_min_interval_is_rejected(value):
     with pytest.raises(ValueError, match="alert_min_interval_s"):
-        HealthRegistry(FastAPI(), alert_min_interval_s=-1)
+        HealthRegistry(FastAPI(), alert_min_interval_s=value)
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +269,7 @@ async def test_dedupe_off_by_default_never_claims():
         await registry._shutdown()
 
 
-@pytest.mark.parametrize("value", [0, -5])
+@pytest.mark.parametrize("value", [0, -5, float("inf"), float("nan")])
 def test_invalid_dedupe_window_is_rejected(value):
     with pytest.raises(ValueError, match="alert_dedupe_window_s"):
         HealthRegistry(FastAPI(), alert_dedupe_window_s=value)

@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import inspect
 import logging
+import math
 import re
 import secrets
 import signal as _signal
@@ -633,10 +634,14 @@ class HealthRegistry:
             raise ValueError(f"storage_timeout must be positive or None, got {storage_timeout!r}")
         if max_stream_connections is not None and max_stream_connections < 1:
             raise ValueError(f"max_stream_connections must be at least 1 or None, got {max_stream_connections!r}")
-        if alert_min_interval_s < 0:
-            raise ValueError(f"alert_min_interval_s must be zero or positive, got {alert_min_interval_s!r}")
-        if alert_dedupe_window_s is not None and alert_dedupe_window_s <= 0:
-            raise ValueError(f"alert_dedupe_window_s must be positive or None, got {alert_dedupe_window_s!r}")
+        # Finite: an infinite interval would hold coalesced alerts forever, and
+        # an infinite claim TTL makes every claim_alert() fail (and so send).
+        if not (math.isfinite(alert_min_interval_s) and alert_min_interval_s >= 0):
+            raise ValueError(f"alert_min_interval_s must be zero or a finite positive number, got {alert_min_interval_s!r}")
+        if alert_dedupe_window_s is not None and not (
+            math.isfinite(alert_dedupe_window_s) and alert_dedupe_window_s > 0
+        ):
+            raise ValueError(f"alert_dedupe_window_s must be a finite positive number or None, got {alert_dedupe_window_s!r}")
         _validate_auth(auth)
         if stream_token_secret is not None and not stream_token_secret:
             raise ValueError("stream_token_secret must not be empty")
