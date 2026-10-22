@@ -258,3 +258,12 @@ def test_include_on_registry_is_chainable():
     registry = HealthRegistry(app)
     result = registry.include(router_a).include(router_b)
     assert result is registry
+
+
+def test_nested_group_tags_reach_the_registry():
+    db = ProbeGroup(tags=["database"])
+    db.add(NoOpProbe(name="pg"))
+    top = ProbeGroup(tags=["infra"])
+    top.include(db)
+    registry = HealthRegistry(FastAPI(), groups=[top])
+    assert [p.tags for p, _ in registry._probes] == [["database", "infra"]]

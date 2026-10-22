@@ -1,6 +1,9 @@
 """User callbacks and storage errors must not break health checks or polling."""
 import asyncio
 import signal
+import subprocess
+import sys
+import textwrap
 
 import httpx
 import pytest
@@ -71,6 +74,7 @@ class _FailOnceStorage(InMemoryProbeStorage):
 async def test_poll_loop_survives_a_failing_iteration(caplog, monkeypatch):
     registry = HealthRegistry(FastAPI(), poll_interval_ms=1000)
     registry.add(_Flip())
+    registry._active_connections = 1  # a stream client keeps registry-interval probes polled
 
     async def _fails(pairs):
         raise RuntimeError("unexpected")
@@ -91,6 +95,7 @@ async def test_poll_loop_storage_error_is_contained_in_the_probe_run(caplog):
     registry = HealthRegistry(FastAPI(), poll_interval_ms=1000, storage=_FailOnceStorage())
     probe = _Flip()
     registry.add(probe)
+    registry._active_connections = 1
 
     with caplog.at_level("WARNING", logger="fastapi_watch"):
         task = asyncio.create_task(registry._poll_loop())
@@ -165,6 +170,28 @@ def test_signal_handler_without_a_running_loop_only_sets_the_flag(monkeypatch):
     installed[signal.SIGINT](signal.SIGINT, None)
     assert registry._shutting_down is True
     assert chained_to == [signal.SIGINT]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")
+def test_signal_hook_keeps_default_sigterm_fatal():
+    # With no Python handler (SIG_DFL), the hook used to swallow SIGTERM: the
+    # process kept running until SIGKILL.
+    script = textwrap.dedent("""
+        import asyncio, os, signal
+        from fastapi import FastAPI
+        from fastapi_watch import HealthRegistry
+
+        async def main():
+            HealthRegistry(FastAPI()).set_started()
+            os.kill(os.getpid(), signal.SIGTERM)
+            await asyncio.sleep(2)
+            print("survived")
+
+        asyncio.run(main())
+    """)
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30)
+    assert "survived" not in proc.stdout
+    assert proc.returncode == -signal.SIGTERM
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +270,26 @@ async def test_first_request_starts_polling_when_set_started_had_no_loop():
         assert registry._poll_task is not None and not registry._poll_task.done()
     finally:
         await registry._shutdown()
+
+
+@pytest.mark.asyncio
+async def test_background_loop_polls_only_custom_interval_probes_without_clients():
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=1000)
+    custom, inherited = _Flip(), _Flip()
+    custom.name, custom.poll_interval_ms = "custom", 5000
+    inherited.name = "inherited"
+    registry.add(custom).add(inherited)
+    task = asyncio.create_task(registry._poll_loop())
+    try:
+        await asyncio.sleep(0.05)
+        # Registry-interval probes poll only while a stream client is connected.
+        assert (custom.calls, inherited.calls) == (1, 0)
+        registry._active_connections = 1
+        registry._probe_last_run.clear()
+        await asyncio.sleep(1.1)
+        assert inherited.calls >= 1
+    finally:
+        task.cancel()
 
 
 @pytest.mark.asyncio
@@ -394,3 +441,26 @@ def test_threshold_probe_carries_inner_metadata():
     wrapped = ThresholdProbe(inner, warn_if=lambda d: False)
     assert (wrapped.description, wrapped.tags) == ("session cache", ["redis"])
     assert wrapped.circuit_breaker_enabled is False  # passive inner keeps the breaker off
+
+
+@pytest.mark.parametrize("returned", [None, {"status": "healthy"}])
+def test_probe_returning_a_non_result_is_unhealthy_not_a_500(returned):
+    class _Bad(BaseProbe):
+        name = "bad"
+
+        async def check(self):
+            return returned
+
+    class _Good(BaseProbe):
+        name = "good"
+
+        async def check(self):
+            return ProbeResult(name="good", status=ProbeStatus.HEALTHY)
+
+    app = FastAPI()
+    HealthRegistry(app, poll_interval_ms=None).add(_Bad()).add(_Good())
+    resp = TestClient(app, raise_server_exceptions=False).get("/health/status")
+    assert resp.status_code == 207
+    probes = {p["name"]: p for p in resp.json()["probes"]}
+    assert probes["bad"]["status"] == "unhealthy" and "TypeError" in probes["bad"]["error"]
+    assert probes["good"]["status"] == "healthy"

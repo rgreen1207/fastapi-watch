@@ -72,8 +72,12 @@ class ProbeGroup:
         """Merge another group's probes into this one. Returns ``self`` for chaining.
 
         Preserves the criticality setting of each probe as declared in the
-        included group.  Silently skips probes already registered (identity check).
+        included group, and merges that group's tags into each probe's own
+        tags (as :meth:`HealthRegistry.include` does), so a nested group's tags
+        are not lost.  Silently skips probes already registered (identity check).
         """
         for probe, critical in group._probes:
+            if group.tags and hasattr(probe, "tags"):
+                probe.tags = list(dict.fromkeys(list(probe.tags or []) + group.tags))
             self.add(probe, critical=critical)
         return self

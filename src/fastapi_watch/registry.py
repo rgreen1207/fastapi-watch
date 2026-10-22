@@ -6,10 +6,12 @@ import hashlib
 import hmac
 import inspect
 import logging
+import math
 import re
 import secrets
 import signal as _signal
 import time
+from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, AsyncGenerator, Awaitable, Callable, Iterator, Literal
@@ -21,6 +23,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel, Field
 from pydantic_core import to_json
 
+from ._executor import run_blocking
 from .alerts import BaseAlerter, WebhookAlerter
 from .dashboard import _current_probe, render_dashboard
 from .models import AlertRecord, HealthReport, ProbeResult, ProbeStatus
@@ -58,8 +61,22 @@ _SINGLE_FETCH_RETRY_MS = 30_000
 _STORAGE_FAILED: Any = object()
 _STORAGE_LOG_INTERVAL_S = 60.0
 _FORGET_INTERVAL_S = 600.0
-# Shutdown: how long each probe's aclose() may take.
+# Background storage writes: alert records held while the backend is behind,
+# the writer key for alerts, and how long shutdown lets pending writes land.
+_MAX_UNWRITTEN_ALERTS = 256
+_ALERT_WRITER: Any = object()
+_WRITE_FLUSH_TIMEOUT_S = 2.0
+# Shutdown: how long each probe's aclose() may take, and how long queued
+# alerts may take to send.
 _ACLOSE_TIMEOUT_S = 5.0
+_ALERT_DRAIN_TIMEOUT_S = 5.0
+# The dashboard page embeds a stream token: never cache it, sniff it, or frame it.
+_DASHBOARD_HEADERS = {
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": "frame-ancestors 'none'",
+}
 # Retry-After (seconds) sent when max_stream_connections streams are open.
 _STREAM_RETRY_AFTER_S = 30
 
@@ -169,6 +186,21 @@ def _name_slug(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9_\-.]+", "_", text).strip("_")
 
 
+def _installed_original(endpoint) -> Callable | None:
+    """Return the handler a monitoring wrapper installed by this module wraps, else ``None``.
+
+    Only that wrapper is ever unwrapped.  Following ``__wrapped__`` on any
+    callable would also strip the application's own ``functools.wraps``
+    decorators (authentication, rate limiting) and install the bare handler,
+    serving it unprotected.  The wrapper is recognised by identity, not by a
+    marker attribute: ``functools.wraps`` copies ``__dict__``, so a user
+    decorator applied over a monitored function carries the same attributes.
+    """
+    if endpoint is not None and getattr(endpoint, "_fastapi_watch_installed", None) is endpoint:
+        return endpoint.__wrapped__
+    return None
+
+
 def _is_health_handler(endpoint) -> bool:
     """True for route handlers that a HealthRegistry mounted itself.
 
@@ -176,16 +208,20 @@ def _is_health_handler(endpoint) -> bool:
     registry's, or a registry mounted at the root where no prefix can tell
     them apart from application routes.
     """
-    endpoint = getattr(endpoint, "__wrapped__", endpoint)
+    endpoint = _installed_original(endpoint) or endpoint
     return getattr(endpoint, "__qualname__", "").startswith(f"{HealthRegistry.__name__}._register_routes.")
 
 
 def _endpoint_keys(route) -> set:
-    """The route's endpoint and, if fastapi-watch wrapped it, the original function."""
+    """The route's endpoint and, if this module wrapped it for monitoring, the original handler.
+
+    A user decorator's inner function is not a key: two routes serving the
+    same function under different decorators are different routes.
+    """
     endpoint = getattr(route, "endpoint", None)
     if endpoint is None:
         return set()
-    return {endpoint, getattr(endpoint, "__wrapped__", endpoint)}
+    return {endpoint, _installed_original(endpoint) or endpoint}
 
 
 _STREAM_TOKEN_TTL_S = 300
@@ -247,7 +283,9 @@ def _stream_token_expiry(key: bytes, token: str) -> int | None:
     if not expiry.isdigit():
         return None
     expected = hmac.new(key, expiry.encode(), hashlib.sha256).hexdigest()
-    if hmac.compare_digest(signature, expected) and int(expiry) >= time.time():
+    # Bytes: compare_digest raises TypeError on a str with non-ASCII characters,
+    # which turned "?token=1.é" into a 500 for any unauthenticated client.
+    if hmac.compare_digest(signature.encode(), expected.encode()) and int(expiry) >= time.time():
         return int(expiry)
     return None
 
@@ -542,9 +580,9 @@ class HealthRegistry:
             records still see every transition.
         alert_dedupe_window_s: Cross-replica alert dedupe (keyword-only,
             default ``None`` = off).  With a shared storage backend that
-            implements ``claim_alert(key, ttl_seconds)``, replicas claim each
-            ``"<probe>:<new_status>"`` alert for this many seconds and only
-            the winner sends it.  A failing claim sends anyway.  Without
+            implements ``claim_alert(key, value, ttl_seconds)``, replicas
+            record the last status announced per probe for this many seconds
+            and only the first to announce each change sends it.  A failing claim sends anyway.  Without
             ``claim_alert`` a warning is logged at init and alerts are not
             deduplicated.
         stream_token_secret: Key that signs the dashboard's short-lived stream
@@ -604,10 +642,14 @@ class HealthRegistry:
             raise ValueError(f"storage_timeout must be positive or None, got {storage_timeout!r}")
         if max_stream_connections is not None and max_stream_connections < 1:
             raise ValueError(f"max_stream_connections must be at least 1 or None, got {max_stream_connections!r}")
-        if alert_min_interval_s < 0:
-            raise ValueError(f"alert_min_interval_s must be zero or positive, got {alert_min_interval_s!r}")
-        if alert_dedupe_window_s is not None and alert_dedupe_window_s <= 0:
-            raise ValueError(f"alert_dedupe_window_s must be positive or None, got {alert_dedupe_window_s!r}")
+        # Finite: an infinite interval would hold coalesced alerts forever, and
+        # an infinite claim TTL makes every claim_alert() fail (and so send).
+        if not (math.isfinite(alert_min_interval_s) and alert_min_interval_s >= 0):
+            raise ValueError(f"alert_min_interval_s must be zero or a finite positive number, got {alert_min_interval_s!r}")
+        if alert_dedupe_window_s is not None and not (
+            math.isfinite(alert_dedupe_window_s) and alert_dedupe_window_s > 0
+        ):
+            raise ValueError(f"alert_dedupe_window_s must be a finite positive number or None, got {alert_dedupe_window_s!r}")
         _validate_auth(auth)
         if stream_token_secret is not None and not stream_token_secret:
             raise ValueError("stream_token_secret must not be empty")
@@ -652,6 +694,13 @@ class HealthRegistry:
         self._last_results: dict[str, ProbeResult] = {}
         # id(probe) -> its in-flight run, shared by concurrent callers
         self._inflight: dict[int, asyncio.Task] = {}
+        # Writes to a backend other than the default in-memory one run in the
+        # background (see _store_result): the newest result per probe and the
+        # alert records not yet written, and one writer task per probe name
+        # (plus _ALERT_WRITER).  Bounded by the number of probes.
+        self._unwritten: dict[str, ProbeResult] = {}
+        self._unwritten_alerts: deque[AlertRecord] = deque(maxlen=_MAX_UNWRITTEN_ALERTS)
+        self._writers: dict[Any, asyncio.Task] = {}
         # Probe names this process has written to storage.  Bounded: only names
         # it registered.  Those it stops registering are forgotten in storage
         # (monotonic time of the last pass).
@@ -1091,11 +1140,13 @@ class HealthRegistry:
             else:
                 probe = FastAPIRouteProbe(name=name, description=description, tags=probe_tags, **probe_kwargs)
 
-            # Watch the original function so re-monitoring never double-wraps.
-            wrapped = probe.watch(getattr(route.endpoint, "__wrapped__", route.endpoint))
+            # Re-monitoring wraps the original handler (with every decorator the
+            # application put on it), never our previous wrapper: no double wrap.
+            wrapped = probe.watch(_installed_original(route.endpoint) or route.endpoint)
             try:
                 wrapped._fastapi_watch = marker
                 wrapped._fastapi_watch_probe = probe
+                wrapped._fastapi_watch_installed = wrapped
                 route.dependant.call = wrapped
                 # FastAPI 0.137+ builds its request context from route.endpoint.
                 route.endpoint = wrapped
@@ -1278,9 +1329,10 @@ class HealthRegistry:
         """Check one probe, then record its result, history, and state change exactly once.
 
         The result is kept in-process first, so it is reported even when the
-        storage writes fail.  Those writes and the state-change handling run
-        concurrently: a slow backend delays the check by at most one
-        ``storage_timeout``, not one per write.
+        storage writes fail, and the writes never delay it (see
+        :meth:`_store_result`).  A cached result served while the circuit is
+        open is not written again: it is already the stored latest result, and
+        re-appending it would fill history with copies of one stale entry.
         """
         result, from_cache = await self._check_or_cached(probe, critical)
         checked_at = datetime.now(self._tzinfo)
@@ -1296,16 +1348,73 @@ class HealthRegistry:
             result = result.model_copy(update=updates)
         self._last_results[probe.name] = result
         self._probe_last_run[probe.name] = asyncio.get_running_loop().time()
-        if not from_cache:
-            self._last_checked_at = checked_at
+        if from_cache:
+            await self._fire_state_changes([result])
+            return result
+        self._last_checked_at = checked_at
         if result.name == probe.name:  # only ever forget a name both registered and written here
             self._written_names.add(result.name)
-        await asyncio.gather(
-            self._storage_call("set_latest", result),
-            self._storage_call("append_history", result),
-            self._fire_state_changes([result]),
-        )
+        await asyncio.gather(self._store_result(result), self._fire_state_changes([result]))
         return result
+
+    def _writes_inline(self) -> bool:
+        """True for the default in-memory backend, which cannot block and so is written inline."""
+        return type(self._storage) is InMemoryProbeStorage
+
+    async def _store_result(self, result: ProbeResult) -> None:
+        """Write *result* as its probe's latest result and append it to history.
+
+        Any backend other than the default in-memory one is written in the
+        background: even bounded by ``storage_timeout``, a hung store would
+        otherwise add that timeout to every health check that runs a probe,
+        failing readiness probes with a shorter timeout (Kubernetes defaults
+        to 1 s) because the *monitoring store* is down.  Each probe has at
+        most one writer; while the store is behind, only the newest unwritten
+        result per probe is kept.
+        """
+        if self._writes_inline():
+            await asyncio.gather(
+                self._storage_call("set_latest", result),
+                self._storage_call("append_history", result),
+            )
+            return
+        self._unwritten[result.name] = result
+        self._start_writer(result.name, self._drain_results)
+
+    async def _store_alert(self, alert: AlertRecord) -> None:
+        """Append *alert* to storage: inline in memory, otherwise in the background."""
+        if self._writes_inline():
+            await self._storage_call("append_alert", alert)
+            return
+        self._unwritten_alerts.append(alert)  # the oldest is dropped if the store is far behind
+        self._start_writer(_ALERT_WRITER, self._drain_alerts)
+
+    def _start_writer(self, key: Any, drain: Callable[[Any], Awaitable[None]]) -> None:
+        task = self._writers.get(key)
+        if task is None or task.done():
+            self._writers[key] = asyncio.get_running_loop().create_task(drain(key))
+
+    async def _drain_results(self, name: str) -> None:
+        try:
+            while (result := self._unwritten.pop(name, None)) is not None:
+                await asyncio.gather(
+                    self._storage_call("set_latest", result),
+                    self._storage_call("append_history", result),
+                )
+        finally:
+            self._writers.pop(name, None)
+
+    async def _drain_alerts(self, key: Any) -> None:
+        try:
+            while self._unwritten_alerts:
+                await self._storage_call("append_alert", self._unwritten_alerts.popleft())
+        finally:
+            self._writers.pop(key, None)
+
+    async def _flush_writes(self) -> None:
+        """Wait until every background storage write has finished."""
+        while self._writers:
+            await asyncio.gather(*list(self._writers.values()), return_exceptions=True)
 
     async def _storage_call(self, op: str, *args: Any) -> Any:
         """Await ``storage.<op>(*args)``, bounded by ``storage_timeout``.
@@ -1360,6 +1469,9 @@ class HealthRegistry:
         try:
             coro = probe.check()
             result = await asyncio.wait_for(coro, timeout) if timeout is not None else await coro
+            if not isinstance(result, ProbeResult):
+                # Left unchecked, one buggy custom probe turned every endpoint into a 500.
+                raise TypeError(f"check() returned {type(result).__name__}, not ProbeResult")
         except asyncio.TimeoutError:
             if self._logger:
                 self._logger.warning("Probe %r timed out after %g s", probe.name, timeout)
@@ -1499,12 +1611,16 @@ class HealthRegistry:
     # Caching / result retrieval
     # ------------------------------------------------------------------
 
-    async def _get_results(self) -> list[ProbeResult]:
+    async def _get_results(self, reuse_within_s: float | None = None) -> list[ProbeResult]:
         """Return the current result of every registered probe, as checked by this process.
 
-        Single-fetch probes always run fresh.  Polled probes run when their
-        interval has elapsed, when they have not yet run in this process, or
-        when no result is held for them.
+        Single-fetch probes run fresh, unless *reuse_within_s* is given: a
+        stream passes its event interval, so a result checked within it is
+        reused.  Otherwise every open stream would re-run each single-fetch
+        probe once per event — N streams, N checks of that dependency per
+        interval.  Polled probes run when their interval has elapsed, when
+        they have not yet run in this process, or when no result is held
+        for them.
 
         Results come from the in-process copy of each probe's last result, not
         from storage.  A shared backend (e.g. Redis) also holds other
@@ -1516,13 +1632,17 @@ class HealthRegistry:
         self._ensure_background_polling()
         self._schedule_forget()
         now = asyncio.get_running_loop().time()
-        to_run = [
-            (p, c) for p, c in self._probes
-            if self._effective_interval_s(p) is None
-            or p.name not in self._probe_last_run
-            or p.name not in self._last_results
-            or self._is_probe_due(p, now)
-        ]
+
+        def _needs_run(probe: BaseProbe) -> bool:
+            last = self._probe_last_run.get(probe.name)
+            if last is None or probe.name not in self._last_results:
+                return True
+            interval_s = self._effective_interval_s(probe)
+            if interval_s is None:  # single-fetch
+                return reuse_within_s is None or now - last >= reuse_within_s
+            return now - last >= interval_s
+
+        to_run = [(p, c) for p, c in self._probes if _needs_run(p)]
         if to_run:
             await self._execute_probes(to_run)
         results: dict[str, ProbeResult] = {}
@@ -1555,17 +1675,19 @@ class HealthRegistry:
         storage method ``forget(names)``.  Data written by other apps or other
         replicas under the same prefix -- including probes this process never
         registered, as during a rolling deploy -- is never touched.  A name
-        stays tracked until ``forget()`` succeeds, so a failed call is retried.
+        stays tracked until ``forget()`` succeeds, so a failed call is retried,
+        and until any background write of it has landed.
         """
         self._last_forget = time.monotonic()
         registered = {p.name for p, _ in self._probes}
         for state in (
             self._last_results, self._probe_last_run, self._probe_states,
             self._alerted_states, self._alert_last_sent_at, self._alert_pending,
+            self._circuit_open_until, self._circuit_err_count, self._circuit_trips,
         ):
             for name in [n for n in state if n not in registered]:
                 del state[name]
-        stale = self._written_names - registered
+        stale = self._written_names - registered - self._writers.keys()
         if not stale:
             return
         if callable(getattr(self._storage, "forget", None)):
@@ -1642,6 +1764,8 @@ class HealthRegistry:
 
         for sig in (_signal.SIGTERM, _signal.SIGINT):
             existing_handler = _signal.getsignal(sig)
+            if existing_handler is None:
+                continue  # installed outside Python: it could not be restored or chained to
 
             def _make_handler(existing):
                 def _chained(signum, frame):
@@ -1651,6 +1775,11 @@ class HealthRegistry:
                     # Delegate to uvicorn's handler so it still shuts down.
                     if callable(existing):
                         existing(signum, frame)
+                    elif existing == _signal.SIG_DFL:
+                        # The default action (terminate) has no function to call:
+                        # restore it and re-raise, or the signal would be ignored.
+                        _signal.signal(signum, _signal.SIG_DFL)
+                        _signal.raise_signal(signum)
                 return _chained
 
             try:
@@ -1663,12 +1792,14 @@ class HealthRegistry:
                 )
 
     def _cancel_background_tasks(self) -> None:
-        """Cancel SSE streams, the poll loop, and the alert worker (on the loop thread)."""
+        """Cancel SSE streams and the poll loop (on the loop thread).
+
+        The alert worker keeps running: :meth:`_shutdown` lets it send what is
+        already queued before stopping it.
+        """
         for task in list(self._sse_tasks):
             task.cancel()
         self._cancel_poll_task()
-        if self._alert_worker is not None and not self._alert_worker.done():
-            self._alert_worker.cancel()
 
     async def _shutdown(self) -> None:
         """Signal SSE streams to stop and cancel the poll task.
@@ -1688,13 +1819,7 @@ class HealthRegistry:
             except (asyncio.CancelledError, Exception):
                 pass
             self._poll_task = None
-        if self._alert_worker is not None and not self._alert_worker.done():
-            self._alert_worker.cancel()
-            try:
-                await self._alert_worker
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._alert_worker = None
+        await self._drain_alerts_for_shutdown()
         if self._forget_task is not None and not self._forget_task.done():
             self._forget_task.cancel()
             try:
@@ -1702,7 +1827,40 @@ class HealthRegistry:
             except (asyncio.CancelledError, Exception):
                 pass
         self._forget_task = None
+        # Give pending background writes a bounded chance to land; past that
+        # they are cancelled (a hung store must not hold up shutdown).
+        try:
+            await asyncio.wait_for(self._flush_writes(), _WRITE_FLUSH_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            pass
         await self._close_probes()
+
+    async def _drain_alerts_for_shutdown(self) -> None:
+        """Send already-queued alerts (bounded by ``_ALERT_DRAIN_TIMEOUT_S``), then stop the worker.
+
+        Cancelling the worker outright dropped every queued alert, including
+        the ones a deploy's last checks produced.
+        """
+        if not self._alert_queue.empty() and (self._alert_worker is None or self._alert_worker.done()):
+            # Queued with no worker to send them (it is not started once shutting down).
+            self._alert_worker = asyncio.get_running_loop().create_task(
+                self._alert_loop(), name="fastapi-watch-alert-worker"
+            )
+        if self._alert_worker is None:
+            return
+        try:
+            await asyncio.wait_for(self._alert_queue.join(), _ALERT_DRAIN_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            (self._logger or _LIB_LOGGER).warning(
+                "fastapi-watch: %d alert(s) still queued at shutdown were dropped", self._alert_queue.qsize()
+            )
+        if not self._alert_worker.done():
+            self._alert_worker.cancel()
+        try:
+            await self._alert_worker
+        except (asyncio.CancelledError, Exception):
+            pass
+        self._alert_worker = None
 
     async def _close_probes(self) -> None:
         """Await ``aclose()`` on every registered and startup probe that has one.
@@ -1739,7 +1897,14 @@ class HealthRegistry:
         while True:
             try:
                 now = loop.time()
-                due = [(p, c) for p, c in self._probes if self._is_probe_due(p, now)]
+                # Probes on the registry-wide interval poll only while a stream
+                # client is connected; the loop may be running for probes with
+                # their own interval, which poll regardless.
+                streaming = self._active_connections > 0
+                due = [
+                    (p, c) for p, c in self._probes
+                    if (streaming or p.poll_interval_ms is not None) and self._is_probe_due(p, now)
+                ]
                 if due:
                     await self._execute_probes(due)
                 if self._forget_due():
@@ -1828,12 +1993,12 @@ class HealthRegistry:
 
         try:
             while not self._shutting_down and not _expired():
-                results = await self._get_results()
+                interval_s = self._stream_interval_s()
+                results = await self._get_results(reuse_within_s=interval_s)
                 if filter_tags:
                     results = [r for r in results if filter_tags & set(r.tags)]
                 if filter_probes:
                     results = [r for r in results if r.name in filter_probes]
-                interval_s = self._stream_interval_s()
                 if interval_s is None:
                     yield f"retry: {_SINGLE_FETCH_RETRY_MS}\ndata: {make_report(results)}\n\n"
                     return
@@ -1886,7 +2051,7 @@ class HealthRegistry:
                     new_status=result.status,
                     timestamp=datetime.now(self._tzinfo),
                 )
-                await self._storage_call("append_alert", alert_record)
+                await self._store_alert(alert_record)
                 for cb in self._state_change_callbacks:
                     # User code: one broken callback must not fail the health check
                     # that triggered it, nor stop the callbacks and alerts after it.
@@ -1987,18 +2152,25 @@ class HealthRegistry:
     async def _claim_alert(self, alert: AlertRecord) -> bool:
         """True if this replica should send *alert* (always, without dedupe).
 
-        With ``alert_dedupe_window_s``, replicas sharing a storage backend race
-        to claim ``"<probe>:<new_status>"`` for that window and only the winner
-        sends.  A failing claim sends anyway: a duplicate alert beats none.
+        With ``alert_dedupe_window_s``, replicas sharing a storage backend
+        record the last status announced for each probe: ``claim_alert`` sets
+        it to the new status and returns False only when it already held that
+        status, so one replica sends each change.  (A claim on
+        ``"<probe>:<status>"`` alone refused a re-failure inside the window,
+        unhealthy -> healthy -> unhealthy, on every replica.)  A failing claim
+        sends anyway: a duplicate alert beats none.
         """
         if self._alert_dedupe_window_s is None:
             return True
-        key = f"{alert.probe}:{alert.new_status.value}"
-        claimed = await self._storage_call("claim_alert", key, self._alert_dedupe_window_s)
+        claimed = await self._storage_call(
+            "claim_alert", alert.probe, alert.new_status.value, self._alert_dedupe_window_s
+        )
         return claimed is _STORAGE_FAILED or bool(claimed)
 
     def _ensure_alert_worker(self) -> None:
-        """Start the alert worker task if not already running."""
+        """Start the alert worker task if not already running (never after shutdown)."""
+        if self._shutting_down:
+            return  # a check finishing during shutdown must not leave a new worker pending
         if self._alert_worker is None or self._alert_worker.done():
             try:
                 self._alert_worker = asyncio.get_running_loop().create_task(
@@ -2023,13 +2195,9 @@ class HealthRegistry:
                     alert = await asyncio.wait_for(self._alert_queue.get(), delay)
             except asyncio.TimeoutError:
                 continue  # a coalesced alert is due
-            except asyncio.CancelledError:
-                return
             try:
                 if alert is not None and await self._claim_alert(alert):
                     await self._dispatch_alert(alert)
-            except asyncio.CancelledError:
-                return
             except Exception:
                 # The worker must outlive any one bad alert, but not silently.
                 (self._logger or _LIB_LOGGER).exception(
@@ -2242,11 +2410,10 @@ class HealthRegistry:
             history = await registry._storage_call("get_history")
             if history is _STORAGE_FAILED:
                 return _storage_unavailable()
-            payload = {
-                name: [r.model_dump(mode="json") for r in entries]
-                for name, entries in history.items()
-            }
-            return JSONResponse({"probes": payload})
+            # Serialized in one pass by pydantic-core: history can run to
+            # megabytes, and dumping to dicts and then json.dumps blocked the
+            # event loop about four times as long.
+            return Response(content=to_json({"probes": history}), media_type="application/json")
 
         @self.app.get(
             f"{prefix}/alerts",
@@ -2262,7 +2429,7 @@ class HealthRegistry:
             alerts = await registry._storage_call("get_alerts")
             if alerts is _STORAGE_FAILED:
                 return _storage_unavailable()
-            return JSONResponse({"alerts": [a.model_dump(mode="json") for a in alerts]})
+            return Response(content=to_json({"alerts": alerts}), media_type="application/json")
 
         @self.app.get(
             f"{prefix}/startup",
@@ -2465,15 +2632,52 @@ class HealthRegistry:
                     )
             else:
 
-                def _renderer(report: HealthReport, maintenance: bool, request: Request, history: dict | None) -> str:
+                def _dashboard_stream(request: Request) -> tuple[str, int | None]:
+                    """The built-in page's stream URL, and when its token expires (None without auth)."""
                     # root_path carries any mount or proxy prefix the app is served
                     # under; without it the page would stream from the wrong URL.
                     root_path = request.scope.get("root_path", "").rstrip("/")
                     params = {"view": "dashboard"}  # slimmed events: only what the page reads
+                    expires_at = None
                     if token_key is not None:
-                        params["token"] = _mint_stream_token(token_key)
-                    stream_url = f"{root_path}{prefix}/status/stream?{urlencode(params)}"
-                    return render_dashboard(report, stream_url=stream_url, maintenance_banner=maintenance, history=history)
+                        params["token"] = token = _mint_stream_token(token_key)
+                        expires_at = int(token.partition(".")[0])
+                    return f"{root_path}{prefix}/status/stream?{urlencode(params)}", expires_at
+
+                # One render at a time, in fastapi-watch's own thread pool: a page
+                # with long history is CPU work (tens of ms, megabytes of HTML)
+                # that would otherwise block the app's event loop, and one
+                # thread keeps the pool free for blocking probe checks.
+                render_lock = asyncio.Lock()
+
+                async def _renderer(report: HealthReport, maintenance: bool, request: Request, history: dict | None) -> str:
+                    stream_url, _ = _dashboard_stream(request)
+                    render = functools.partial(
+                        render_dashboard, report, stream_url=stream_url, maintenance_banner=maintenance, history=history
+                    )
+                    async with render_lock:
+                        return await run_blocking(render)
+
+                if token_key is not None:
+
+                    @self.app.get(
+                        f"{prefix}/dashboard/stream-url",
+                        tags=tags,
+                        summary="Fresh dashboard stream URL",
+                        description=(
+                            "Returns the dashboard's live-update stream URL with a newly minted token, "
+                            "``{\"stream_url\": ..., \"expires_at\": <unix time>}``, so an open page can "
+                            "reconnect without reloading.  Requires the configured credentials; a stream "
+                            "token is not accepted here, so a leaked token cannot renew itself."
+                        ),
+                        dependencies=auth_deps,
+                    )
+                    async def dashboard_stream_url(request: Request) -> Response:
+                        stream_url, expires_at = _dashboard_stream(request)
+                        return JSONResponse(
+                            {"stream_url": stream_url, "expires_at": expires_at},
+                            headers={"Cache-Control": "no-store"},
+                        )
 
             @self.app.get(
                 f"{prefix}/dashboard",
@@ -2493,4 +2697,7 @@ class HealthRegistry:
                 history = await registry._storage_call("get_history") if builtin_dashboard else None
                 if history is _STORAGE_FAILED:
                     history = {}  # the page still renders, from live results only
-                return HTMLResponse(content=_renderer(report, registry._in_maintenance(), request, history))
+                content = _renderer(report, registry._in_maintenance(), request, history)
+                if inspect.isawaitable(content):
+                    content = await content
+                return HTMLResponse(content=content, headers=_DASHBOARD_HEADERS)

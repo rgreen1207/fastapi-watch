@@ -301,3 +301,50 @@ async def test_state_change_dispatches_via_queue():
             await registry._alert_worker
         except (asyncio.CancelledError, Exception):
             pass
+
+
+@pytest.mark.asyncio
+async def test_alert_worker_not_restarted_after_shutdown():
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=None, alerters=[_RecordingAlerter()])
+    await registry._shutdown()
+    # A check that finishes during shutdown must not leave a new worker task pending.
+    await registry._fire_state_changes([ProbeResult(name="db", status=ProbeStatus.UNHEALTHY)])
+    assert registry._alert_worker is None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_sends_queued_alerts_before_stopping():
+    alerter = _SlowAlerter(delay=0.05)
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=None, alerters=[alerter])
+    await registry._fire_state_changes([ProbeResult(name="a", status=ProbeStatus.UNHEALTHY)])
+    await registry._fire_state_changes([ProbeResult(name="b", status=ProbeStatus.UNHEALTHY)])
+    registry._cancel_background_tasks()  # what the SIGTERM hook runs: must not drop the queue
+    await registry._shutdown()
+    assert sorted(a.probe for a in alerter.received) == ["a", "b"]
+    assert registry._alert_worker is None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_alert_drain_is_bounded(monkeypatch, caplog):
+    import fastapi_watch.registry as registry_module
+
+    monkeypatch.setattr(registry_module, "_ALERT_DRAIN_TIMEOUT_S", 0.05)
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=None, alerters=[_SlowAlerter(delay=30)])
+    await registry._fire_state_changes([ProbeResult(name="a", status=ProbeStatus.UNHEALTHY)])
+    await registry._fire_state_changes([ProbeResult(name="b", status=ProbeStatus.UNHEALTHY)])
+    with caplog.at_level("WARNING", logger="fastapi_watch"):
+        await asyncio.wait_for(registry._shutdown(), timeout=1)
+    assert registry._alert_worker is None
+    assert any("still queued at shutdown" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_alert_worker_propagates_cancellation():
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=None, alerters=[_RecordingAlerter()])
+    registry._ensure_alert_worker()
+    worker = registry._alert_worker
+    await asyncio.sleep(0)
+    worker.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await worker
+    assert worker.cancelled()
