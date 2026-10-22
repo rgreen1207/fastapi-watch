@@ -46,6 +46,11 @@ def test_stream_without_token_or_header_is_rejected():
     assert TestClient(_app(_APIKEY)).get("/health/status/stream").status_code == 403
 
 
+def test_non_ascii_token_is_rejected_not_an_error():
+    client = TestClient(_app(_APIKEY), raise_server_exceptions=False)
+    assert client.get("/health/status/stream?token=1.%C3%A9").status_code == 403
+
+
 def test_stream_with_header_still_works():
     assert TestClient(_app(_APIKEY)).get("/health/status/stream", headers=_HEADER).status_code == 200
 
@@ -67,7 +72,7 @@ def test_api_key_never_appears_in_the_page():
     assert "s3cret-key" not in html
 
 
-@pytest.mark.parametrize("token", ["", "abc", "123.", "notdigits.deadbeef", "99999999999.deadbeef"])
+@pytest.mark.parametrize("token", ["", "abc", "123.", "notdigits.deadbeef", "99999999999.deadbeef", "1.\u00e9", "\u00b2.ab"])
 def test_malformed_or_forged_tokens_are_rejected(token):
     assert not _valid_stream_token(_stream_token_key(_APIKEY), token)
 

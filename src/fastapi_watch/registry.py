@@ -253,7 +253,9 @@ def _stream_token_expiry(key: bytes, token: str) -> int | None:
     if not expiry.isdigit():
         return None
     expected = hmac.new(key, expiry.encode(), hashlib.sha256).hexdigest()
-    if hmac.compare_digest(signature, expected) and int(expiry) >= time.time():
+    # Bytes: compare_digest raises TypeError on a str with non-ASCII characters,
+    # which turned "?token=1.é" into a 500 for any unauthenticated client.
+    if hmac.compare_digest(signature.encode(), expected.encode()) and int(expiry) >= time.time():
         return int(expiry)
     return None
 
@@ -2330,11 +2332,10 @@ class HealthRegistry:
             history = await registry._storage_call("get_history")
             if history is _STORAGE_FAILED:
                 return _storage_unavailable()
-            payload = {
-                name: [r.model_dump(mode="json") for r in entries]
-                for name, entries in history.items()
-            }
-            return JSONResponse({"probes": payload})
+            # Serialized in one pass by pydantic-core: history can run to
+            # megabytes, and dumping to dicts and then json.dumps blocked the
+            # event loop about four times as long.
+            return Response(content=to_json({"probes": history}), media_type="application/json")
 
         @self.app.get(
             f"{prefix}/alerts",
@@ -2350,7 +2351,7 @@ class HealthRegistry:
             alerts = await registry._storage_call("get_alerts")
             if alerts is _STORAGE_FAILED:
                 return _storage_unavailable()
-            return JSONResponse({"alerts": [a.model_dump(mode="json") for a in alerts]})
+            return Response(content=to_json({"alerts": alerts}), media_type="application/json")
 
         @self.app.get(
             f"{prefix}/startup",
