@@ -346,3 +346,16 @@ def test_unreachable_addresses_share_the_webhook_deadline(real_opener, monkeypat
         alerts._post_json("http://hooks.example.com/hook", b"{}", timeout=0.5)
     assert time.monotonic() - start < 1.0  # was 4 x 0.5 s
     assert attempts and attempts[0] <= 0.5
+
+
+def test_webhook_timeout_none_still_posts(real_opener):
+    listener = socket.create_server(("127.0.0.1", 0))
+
+    def serve():
+        conn, _ = listener.accept()
+        with conn, listener:
+            conn.recv(65536)
+            conn.sendall(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+
+    threading.Thread(target=serve, daemon=True).start()
+    alerts._post_json(f"http://127.0.0.1:{listener.getsockname()[1]}/hook", b"{}", timeout=None)

@@ -42,6 +42,7 @@ Custom alerters::
 """
 import ipaddress
 import json
+import math
 import socket
 import threading
 import time
@@ -156,9 +157,10 @@ class _Deadline:
     bounded only by the system resolver's own timeouts.
     """
 
-    def __init__(self, seconds: float) -> None:
+    def __init__(self, seconds: float | None) -> None:
         self.expired = False
-        self._ends_at = time.monotonic() + seconds
+        # timeout=None leaves the request unbounded, as urllib does.
+        self._ends_at = math.inf if seconds is None else time.monotonic() + seconds
         self._lock = threading.Lock()
         self._socks: list[socket.socket] = []
         self._timer = threading.Timer(seconds, self._expire)
@@ -217,7 +219,8 @@ def _connect_within(deadline: _Deadline, address: tuple, timeout: Any, source_ad
             break
         sock = socket.socket(family, type_, proto)
         try:
-            sock.settimeout(min(timeout, remaining) if isinstance(timeout, (int, float)) else remaining)
+            limit = min(timeout, remaining) if isinstance(timeout, (int, float)) else remaining
+            sock.settimeout(None if math.isinf(limit) else limit)
             if source_address:
                 sock.bind(source_address)
             sock.connect(sockaddr)
