@@ -192,6 +192,39 @@ def test_embedded_history_capped_per_probe():
     assert points[-1]["checked_at"].startswith(history[-1].checked_at.isoformat()[:19])
 
 
+def test_embedded_data_is_encoded_one_probe_at_a_time(monkeypatch):
+    # The page renders in a worker thread, but json.dumps holds the GIL for a
+    # whole call: encoding every probe's history at once stalled the app's
+    # event loop for as long as it took (447 ms with 200 probes x 2000 points).
+    # One call per probe lets the loop run between them.
+    import fastapi_watch.dashboard as dashboard_module
+
+    sizes: list[int] = []
+    real_dumps = dashboard_module.json.dumps
+
+    def _recording_dumps(*args, **kwargs):
+        out = real_dumps(*args, **kwargs)
+        sizes.append(len(out))
+        return out
+
+    monkeypatch.setattr(dashboard_module.json, "dumps", _recording_dumps)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    history = {
+        f"p{i}": [
+            ProbeResult(name=f"p{i}", status=ProbeStatus.HEALTHY, latency_ms=1.0,
+                        checked_at=start + timedelta(seconds=10 * k), details={"p95_rtt_ms": 2.0})
+            for k in range(200)
+        ]
+        for i in range(20)
+    }
+    report = HealthReport.from_results([results[-1] for results in history.values()])
+    html = render_dashboard(report, stream_url="/s", history=history)
+    data = _embedded(html)
+    assert [p["name"] for p in data["probes"]] == list(history)
+    assert {name: len(points) for name, points in data["history"].items()} == {name: 200 for name in history}
+    assert max(sizes) < sum(sizes) / 10
+
+
 def test_embedded_current_probe_keeps_details_but_trims_routes():
     [result] = _request_metrics_history(routes=150, entries=1)
     html = render_dashboard(HealthReport.from_results([result]), stream_url="/s")

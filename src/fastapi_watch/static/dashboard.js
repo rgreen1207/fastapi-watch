@@ -273,6 +273,18 @@
     return m ? m[1] + '/dashboard/stream-url' : null;
   }
 
+  /**
+   * An empty probe-name -> points map.  No prototype: a probe may be named
+   * "constructor" or "__proto__", which on a plain object would find (or
+   * replace) Object.prototype members instead of that probe's points.
+   */
+  function newHistory() { return Object.create(null); }
+
+  /** The points stored for *name* in *history*, or [] when it has none. */
+  function pointsOf(history, name) {
+    return Object.prototype.hasOwnProperty.call(history, name) ? history[name] : [];
+  }
+
   /** The newest point time across *history*, or -Infinity. */
   function newestTime(history) {
     var newest = -Infinity;
@@ -293,7 +305,7 @@
     }
     var word = failing.length ? 'unhealthy' : 'degraded';
     if (pick.length === 1) {
-      var since = heldSince(history[pick[0].name] || []);
+      var since = heldSince(pointsOf(history, pick[0].name));
       return pick[0].name + ' ' + word + (since !== null ? ' for ' + fmtDuration(now - since) : '');
     }
     return pick.length + ' probes ' + word + ': ' + pick.map(function (p) { return p.name; }).join(', ');
@@ -305,7 +317,7 @@
     gapThreshold: gapThreshold, pathD: pathD, areaD: areaD, segments: segments, transitions: transitions,
     nearest: nearest, heldSince: heldSince, fmtDuration: fmtDuration, fmtValue: fmtValue,
     topRoutes: topRoutes, statusSentence: statusSentence, retryDelayMs: retryDelayMs,
-    tokenExpired: tokenExpired, renewUrl: renewUrl, newestTime: newestTime, RANGES: RANGES, MAX_POINTS: MAX_POINTS,
+    tokenExpired: tokenExpired, renewUrl: renewUrl, newestTime: newestTime, newHistory: newHistory, pointsOf: pointsOf, RANGES: RANGES, MAX_POINTS: MAX_POINTS,
     TOP_ROUTES: TOP_ROUTES, RETRY_MAX_MS: RETRY_MAX_MS,
   };
   if (typeof module !== 'undefined' && module.exports) { module.exports = api; return; }
@@ -321,7 +333,7 @@
   var dataEl = doc.getElementById('fw-data');
   var initial = {};
   try { initial = JSON.parse(dataEl ? dataEl.textContent : '{}') || {}; } catch (_) { initial = {}; }
-  var history = {};
+  var history = newHistory();
   Object.keys(initial.history || {}).forEach(function (name) { history[name] = pointsFor(initial.history[name]); });
   var retainMs = retentionMs(history);
   Object.keys(history).forEach(function (name) { capPoints(history[name], retainMs, MAX_POINTS); });
@@ -597,11 +609,11 @@
     doc.querySelectorAll('.axis-svg').forEach(function (svg) { drawAxis(svg, from, to); });
     doc.querySelectorAll('.lane').forEach(function (lane) {
       var svg = lane.querySelector('.lane-svg');
-      if (svg) drawLane(svg, history[lane.getAttribute('data-probe')] || [], from, to);
+      if (svg) drawLane(svg, pointsOf(history, lane.getAttribute('data-probe')), from, to);
     });
     doc.querySelectorAll('.probe-card').forEach(function (card) {
       if (card.style.display === 'none') return;
-      drawProbeCharts(card, history[card.getAttribute('data-probe')] || [], from, to);
+      drawProbeCharts(card, pointsOf(history, card.getAttribute('data-probe')), from, to);
     });
     drawRoutes(from, to);
   }
@@ -834,7 +846,7 @@
   function applyReport(report) {
     var probes = report.probes || [];
     probes.forEach(function (p) {
-      var points = history[p.name] = history[p.name] || [];
+      var points = history[p.name] = pointsOf(history, p.name);
       if (addPoint(points, pointsFor([p])[0])) capPoints(points, retainMs, MAX_POINTS);
     });
     if (header) header.className = 'header ' + report.status;

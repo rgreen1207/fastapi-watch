@@ -29,8 +29,17 @@ Most fixes need no action. These change what you see or what is accepted:
 - **`EventLoopProbe(sample_interval_ms=...)` below 1 raises `ValueError`**; `alert_dedupe_window_s` and `alert_min_interval_s` must be finite.
 - **A custom `check()` that returns something other than a `ProbeResult`** is reported as that probe's `UNHEALTHY` result instead of failing every health endpoint with `500`.
 - **The dashboard is served with `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and `frame-ancestors 'none'`.**
+- **The built-in dashboard sends a strict `Content-Security-Policy`**: only its own script runs (by a per-page nonce), and it connects only to its own origin. A proxy that injects scripts into HTML pages will find them blocked there. Custom dashboards keep `frame-ancestors 'none'` only.
+- **`/health/metrics` writes non-finite values as `NaN`, `+Inf`, `-Inf`**, as the Prometheus text format spells them, and a non-numeric value as `NaN`.
 
 ### Bug Fixes
+
+#### Dashboard and metrics (third review round)
+
+- **Rendering the dashboard no longer stalls the app.** The page renders in a worker thread, but its embedded data was encoded in one `json.dumps` call, which holds the GIL throughout: with 200 probes and 2,000 history points each, the app's event loop stopped for 447 ms per page load (about 30 ms at the default `history_size`). Data is now encoded a probe at a time; the same page stalls the loop for at most 30 ms.
+- **A probe named `constructor`, `toString` or `__proto__` no longer breaks the dashboard.** With no history stored for it yet, the page script found `Object.prototype` members instead and threw on its first render: no charts and no live updates for any probe.
+- **One probe can no longer fail the whole Prometheus scrape.** A custom probe's own `circuit_breaker` detail that is not a dict (with the breaker off, the registry leaves it alone) turned `/health/metrics` into a `500`; a boolean there was written as `True`, which Prometheus rejects along with every other sample in the scrape.
+- **Free-form route breakdowns no longer `500` the dashboard.** Mixed-type route keys or a non-numeric `request_count` in a custom probe's `routes` detail failed the page; the latter also failed every live update.
 
 #### Second review round
 

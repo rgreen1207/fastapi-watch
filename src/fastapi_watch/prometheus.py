@@ -28,6 +28,7 @@ scraped into one Prometheus.  Pass ``HealthRegistry(metrics_prefix=...)`` (for
 example ``"fastapi_watch_"``) to namespace them; the default ``""`` keeps the
 names above so existing dashboards and alerts continue to work.
 """
+import math
 import re
 from typing import Callable
 
@@ -58,7 +59,29 @@ def _lbl(name: str, critical: bool) -> str:
 
 
 def _circuit(result: ProbeResult) -> dict:
-    return (result.details or {}).get("circuit_breaker", {})
+    # Without the registry's breaker, a custom probe's own "circuit_breaker"
+    # detail passes through untouched and may be anything.
+    info = (result.details or {}).get("circuit_breaker")
+    return info if isinstance(info, dict) else {}
+
+
+def _sample(value: object) -> str:
+    """*value* as a sample value: a number, ``NaN`` or ``±Inf``.
+
+    One value Prometheus cannot parse (``True``, ``nan``, a string) fails the
+    whole scrape, so anything that is not a number is written as ``NaN``.
+    """
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "NaN"
+        if math.isinf(value):
+            return "+Inf" if value > 0 else "-Inf"
+        return repr(value)
+    if isinstance(value, int):
+        return str(value)
+    return "NaN"
 
 
 def render_prometheus(
@@ -95,7 +118,7 @@ def render_prometheus(
     for name, kind, help_text, value in metrics:
         metric = f"{prefix}{name}"
         lines += [f"# HELP {metric} {help_text}", f"# TYPE {metric} {kind}"]
-        lines += [f"{metric}{_lbl(r.name, r.critical)} {value(r)}" for r in results]
+        lines += [f"{metric}{_lbl(r.name, r.critical)} {_sample(value(r))}" for r in results]
 
     lines.append("")  # trailing newline required by spec
     return "\n".join(lines)

@@ -135,7 +135,7 @@ def _routes_table(routes: dict) -> str:
         f"<td>{_e(stats.get('error_count', 0))}</td>"
         f"<td>{_fmt_detail_value('error_rate', stats.get('error_rate'))}</td>"
         f"<td>{_fmt_detail_value('p95_rtt_ms', stats.get('p95_rtt_ms'))}</td></tr>"
-        for path, stats in sorted(routes.items())
+        for path, stats in sorted(routes.items(), key=lambda kv: str(kv[0]))
         if isinstance(stats, dict)
     )
     return (
@@ -237,11 +237,15 @@ _MAX_CHART_POINTS = 2000
 
 def _top_routes(routes: dict) -> list[str]:
     """The busiest routes by request count, ranked as topRoutes() in dashboard.js ranks them."""
-    def count(path: str) -> int:
-        stats = routes[path]
-        return (stats.get("request_count") or 0) if isinstance(stats, dict) else 0
+    def count(path: Any) -> float:
+        # Custom probes' details are free-form: anything but a finite number counts as 0.
+        value = routes[path].get("request_count") if isinstance(routes[path], dict) else None
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            return 0
+        return value
 
-    return sorted(routes, key=lambda path: (-count(path), path))[:_CHART_ROUTES]
+    # str(): JSON keys are strings, so the page compares them as strings too.
+    return sorted(routes, key=lambda path: (-count(path), str(path)))[:_CHART_ROUTES]
 
 
 def _slim_routes(routes: dict, keep: list[str], fields: tuple[str, ...] = _CHART_ROUTE_FIELDS) -> dict:
@@ -389,6 +393,7 @@ def render_dashboard(
     stream_url: str,
     maintenance_banner: bool = False,
     history: dict[str, list[ProbeResult]] | None = None,
+    nonce: str | None = None,
 ) -> str:
     """Render the dashboard page.
 
@@ -401,6 +406,8 @@ def render_dashboard(
             stored history); embedded so the charts have data on first paint.
             Only the fields the charts read are embedded, so the page stays
             small however many details or routes each result carries.
+        nonce: Content-Security-Policy nonce for the page script, the only
+            script the page runs.
     """
     checked_at_text = ""
     if report.checked_at:
@@ -422,10 +429,16 @@ def render_dashboard(
         '<div class="maintenance-banner">Maintenance in progress — probe failures are not alerting.</div>'
         if maintenance_banner else ""
     )
-    data = {
-        "probes": [_current_probe(p) for p in report.probes],
-        "history": {name: _chart_history(results) for name, results in (history or {}).items()},
-    }
+    # Encoded a probe at a time: this runs in a worker thread, but json.dumps
+    # holds the GIL for a whole call, so one call over every probe's history
+    # stalled the app's event loop for all of it (~0.4 s at 200 x 2000 points).
+    probes_json = ",".join(_json_for_script(_current_probe(p)) for p in report.probes)
+    history_json = ",".join(
+        f"{_json_for_script(str(name))}:{_json_for_script(_chart_history(results))}"
+        for name, results in (history or {}).items()
+    )
+    data_json = f'{{"probes":[{probes_json}],"history":{{{history_json}}}}}'
+    nonce_attr = f' nonce="{_e(nonce)}"' if nonce else ""
     lanes = "".join(_lane(p) for p in report.probes)
     cards = "\n".join(_probe_card(p) for p in report.probes)
 
@@ -474,7 +487,7 @@ def render_dashboard(
     </div>
   </main>
   <div class="chart-tooltip" id="chart-tooltip" hidden></div>
-  <script type="application/json" id="fw-data">{_json_for_script(data)}</script>
-  <script>{_JS}</script>
+  <script type="application/json" id="fw-data">{data_json}</script>
+  <script{nonce_attr}>{_JS}</script>
 </body>
 </html>"""
