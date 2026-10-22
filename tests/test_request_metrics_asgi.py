@@ -10,13 +10,15 @@ import contextvars
 import time
 
 import pytest
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.testclient import TestClient
 from starlette.background import BackgroundTask
+from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse, StreamingResponse
 
 from fastapi_watch import HealthRegistry, RequestMetricsMiddleware, RequestMetricsProbe
 from fastapi_watch.middleware import OTHER_ROUTE, UNMATCHED_ROUTE
+from fastapi_watch.models import ProbeStatus
 
 
 def _leaf_exceptions(exc: BaseException) -> list[BaseException]:
@@ -134,6 +136,78 @@ async def test_response_that_never_started_counts_as_500():
     snap = middleware._aggregate.snapshot()
     assert snap["request_count"] == 1
     assert snap["error_count"] == 1
+
+
+def test_client_aborting_an_upload_is_not_a_server_error():
+    """A client that hangs up while the app reads its body (Starlette raises
+    ClientDisconnect) is a 499, not a 500: dropped mobile uploads must not
+    turn RequestMetricsProbe, and with it readiness, unhealthy."""
+    app = FastAPI()
+
+    @app.post("/upload")
+    async def upload(request: Request):
+        return {"size": len(await request.body())}
+
+    app.add_middleware(RequestMetricsMiddleware)
+    app.middleware_stack = app.build_middleware_stack()
+    middleware = _installed_middleware(app)
+    messages = iter([
+        {"type": "http.request", "body": b"part", "more_body": True},
+        {"type": "http.disconnect"},
+    ])
+
+    async def receive():
+        return next(messages)
+
+    async def send(message):
+        pass
+
+    scope = {**_http_scope("/upload"), "method": "POST", "app": app}
+    with pytest.raises(Exception) as raised:
+        asyncio.run(middleware(scope, receive, send))
+    assert any(isinstance(e, ClientDisconnect) for e in _leaf_exceptions(raised.value))
+
+    snap = middleware._aggregate.snapshot()
+    assert snap["request_count"] == 1
+    assert snap["error_count"] == 0
+    probe = RequestMetricsProbe(middleware)
+    assert asyncio.run(probe.check()).status == ProbeStatus.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_send_failing_mid_response_keeps_the_status_already_sent():
+    """The server failing to deliver a chunk (the client is gone) leaves the
+    status the response started with: a hang-up mid-download is not a 500."""
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"a", "more_body": True})
+
+    async def send(message):
+        if message["type"] == "http.response.body":
+            raise OSError("client disconnected")
+
+    middleware = RequestMetricsMiddleware(app)
+    with pytest.raises(OSError):
+        await middleware(_http_scope(), _receive, send)
+
+    snap = middleware._aggregate.snapshot()
+    assert snap["request_count"] == 1
+    assert snap["error_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_unhandled_exception_after_response_start_is_still_a_500():
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        raise RuntimeError("app bug")
+
+    async def send(message):
+        pass
+
+    middleware = RequestMetricsMiddleware(app)
+    with pytest.raises(RuntimeError):
+        await middleware(_http_scope(), _receive, send)
+    assert middleware._aggregate.snapshot()["error_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -395,3 +469,36 @@ async def test_hot_path_overhead_is_small():
 
     assert middleware._aggregate.snapshot()["request_count"] == n
     assert per_request_us < 50
+
+
+@pytest.mark.asyncio
+async def test_probe_check_lets_requests_run_between_route_snapshots():
+    """Each route snapshot sorts its latency window; at the 500-route cap a
+    check is milliseconds of CPU, which must not stall the app in one block."""
+    middleware = RequestMetricsMiddleware(FastAPI(), max_routes=500)
+    for index in range(500):
+        stats = middleware._get_or_create(f"/r{index}")
+        for sample in range(200):
+            stats.record(200, float(sample))
+    middleware._aggregate.record(200, 1.0)
+    probe = RequestMetricsProbe(middleware)
+
+    ticks = 0
+    checking = True
+
+    async def other_request():
+        nonlocal ticks
+        while checking:
+            ticks += 1
+            await asyncio.sleep(0)
+
+    other = asyncio.create_task(other_request())
+    await asyncio.sleep(0)
+    ticks = 0
+    result = await probe.check()
+    checking = False
+    await other
+
+    assert len(result.details["routes"]) == 500
+    assert list(result.details["routes"]) == sorted(result.details["routes"])
+    assert ticks >= 500 // 50 - 1  # the loop ran between every slice of routes

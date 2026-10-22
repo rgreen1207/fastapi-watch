@@ -4,21 +4,26 @@ Add :class:`RequestMetricsMiddleware` to your FastAPI app and pass the app to
 :class:`RequestMetricsProbe` to get automatic, app-wide request telemetry
 without decorating individual routes.
 """
+import asyncio
 import threading
 import time
 from collections import deque
 from typing import TYPE_CHECKING, Any, Callable
 
+from starlette.requests import ClientDisconnect
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .models import ProbeResult, ProbeStatus
 from .probes.base import BaseProbe, _calc_percentiles, _update_ema
+from .probes.route import CLIENT_CLOSED_REQUEST
 
 if TYPE_CHECKING:
     from starlette.applications import Starlette
 
 # Bound on the middleware-stack walk: real stacks are a handful of layers deep.
 _MAX_STACK_DEPTH = 64
+# Per-route snapshots taken between yields to the event loop (well under 1 ms).
+_ROUTES_PER_SLICE = 50
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +244,9 @@ class RequestMetricsMiddleware:
             ``(0, 1]``.
         min_error_status: HTTP status codes at or above this value are counted
             as errors (default ``500``).  4xx client errors such as 404 are not
-            counted as errors by default; set to ``400`` to include them.
+            counted as errors by default; set to ``400`` to include them.  A
+            request whose client hung up before the response started (an
+            aborted upload) is recorded as ``499``, not as a server error.
         max_routes: Most per-route entries kept (default ``500``).  Requests
             for further routes share one ``"<other>"`` entry — a backstop for
             apps whose route keys are not a fixed set.
@@ -309,13 +316,14 @@ class RequestMetricsMiddleware:
         # value so the mount prefix can be recovered afterwards.
         entry_root_path = scope.get("root_path", "")
         status_code = 500  # a response that never starts counts as a server error
-        done = False
+        started = done = client_gone = False
 
         async def send_wrapper(message: Message) -> None:
-            nonlocal status_code, done
+            nonlocal status_code, started, done, client_gone
             message_type = message["type"]
             if message_type == "http.response.start":
                 status_code = message["status"]
+                started = True
             elif message_type == "http.response.body" and not message.get("more_body", False) and not done:
                 # The last body chunk completes the response: record it here,
                 # so background tasks that run afterwards are not timed.
@@ -325,17 +333,27 @@ class RequestMetricsMiddleware:
                 finally:
                     self._record(scope, status_code, start, entry_root_path)
                 return
-            await send(message)
+            try:
+                await send(message)
+            except Exception:
+                client_gone = True  # the server could not deliver it: the client hung up
+                raise
 
         try:
             await self.app(scope, receive, send_wrapper)
-        except Exception:
+        except Exception as exc:
             # Unhandled exceptions become a 500 in Starlette's ServerErrorMiddleware,
             # which sits outside every user middleware — so this is the only place
             # the request can be counted.  Re-raise so that response is unchanged.
             if not done:
                 done = True
-                self._record(scope, 500, start, entry_root_path)
+                if client_gone or isinstance(exc, ClientDisconnect):
+                    # The client hung up (an aborted upload or download): not a
+                    # server error.  Keep the status already sent, else 499.
+                    status_code = status_code if started else CLIENT_CLOSED_REQUEST
+                else:
+                    status_code = 500
+                self._record(scope, status_code, start, entry_root_path)
             raise
         if not done:
             # No final body chunk (e.g. a ``pathsend`` file response): the
@@ -478,10 +496,14 @@ class RequestMetricsProbe(BaseProbe):
         if middleware.per_route:
             with middleware._routes_lock:
                 routes_copy = list(middleware._routes.items())
-            details["routes"] = {
-                path: stats.snapshot()
-                for path, stats in sorted(routes_copy)
-            }
+            # Each snapshot sorts its route's latency window: with hundreds of
+            # routes that is milliseconds of CPU, so let requests run in between.
+            routes: dict[str, Any] = {}
+            for index, (path, stats) in enumerate(sorted(routes_copy)):
+                if index and not index % _ROUTES_PER_SLICE:
+                    await asyncio.sleep(0)
+                routes[path] = stats.snapshot()
+            details["routes"] = routes
 
         return ProbeResult(
             name=self.name,
