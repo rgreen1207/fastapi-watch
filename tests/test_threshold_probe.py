@@ -115,3 +115,21 @@ async def test_threshold_poll_interval_override():
     inner.poll_interval_ms = 5_000
     probe = ThresholdProbe(inner, poll_interval_ms=10_000)
     assert probe.poll_interval_ms == 10_000
+
+
+@pytest.mark.asyncio
+async def test_threshold_keeps_inner_circuit_breaker_settings():
+    from fastapi import FastAPI
+    from fastapi_watch import HealthRegistry
+
+    inner = _make_probe_with_details({}, ProbeStatus.UNHEALTHY)
+    inner.circuit_breaker_threshold = 1
+    inner.circuit_breaker_cooldown_ms = 60_000
+    probe = ThresholdProbe(inner)
+    assert (probe.circuit_breaker_threshold, probe.circuit_breaker_cooldown_ms) == (1, 60_000)
+
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=None, circuit_breaker_threshold=5)
+    registry.add(probe)
+    await registry.run_all()
+    # Opened after the inner probe's one failure, not the registry's five.
+    assert "inner" in registry._circuit_open_until
