@@ -40,14 +40,14 @@ Most fixes need no action. These change what you see or what is accepted:
 
 ### Bug Fixes
 
-#### Dashboard and metrics (third review round)
+#### Third review round: dashboard and metrics
 
 - **Rendering the dashboard no longer stalls the app.** The page renders in a worker thread, but its embedded data was encoded in one `json.dumps` call, which holds the GIL throughout: with 200 probes and 2,000 history points each, the app's event loop stopped for 447 ms per page load (about 30 ms at the default `history_size`). Data is now encoded a probe at a time; the same page stalls the loop for at most 30 ms.
 - **A probe named `constructor`, `toString` or `__proto__` no longer breaks the dashboard.** With no history stored for it yet, the page script found `Object.prototype` members instead and threw on its first render: no charts and no live updates for any probe.
 - **One probe can no longer fail the whole Prometheus scrape.** A custom probe's own `circuit_breaker` detail that is not a dict (with the breaker off, the registry leaves it alone) turned `/health/metrics` into a `500`; a boolean there was written as `True`, which Prometheus rejects along with every other sample in the scrape.
 - **Free-form route breakdowns no longer `500` the dashboard.** Mixed-type route keys or a non-numeric `request_count` in a custom probe's `routes` detail failed the page; the latter also failed every live update.
 
-#### Registry review round
+#### Third review round: registry
 
 - **Shutdown never ran for apps with a `lifespan=`.** Starlette skips `on_shutdown` handlers once an app has its own lifespan, which is how every documented example is set up, so queued alerts were dropped, background storage writes abandoned, and probe `aclose()` never called. The registry now wraps the app's lifespan and shuts down before the app's own teardown. Each lifespan also starts it afresh: after one shutdown, streams of a second run in the same process (`with TestClient(app)` per test) returned nothing and alerts stopped.
 - **Unauthenticated clients could make the app parse arbitrary JSON.** FastAPI reads and parses a declared request body before any dependency runs, so `POST /health/maintenance` parsed bodies of any size on the event loop before checking credentials (40 MB took 0.6 s). The body is now read after authentication and capped at 4 KiB.
@@ -58,11 +58,17 @@ Most fixes need no action. These change what you see or what is accepted:
 - **Storage no longer grows with a renamed result.** A probe whose `check()` returned a result under another name (an inner probe's result passed through, or a name that changed per check) was stored under that name, which the registry never forgets: each new name left a latest-result key and a history key behind until `result_ttl_seconds`, or forever with `result_ttl_seconds=0` (200 checks wrote 401 Redis keys). Results are now filed under the probe's registered name.
 - **One unreadable entry no longer fails history.** A history entry, alert or latest result that `RedisProbeStorage` could not parse (written by a newer version sharing the prefix during a rolling deploy, e.g. with a new status value, or corrupted) made every read raise, so `/health/history` and `/health/alerts` answered `503` until it aged out. Such entries are skipped.
 
-#### Probe timeouts, storage TTLs and documentation
+#### Third review round: probe timeouts, storage TTLs and documentation
 
 - **A probe raising its own `TimeoutError` no longer fails every health endpoint.** Since Python 3.11 `asyncio.TimeoutError` is the builtin `TimeoutError` that socket and client libraries raise on a connect or read timeout.  With `probe_timeout=None` the registry tried to format the missing deadline and `/health/ready`, `/status`, `/metrics` and the dashboard answered `500`; with a deadline the error claimed the probe had run for the full timeout.  Such a probe is now reported `UNHEALTHY` with `"probe check failed: TimeoutError"`; only the registry's own deadline reports `"probe timed out after N s"`.
 - **In-memory TTLs are validated.** `InMemoryProbeStorage` (and so `HealthRegistry` without `storage=`) accepted a negative or NaN TTL, which disabled time-based expiry without a word.
 - **Documentation examples run.** The README quickstart called `PostgreSQLProbe(url=...)` and `RedisProbe(url=...)`, which raise `TypeError` (they are passive probes, fed by `@probe.watch`), and attached the registry to an `app` it then replaced with `FastAPI(lifespan=...)`, so the served app had no health routes.  `ThresholdProbe`'s example passed `probe=` instead of `inner_probe`.  A test now checks every documented constructor call against its signature.
+
+#### Third review round: hot path
+
+- **Watched `yield` dependencies work on older FastAPI.** `probe.watch()` wrapped a generator function in a plain function, so FastAPI before it followed `__wrapped__` (0.100, for one) injected the generator object itself into the route instead of the session it yields. Newer releases ran it, but the probe timed only the creation of the generator (~0 ms) and missed any error raised while it ran, including mid-stream failures of streaming (generator) endpoints. Watched generators now stay generators, forward every send, throw and close, and are recorded when they finish: RTT is the time spent running the generator (a dependency's setup and teardown, not the endpoint's work in between), and an endpoint's exception passing back out of a dependency is not counted against it.
+- **Aborted uploads no longer make the app unhealthy.** A client that disconnected while a handler read its body was counted as a server error (500) by `RequestMetricsMiddleware` and route probes, so clients on flaky networks could push `RequestMetricsProbe`, and with it readiness, to `UNHEALTHY`. Such requests are now recorded as `499`, and a response the server could not finish delivering keeps the status it started with.
+- **`RequestMetricsProbe` no longer stalls the event loop.** Building the per-route breakdown sorted every route's latency window in one go: about 8 ms of blocked event loop per check at the 500-route cap. The check now yields between batches of 50 routes (under 1 ms each).
 
 #### Second review round
 
@@ -73,12 +79,6 @@ Most fixes need no action. These change what you see or what is accepted:
 - **Dashboard fixes:** a NaN or infinite value from a custom probe no longer drops all embedded data or freezes live updates; a non-numeric `error_rate` or mixed-type detail keys no longer return `500`; a probe name containing `"` no longer stops live updates; points are no longer cut off when the browser clock runs behind the server.
 - **Probe fixes:** async callable objects (`alru_cache` wrappers, partials) are timed and their errors counted; a returned model with a `status_code` field no longer counts as an HTTP error; WebSocket handlers whose socket parameter has another name and a string annotation are instrumented; `ThresholdProbe` keeps the inner probe's circuit-breaker settings; `RabbitMQProbe` decodes percent-encoded management credentials; `ProbeGroup.include()` keeps nested group tags; circuit-breaker state of removed probes is cleaned up.
 - **Webhook deadlines cover connecting.** A host resolving to several unreachable addresses gave each the full timeout (a 1 s budget took 3 s with three); they now share it.
-
-#### Third review round
-
-- **Watched `yield` dependencies work on older FastAPI.** `probe.watch()` wrapped a generator function in a plain function, so FastAPI before it followed `__wrapped__` (0.100, for one) injected the generator object itself into the route instead of the session it yields. Newer releases ran it, but the probe timed only the creation of the generator (~0 ms) and missed any error raised while it ran, including mid-stream failures of streaming (generator) endpoints. Watched generators now stay generators, forward every send, throw and close, and are recorded when they finish: RTT is the time spent running the generator (a dependency's setup and teardown, not the endpoint's work in between), and an endpoint's exception passing back out of a dependency is not counted against it.
-- **Aborted uploads no longer make the app unhealthy.** A client that disconnected while a handler read its body was counted as a server error (500) by `RequestMetricsMiddleware` and route probes, so clients on flaky networks could push `RequestMetricsProbe`, and with it readiness, to `UNHEALTHY`. Such requests are now recorded as `499`, and a response the server could not finish delivering keeps the status it started with.
-- **`RequestMetricsProbe` no longer stalls the event loop.** Building the per-route breakdown sorted every route's latency window in one go: about 8 ms of blocked event loop per check at the 500-route cap. The check now yields between batches of 50 routes (under 1 ms each).
 
 #### `error_rate` now reflects recent traffic, not the process lifetime
 
