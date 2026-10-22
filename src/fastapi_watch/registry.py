@@ -445,6 +445,26 @@ async def _json_body(request: Request) -> bytes:
     return body
 
 
+def _body_errors(exc: ValidationError) -> list[dict]:
+    """*exc*'s errors located in the request body, as FastAPI reports them, and encodable as JSON.
+
+    Each error echoes its input: for malformed JSON that is the raw body, which
+    need not be UTF-8, and a number may be NaN or infinite; either turned the
+    422 into a 500.  Malformed JSON reports ``{}``, as FastAPI's own body
+    parsing does, and a non-finite number its name.
+    """
+    errors = []
+    for err in exc.errors(include_url=False):
+        err = {**err, "loc": ("body", *err["loc"])}
+        value = err.get("input")
+        if err["type"] == "json_invalid":
+            err["input"] = {}
+        elif isinstance(value, float) and not math.isfinite(value):
+            err["input"] = str(value)
+        errors.append(err)
+    return errors
+
+
 def _make_auth_checker(auth) -> Callable | None:
     """Return a FastAPI dependency that enforces authentication, or ``None`` for open access.
 
@@ -2719,6 +2739,16 @@ class HealthRegistry:
                         "required": False,
                         "content": {"application/json": {"schema": _MaintenanceRequest.model_json_schema()}},
                     },
+                    # Documented by FastAPI only for declared parameters, which this route no
+                    # longer has; the schema is in the spec for the routes' query parameters.
+                    "responses": {
+                        "422": {
+                            "description": "Validation Error",
+                            "content": {
+                                "application/json": {"schema": {"$ref": "#/components/schemas/HTTPValidationError"}},
+                            },
+                        },
+                    },
                 },
             )
             async def enable_maintenance(raw: bytes = Depends(_json_body)) -> Response:
@@ -2726,9 +2756,7 @@ class HealthRegistry:
                 try:
                     body = _MaintenanceRequest.model_validate_json(raw) if raw else _MaintenanceRequest()
                 except ValidationError as exc:
-                    raise RequestValidationError(
-                        [{**err, "loc": ("body", *err["loc"])} for err in exc.errors(include_url=False)]
-                    ) from None
+                    raise RequestValidationError(_body_errors(exc)) from None
                 now = datetime.now(registry._tzinfo)
                 if body.until is not None:
                     until = registry._aware(body.until)
