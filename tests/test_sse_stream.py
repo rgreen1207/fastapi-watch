@@ -10,6 +10,14 @@ from fastapi_watch import HealthRegistry
 from fastapi_watch.probes.noop import NoOpProbe
 
 
+def _leaf_exceptions(exc: BaseException) -> list[BaseException]:
+    """*exc* itself, or every exception nested inside it if it is an exception group."""
+    nested = getattr(exc, "exceptions", None)
+    if nested is None:
+        return [exc]
+    return [leaf for sub in nested for leaf in _leaf_exceptions(sub)]
+
+
 class _FakeRequest:
     """Stands in for a Starlette Request: connected until told otherwise."""
 
@@ -189,8 +197,10 @@ async def test_slot_released_when_the_response_fails_before_streaming():
     async def _receive():
         return {"type": "http.disconnect"}
 
-    with pytest.raises(OSError):
+    with pytest.raises(Exception) as raised:
         await response({"type": "http", "asgi": {"spec_version": "2.0"}}, _receive, _send)
+    # Starlette < 0.28 streams in an anyio task group, which wraps the error in an ExceptionGroup.
+    assert any(isinstance(e, OSError) for e in _leaf_exceptions(raised.value))
     assert released == [1]
 
 

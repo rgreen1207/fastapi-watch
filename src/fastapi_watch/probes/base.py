@@ -431,7 +431,10 @@ class PassiveProbe(BaseProbe):
         debug level instead; see the class docstring.
         """
         if self.expose_error_messages:
-            return f"{type(exc).__name__}: {exc}"
+            # str(HTTPException) is empty on older Starlette; its detail is the message.
+            detail = getattr(exc, "detail", None)
+            message = detail if isinstance(detail, str) else str(exc)
+            return f"{type(exc).__name__}: {message}"
         _LOGGER.debug("fastapi-watch: probe %r observed a failed call", self.name, exc_info=exc)
         return type(exc).__name__
 

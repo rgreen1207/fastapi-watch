@@ -19,6 +19,14 @@ from fastapi_watch import HealthRegistry, RequestMetricsMiddleware, RequestMetri
 from fastapi_watch.middleware import OTHER_ROUTE, UNMATCHED_ROUTE
 
 
+def _leaf_exceptions(exc: BaseException) -> list[BaseException]:
+    """*exc* itself, or every exception nested inside it if it is an exception group."""
+    nested = getattr(exc, "exceptions", None)
+    if nested is None:
+        return [exc]
+    return [leaf for sub in nested for leaf in _leaf_exceptions(sub)]
+
+
 def _installed_middleware(app: FastAPI) -> RequestMetricsMiddleware:
     node = app.middleware_stack
     while not isinstance(node, RequestMetricsMiddleware):
@@ -105,8 +113,10 @@ def test_exception_mid_stream_counted_as_500_and_reraised():
         return StreamingResponse(chunks())
 
     app.add_middleware(RequestMetricsMiddleware)
-    with pytest.raises(RuntimeError, match="stream broke"):
+    with pytest.raises(Exception) as raised:
         TestClient(app).get("/broken")
+    # Starlette < 0.28 streams in an anyio task group, which wraps the error in an ExceptionGroup.
+    assert any(isinstance(e, RuntimeError) and "stream broke" in str(e) for e in _leaf_exceptions(raised.value))
 
     snap = _installed_middleware(app)._aggregate.snapshot()
     assert snap["request_count"] == 1
