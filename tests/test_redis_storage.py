@@ -5,6 +5,7 @@ skip when it is unset or the server is unreachable.  Every test uses its own
 random key prefix and deletes its keys afterwards.
 """
 import asyncio
+import math
 import os
 import time
 import uuid
@@ -238,7 +239,7 @@ async def test_every_key_has_a_ttl_and_writes_are_single_transactions(client, sp
     assert spy.round_trips - before == 3
     assert spy.transactions == 3
     keys = await _keys(client, prefix)
-    assert {k.rsplit(":", 1)[-1] for k in keys} >= {"probes", "alerts", "db"}
+    assert {k.rsplit(":", 1)[-1] for k in keys} >= {"names", "alerts", "db"}
     for key in keys:
         assert 0 < await client.pttl(key) <= 30_000 + 60_000, key
 
@@ -261,7 +262,9 @@ async def test_history_entries_truncated_to_max_entry_bytes(client, spy, prefix)
     entry = (await store.get_history())["db"][0]
     assert entry.details == {"p95_rtt_ms": 12.5, "error_rate": 0.01, "_truncated": True}
     assert entry.status == result.status and entry.checked_at == result.checked_at
-    assert (await store.get_latest("db")).details == result.details  # latest kept in full
+    # The latest result is capped the same way: one huge payload per probe is not stored either.
+    assert len(await client.get(f"{prefix}:latest:db")) <= 2048
+    assert (await store.get_latest("db")).details == entry.details
 
 
 async def test_truncation_handles_oversized_text_fields(client, spy, prefix):
@@ -337,10 +340,10 @@ async def test_reads_take_constant_round_trips(spy, prefix):
         await store.append_history(_result(name=f"p{i}"))
     before = spy.round_trips
     assert len(await store.get_history()) == 25
-    assert spy.round_trips - before == 2  # SMEMBERS + one pipeline
+    assert spy.round_trips - before == 2  # ZRANGEBYSCORE + one pipeline
     before = spy.round_trips
     assert len(await store.get_all_latest()) == 25
-    assert spy.round_trips - before == 2  # SMEMBERS + MGET
+    assert spy.round_trips - before == 2  # ZRANGEBYSCORE + MGET
 
 
 async def test_index_drops_probes_whose_data_expired(client, spy, prefix):
@@ -350,11 +353,13 @@ async def test_index_drops_probes_whose_data_expired(client, spy, prefix):
     await asyncio.sleep(0.35)
     await store.set_latest(_result(name="kept"))
     await store.append_history(_result(name="kept"))
-    assert list(await store.get_all_latest()) == ["kept"]
-    assert await store.get_history() != {}
-    members = {m.decode() if isinstance(m, bytes) else m for m in await client.smembers(f"{prefix}:probes")}
+    # The writes alone trim the index: no read is needed to drop "gone".
+    members = {m.decode() if isinstance(m, bytes) else m for m in await client.zrange(f"{prefix}:names", 0, -1)}
     assert members == {"kept"}
-    assert await client.exists(f"{prefix}:history:gone") == 0
+    assert list(await store.get_all_latest()) == ["kept"]
+    assert list(await store.get_history()) == ["kept"]
+    assert await client.exists(f"{prefix}:latest:gone") == 0
+    assert 0 < await client.pttl(f"{prefix}:history:gone") <= 200 + 60_000
 
 
 async def test_cleared_latest_keeps_history_indexed_with_zero_ttl(spy, prefix):
@@ -400,7 +405,7 @@ async def test_forget_deletes_only_the_named_probes(client, spy, prefix):
     assert sorted(await store.get_all_latest()) == ["keep", "other"]
     assert sorted(await store.get_history()) == ["keep", "other"]
     assert await client.exists(f"{prefix}:latest:drop", f"{prefix}:history:drop") == 0
-    assert await client.sismember(f"{prefix}:probes", "drop") in (0, False)
+    assert await client.zscore(f"{prefix}:names", "drop") is None
     assert [a.probe for a in await store.get_alerts()] == ["drop"]  # alert log is left alone
     before = spy.round_trips
     await store.forget(set())  # nothing named: no round trip
@@ -466,7 +471,9 @@ async def test_configure_applies_new_limits(client, spy, prefix):
     await store.append_alert(_alert(probe="p10", at=base + timedelta(seconds=1)))
     assert await client.zcard(f"{prefix}:history:db") == 3
     assert await client.zcard(f"{prefix}:alerts") == 2
-    assert await client.pttl(f"{prefix}:history:db") > 0  # expiry from the earlier TTL stays until it lapses
+    # TTL 0 removes the expiry an earlier TTL left, so the history is not dropped when it lapses.
+    assert await client.pttl(f"{prefix}:history:db") == -1
+    assert await client.pttl(f"{prefix}:alerts") == -1
 
 
 async def test_configure_rejects_negative_ttl(spy, prefix):
@@ -545,19 +552,32 @@ async def test_registry_serves_from_redis(spy, prefix):
 async def test_claim_alert_only_one_replica_wins(client, prefix):
     one = RedisProbeStorage(client, prefix=prefix)
     two = RedisProbeStorage(client, prefix=prefix)
-    results = await asyncio.gather(*(s.claim_alert("db:unhealthy", 30) for s in (one, two, one, two)))
+    results = await asyncio.gather(*(s.claim_alert("db", "unhealthy", 30) for s in (one, two, one, two)))
     assert sorted(results) == [False, False, False, True]
-    assert await two.claim_alert("db:healthy", 30) is True  # different key, own claim
+    assert await two.claim_alert("cache", "unhealthy", 30) is True  # different key, own claim
+
+
+async def test_claim_alert_status_returned_to_within_window_is_claimable(client, spy, prefix):
+    # unhealthy -> healthy -> unhealthy inside the window: the re-failure must be sent.
+    one, two = _store(spy, prefix), _store(spy, prefix)
+    assert await one.claim_alert("db", "unhealthy", 60) is True
+    assert await two.claim_alert("db", "unhealthy", 60) is False
+    assert await two.claim_alert("db", "healthy", 60) is True
+    assert await one.claim_alert("db", "healthy", 60) is False
+    assert await one.claim_alert("db", "unhealthy", 60) is True
+    assert await two.claim_alert("db", "unhealthy", 60) is False
+    assert await _keys(client, prefix) == [f"{prefix}:alert-claim:db"]  # one key per probe
+    assert 0 < await client.pttl(f"{prefix}:alert-claim:db") <= 60_000
 
 
 async def test_claim_alert_expires_and_always_has_ttl(client, spy, prefix):
     store = _store(spy, prefix)
-    assert await store.claim_alert("db:unhealthy", 0.2) is True
-    pttl = await client.pttl(f"{prefix}:alert-claim:db:unhealthy")
+    assert await store.claim_alert("db", "unhealthy", 0.2) is True
+    pttl = await client.pttl(f"{prefix}:alert-claim:db")
     assert 0 < pttl <= 200
-    assert await store.claim_alert("db:unhealthy", 0.2) is False
+    assert await store.claim_alert("db", "unhealthy", 0.2) is False
     await asyncio.sleep(0.3)
-    assert await store.claim_alert("db:unhealthy", 0.2) is True
+    assert await store.claim_alert("db", "unhealthy", 0.2) is True
     for key in await _keys(client, prefix):
         assert await client.pttl(key) > 0, key
 
@@ -565,6 +585,78 @@ async def test_claim_alert_expires_and_always_has_ttl(client, spy, prefix):
 async def test_claim_alert_non_positive_ttl_stores_nothing(client, spy, prefix):
     store = _store(spy, prefix)
     for ttl in (0, -5):
-        assert await store.claim_alert("db:unhealthy", ttl) is True
-        assert await store.claim_alert("db:unhealthy", ttl) is True
+        assert await store.claim_alert("db", "unhealthy", ttl) is True
+        assert await store.claim_alert("db", "unhealthy", ttl) is True
     assert await _keys(client, prefix) == []
+
+
+# --- index stays bounded and expiring ---------------------------------------
+
+async def test_index_drops_renamed_probes_without_any_read(client, spy, prefix):
+    old = _store(spy, prefix, result_ttl_seconds=0.2)  # e.g. before a deploy that renamed probes
+    for i in range(20):
+        await old.set_latest(_result(name=f"old-{i}"))
+        await old.append_history(_result(name=f"old-{i}"))
+    await asyncio.sleep(0.3)
+    new = _store(spy, prefix, result_ttl_seconds=0.2)
+    for _ in range(3):  # the new names keep being written; nothing reads history
+        await new.set_latest(_result(name="new"))
+        await new.append_history(_result(name="new"))
+    assert await client.zcard(f"{prefix}:names") == 1
+
+
+async def test_reads_never_leave_the_index_without_expiry(client, spy, prefix):
+    store = _store(spy, prefix, result_ttl_seconds=60)
+    await store.set_latest(_result())
+    await store.append_history(_result())
+    await client.delete(f"{prefix}:latest:db")  # e.g. a set_latest that timed out, or eviction
+    await store.get_all_latest()
+    await store.get_history()
+    for key in await _keys(client, prefix):
+        assert 0 < await client.pttl(key) <= 120_000, key
+
+
+async def test_first_write_deletes_the_legacy_index_set(client, spy, prefix):
+    await client.sadd(f"{prefix}:probes", "db")  # written by an earlier version with TTL 0
+    store = _store(spy, prefix, result_ttl_seconds=0)
+    await store.set_latest(_result())
+    assert await client.exists(f"{prefix}:probes") == 0
+    await client.sadd(f"{prefix}:probes", "db")  # an old replica mid-rollout: left alone from now on
+    await store.set_latest(_result())
+    assert await client.exists(f"{prefix}:probes") == 1
+
+
+def test_rejects_non_finite_ttl():
+    for ttl in (math.inf, math.nan):
+        with pytest.raises(ValueError):
+            RedisProbeStorage(object(), result_ttl_seconds=ttl)
+        with pytest.raises(ValueError):
+            RedisProbeStorage(object(), alert_ttl_seconds=ttl)
+    with pytest.raises(ValueError):
+        RedisProbeStorage(object(), max_connections=0)
+
+
+# --- connections ------------------------------------------------------------
+
+async def test_many_probes_do_not_exhaust_a_shared_pool(prefix):
+    # The app's client, with a small pool: monitoring may take at most
+    # max_connections of it, so the app's own five commands still fit.
+    shared = redis_asyncio.from_url(REDIS_URL, max_connections=9)
+    try:
+        storage = RedisProbeStorage(shared, prefix=prefix, max_connections=4)
+        registry = HealthRegistry(FastAPI(), storage=storage, poll_interval_ms=None)
+        for i in range(40):
+            registry.add(NoOpProbe(name=f"route-{i}"))
+        failures = []
+        registry._log_storage_failure = lambda op, exc: failures.append((op, exc))
+
+        async def app_command():
+            await asyncio.sleep(0)
+            return await shared.set(f"{prefix}:app-key", "1", px=10_000)
+
+        results = await asyncio.gather(registry.run_all(), *(app_command() for _ in range(5)))
+        assert all(results[1:])
+        assert failures == []
+        assert len(await storage.get_history()) == 40
+    finally:
+        await shared.aclose()

@@ -563,6 +563,8 @@ Alerts are ordered oldest-first. If the storage backend is unavailable, the endp
 
 Pass any object implementing `ProbeStorage` as `HealthRegistry(app, storage=...)`. Setting a TTL to `0` disables age-based expiry for that collection (count limits still apply).
 
+The default in-process backend, `InMemoryProbeStorage(max_results=120, result_ttl_seconds=7200, alert_ttl_seconds=259200, max_alerts=120, max_entry_bytes=8192)`, caps history entries by bytes the same way `RedisProbeStorage` does (see **Byte cap** below), so a probe with a very large `details` payload cannot keep `history_size` full copies of it in memory.
+
 ### Retention settings
 
 Which limits a custom backend uses depends on what you pass to `HealthRegistry`:
@@ -582,7 +584,8 @@ from fastapi_watch import HealthRegistry, RedisProbeStorage
 storage = RedisProbeStorage(
     redis.from_url("redis://localhost:6379/0"),  # with or without decode_responses=True
     prefix="myapp:health",   # namespace; one per app sharing the Redis
-    max_entry_bytes=8192,    # byte cap per history entry
+    max_entry_bytes=8192,    # byte cap per stored result
+    max_connections=4,       # most connections taken from the client's pool at once
 )
 registry = HealthRegistry(app, storage=storage, history_size=120, result_ttl_seconds=7200)
 # history_size / result_ttl_seconds passed here, so configure() applies them
@@ -597,23 +600,26 @@ registry = HealthRegistry(app, storage=storage, history_size=120, result_ttl_sec
 | `result_ttl_seconds` | `7200` | Age limit for latest results and history entries. `0` = no age limit |
 | `alert_ttl_seconds` | `259200` | Age limit for alerts. `0` = no age limit |
 | `max_alerts` | `120` | Total alerts kept |
-| `max_entry_bytes` | `8192` | Largest stored history entry, minimum 512 |
+| `max_entry_bytes` | `8192` | Largest stored latest result or history entry, minimum 512 |
+| `max_connections` | `4` | Most Redis commands in flight at once, so the most connections taken from the client's pool. `None` = no limit |
 
 The four retention arguments are replaced by the registry's values only when `HealthRegistry` is given at least one of `history_size`, `result_ttl_seconds`, `alert_ttl_seconds` or `max_alerts` (see [Retention settings](#retention-settings)).
 
 Built so monitoring never loads the Redis it shares with your app:
 
-- **No `KEYS` or `SCAN`.** Probe names are kept in an index set (`<prefix>:probes`). `get_all_latest` is `SMEMBERS` plus one `MGET`, and `get_history` is `SMEMBERS` plus one pipelined round trip, however many probes there are.
-- **Atomic writes.** Each write is one `MULTI/EXEC`: add the entry, drop entries older than the TTL, trim to the count limit, and refresh a key-level expiry set slightly past the TTL. No key is ever left without its expiry. With a TTL of `0` no expiry is set and nothing is deleted by age.
+- **No `KEYS` or `SCAN`.** Probe names are kept in an index (`<prefix>:names`, a sorted set scored by each name's last write). `get_all_latest` is `ZRANGEBYSCORE` plus one `MGET`, and `get_history` is `ZRANGEBYSCORE` plus one pipelined round trip, however many probes there are.
+- **Atomic writes.** Each write is one `MULTI/EXEC`: add the entry, drop entries older than the TTL, trim to the count limit, drop index names not written within the TTL, and refresh a key-level expiry set slightly past the TTL. No key is ever left without its expiry, and names of renamed or removed probes leave the index on their own, even if nothing reads it. With a TTL of `0` no expiry is set (an expiry left by an earlier non-zero TTL is removed) and nothing is deleted by age.
+- **Bounded connections.** At most `max_connections` commands run at once; the rest queue (within `storage_timeout`). Without this, checking many probes together (for example after `discover_routes()`) took two connections per probe at once and could drain a pool the app shares: redis-py 5+ then raises `MaxConnectionsError` for the app's own commands too.
 - **Per-entry ageing.** History (`<prefix>:history:<name>`) and alerts (`<prefix>:alerts`) are sorted sets scored by `checked_at` / `timestamp`; reads skip expired entries even before a write trims them.
-- **Byte cap.** A history entry over `max_entry_bytes` loses its largest `details` values first (for example a request-metrics probe's per-route table) and gets `details["_truncated"] = true`; scalar values such as `p95_rtt_ms` stay, so dashboard graphs keep working. Latest results (`<prefix>:latest:<name>`) are stored in full.
-- **Cleanup.** Keys of probes that stop reporting expire on their own. `forget(names)` deletes the latest result, history and index entry of exactly the named probes; the registry passes only names it wrote and no longer registers, so it never removes another app's or replica's data.
-- **One alert per state change across replicas.** `claim_alert` is a single `SET <prefix>:alert-claim:<key> 1 NX PX <ttl>`; only the first replica to claim a key gets `True`, and every claim key expires.
+- **Byte cap.** A latest result or history entry over `max_entry_bytes` loses its largest `details` values first (for example a request-metrics probe's per-route table) and gets `details["_truncated"] = true`; scalar values such as `p95_rtt_ms` stay, so dashboard graphs keep working. If that is not enough, `description` and `tags` are dropped and `error` is shortened.
+- **Cleanup.** Keys of probes that stop reporting expire on their own. `forget(names)` deletes the latest result, history and index entry of exactly the named probes; the registry passes only names it wrote and no longer registers, so it never removes another app's or replica's data. With `result_ttl_seconds=0` nothing expires, so a probe renamed or removed across a restart keeps its keys until you delete them (`await storage.forget({"old-name"})`); this includes keys written while the TTL was `0` and never written again after you set one.
+- **Upgrading.** Versions before this one indexed names in a set at `<prefix>:probes`. Each new instance deletes it on its first write; with a non-zero TTL it would also expire on its own.
+- **One alert per state change across replicas.** `claim_alert(key, value, ttl_seconds)` is one Lua script on `<prefix>:alert-claim:<key>`: it returns `False` if the key already holds `value`, and otherwise stores `value` with a `PX` expiry and returns `True`. So only the first replica to announce a status gets `True`, a probe that changes status again within the window (unhealthy → healthy → unhealthy) is announced again, and every claim key expires.
 
 Upper bound on memory used:
 
 ```
-probes × (history_size × max_entry_bytes + one latest result) + max_alerts × (~150 B + probe name)
+probes × ((history_size + 1) × max_entry_bytes + probe name) + max_alerts × (~150 B + probe name)
 ```
 
 where `probes` counts the probe names written within the last `result_ttl_seconds` (or, when that TTL is `0`, every name written and not yet removed by `forget()`).
@@ -624,7 +630,7 @@ Implement the eight `ProbeStorage` methods: `get_latest`, `get_all_latest`, `set
 
 - `configure(*, max_results, result_ttl_seconds, alert_ttl_seconds, max_alerts)`: receives the registry's retention settings, only when at least one was passed to `HealthRegistry` (see [Retention settings](#retention-settings)).
 - `async forget(names: set[str])`: delete the latest result, history and any index entry of exactly the probes in `names`, and nothing else. The registry passes only names this process wrote and no longer registers.
-- `async claim_alert(key: str, ttl_seconds: float) -> bool`: return `True` only for the first caller to claim `key` within `ttl_seconds`, so one replica sends each alert. `ttl_seconds <= 0` always returns `True`. Claims must expire.
+- `async claim_alert(key: str, value: str, ttl_seconds: float) -> bool`: atomically store `value` under `key` for `ttl_seconds`; return `True` if `key` was absent, expired or held a different value, and `False` if it already held `value` (another replica announced it). `ttl_seconds <= 0` always returns `True`. Claims must expire.
 
 Bound every collection by count and by age, per entry. The `ProbeStorage` docstring has an outline.
 
