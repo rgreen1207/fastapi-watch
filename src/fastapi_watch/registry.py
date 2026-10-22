@@ -1827,7 +1827,14 @@ class HealthRegistry:
         while True:
             try:
                 now = loop.time()
-                due = [(p, c) for p, c in self._probes if self._is_probe_due(p, now)]
+                # Probes on the registry-wide interval poll only while a stream
+                # client is connected; the loop may be running for probes with
+                # their own interval, which poll regardless.
+                streaming = self._active_connections > 0
+                due = [
+                    (p, c) for p, c in self._probes
+                    if (streaming or p.poll_interval_ms is not None) and self._is_probe_due(p, now)
+                ]
                 if due:
                     await self._execute_probes(due)
                 if self._forget_due():

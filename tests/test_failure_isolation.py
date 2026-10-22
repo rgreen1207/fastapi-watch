@@ -74,6 +74,7 @@ class _FailOnceStorage(InMemoryProbeStorage):
 async def test_poll_loop_survives_a_failing_iteration(caplog, monkeypatch):
     registry = HealthRegistry(FastAPI(), poll_interval_ms=1000)
     registry.add(_Flip())
+    registry._active_connections = 1  # a stream client keeps registry-interval probes polled
 
     async def _fails(pairs):
         raise RuntimeError("unexpected")
@@ -94,6 +95,7 @@ async def test_poll_loop_storage_error_is_contained_in_the_probe_run(caplog):
     registry = HealthRegistry(FastAPI(), poll_interval_ms=1000, storage=_FailOnceStorage())
     probe = _Flip()
     registry.add(probe)
+    registry._active_connections = 1
 
     with caplog.at_level("WARNING", logger="fastapi_watch"):
         task = asyncio.create_task(registry._poll_loop())
@@ -268,6 +270,26 @@ async def test_first_request_starts_polling_when_set_started_had_no_loop():
         assert registry._poll_task is not None and not registry._poll_task.done()
     finally:
         await registry._shutdown()
+
+
+@pytest.mark.asyncio
+async def test_background_loop_polls_only_custom_interval_probes_without_clients():
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=1000)
+    custom, inherited = _Flip(), _Flip()
+    custom.name, custom.poll_interval_ms = "custom", 5000
+    inherited.name = "inherited"
+    registry.add(custom).add(inherited)
+    task = asyncio.create_task(registry._poll_loop())
+    try:
+        await asyncio.sleep(0.05)
+        # Registry-interval probes poll only while a stream client is connected.
+        assert (custom.calls, inherited.calls) == (1, 0)
+        registry._active_connections = 1
+        registry._probe_last_run.clear()
+        await asyncio.sleep(1.1)
+        assert inherited.calls >= 1
+    finally:
+        task.cancel()
 
 
 @pytest.mark.asyncio
