@@ -359,3 +359,18 @@ def test_webhook_timeout_none_still_posts(real_opener):
 
     threading.Thread(target=serve, daemon=True).start()
     alerts._post_json(f"http://127.0.0.1:{listener.getsockname()[1]}/hook", b"{}", timeout=None)
+
+
+async def test_slow_webhooks_do_not_starve_blocking_probe_checks(monkeypatch):
+    # Alert posts shared the 4-thread pool with CeleryProbe / TCPProbe, so four
+    # slow posts left those checks queued until they timed out.
+    release = threading.Event()
+    monkeypatch.setattr(alerts, "_post_json", lambda *a, **k: release.wait(5))
+    posts = [asyncio.ensure_future(WebhookAlerter("https://example.com/hook").notify(_alert()))
+             for _ in range(_MAX_WORKERS)]
+    try:
+        await asyncio.sleep(0.05)
+        await asyncio.wait_for(run_blocking(lambda: None), 1.0)
+    finally:
+        release.set()
+        await asyncio.gather(*posts)

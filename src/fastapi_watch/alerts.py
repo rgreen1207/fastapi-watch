@@ -40,6 +40,7 @@ Custom alerters::
             )
             # send SMS via your provider ...
 """
+import asyncio
 import ipaddress
 import json
 import math
@@ -52,13 +53,30 @@ import urllib.request
 from abc import ABC, abstractmethod
 from typing import Any
 
-from ._executor import run_blocking
+from ._executor import _MAX_WORKERS, _DaemonThreadPool
 from .models import AlertRecord, ProbeStatus
 
 # Upper bound on one alerter's notify() call.  Built-in alerters cut their own
 # request off after ``timeout`` (default 5 s); this only catches custom alerters
 # that never return, so one of them cannot stall every later alert.
 _NOTIFY_TIMEOUT_S = 30.0
+
+# Webhook posts get their own pool rather than the one blocking probe checks
+# use (CeleryProbe, TCPProbe's DNS lookup): a burst of alerts to a slow
+# endpoint would otherwise occupy every thread and time those checks out,
+# which reports them unhealthy and raises yet more alerts.
+_alert_pool: _DaemonThreadPool | None = None
+_alert_pool_lock = threading.Lock()
+
+
+async def _run_post(fn: Any, *args: Any) -> Any:
+    """Run the blocking webhook call ``fn(*args)`` in the alerters' own thread pool."""
+    global _alert_pool
+    if _alert_pool is None:
+        with _alert_pool_lock:
+            if _alert_pool is None:
+                _alert_pool = _DaemonThreadPool(_MAX_WORKERS, "fastapi-watch-alert")
+    return await asyncio.get_running_loop().run_in_executor(_alert_pool, fn, *args)
 
 
 def _ip_literal(hostname: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
@@ -274,7 +292,7 @@ def _post_json(
 ) -> None:
     """POST *payload* as JSON and close the response.  Raises on non-2xx.
 
-    Blocking — call it through ``run_blocking``.  The whole request, not just
+    Blocking — call it through ``_run_post``.  The whole request, not just
     each socket operation, is bounded by *timeout* (see :class:`_Deadline`);
     running out raises ``TimeoutError``.  Error responses are closed too, so a
     failing endpoint cannot leak a socket per alert.
@@ -389,7 +407,7 @@ class WebhookAlerter(BaseAlerter):
         }).encode()
 
     async def notify(self, alert: AlertRecord) -> None:
-        await run_blocking(_post_json, self.url, self._build_payload(alert), self.timeout, self.headers)
+        await _run_post(_post_json, self.url, self._build_payload(alert), self.timeout, self.headers)
 
 
 class SlackAlerter(BaseAlerter):
@@ -476,7 +494,7 @@ class SlackAlerter(BaseAlerter):
         return json.dumps(body).encode()
 
     async def notify(self, alert: AlertRecord) -> None:
-        await run_blocking(_post_json, self.webhook_url, self._build_payload(alert), self.timeout)
+        await _run_post(_post_json, self.webhook_url, self._build_payload(alert), self.timeout)
 
 
 class TeamsAlerter(BaseAlerter):
@@ -537,7 +555,7 @@ class TeamsAlerter(BaseAlerter):
         return json.dumps(body).encode()
 
     async def notify(self, alert: AlertRecord) -> None:
-        await run_blocking(_post_json, self.webhook_url, self._build_payload(alert), self.timeout)
+        await _run_post(_post_json, self.webhook_url, self._build_payload(alert), self.timeout)
 
 
 class PagerDutyAlerter(BaseAlerter):
@@ -618,7 +636,7 @@ class PagerDutyAlerter(BaseAlerter):
         return json.dumps(body).encode()
 
     async def notify(self, alert: AlertRecord) -> None:
-        await run_blocking(_post_json, self._EVENTS_URL, self._build_payload(alert), self.timeout)
+        await _run_post(_post_json, self._EVENTS_URL, self._build_payload(alert), self.timeout)
 
 
 class OpsGenieAlerter(BaseAlerter):
@@ -694,7 +712,7 @@ class OpsGenieAlerter(BaseAlerter):
     def _send(self, url: str, payload: bytes, action: str, subject: str) -> None:
         """POST to the OpsGenie API, raising ``RuntimeError`` with context on failure.
 
-        Blocking — called through ``run_blocking``.
+        Blocking — called through ``_run_post``.
         """
         self._assert_safe_url(url)
         try:
@@ -709,7 +727,7 @@ class OpsGenieAlerter(BaseAlerter):
 
         if alert.new_status == ProbeStatus.HEALTHY:
             url = f"{self._base_url}/v2/alerts/{urllib.parse.quote(alias, safe='')}/close?identifierType=alias"
-            await run_blocking(self._send, url, json.dumps({}).encode(), "close-alert", f"alias {alias!r}")
+            await _run_post(self._send, url, json.dumps({}).encode(), "close-alert", f"alias {alias!r}")
         else:
             priority = self._PRIORITY.get(alert.new_status, "P1")
             url = f"{self._base_url}/v2/alerts"
@@ -728,4 +746,4 @@ class OpsGenieAlerter(BaseAlerter):
                     "new_status": alert.new_status.value,
                 },
             }).encode()
-            await run_blocking(self._send, url, payload, "create-alert", f"probe {alert.probe!r}")
+            await _run_post(self._send, url, payload, "create-alert", f"probe {alert.probe!r}")
