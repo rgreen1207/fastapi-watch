@@ -1410,7 +1410,7 @@ registry.add(KafkaProbe(bootstrap_servers="localhost:9092"))
 registry.add(KafkaProbe(bootstrap_servers=["b1:9092", "b2:9092", "b3:9092"]))
 ```
 
-Details: `broker_count`, `controller_id`, `topics`, `internal_topics`.
+Details: `broker_count`, `controller_id`, `topic_count`, `topics`, `internal_topics`. At most 100 topic names are listed; `topic_count` is the full number of non-internal topics.
 
 ---
 
@@ -1539,7 +1539,7 @@ registry.add(db_probe)
 | Probe | Extra | Key args | Details |
 |-------|-------|----------|---------|
 | `RabbitMQProbe` | `rabbitmq` | `url`, `management_url` | `connected`; + `server`, `totals`, `queues` when `management_url` set |
-| `KafkaProbe` | `kafka` | `bootstrap_servers` | `broker_count`, `controller_id`, `topics` |
+| `KafkaProbe` | `kafka` | `bootstrap_servers` | `broker_count`, `controller_id`, `topic_count`, `topics` (first 100) |
 | `CeleryProbe` | `celery` | `app`, `min_workers`, `detailed`, `include_task_args` | `workers_online`, `workers` |
 
 #### HTTP / document stores

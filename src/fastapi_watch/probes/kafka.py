@@ -4,12 +4,18 @@ import time
 from ..models import ProbeResult, ProbeStatus
 from .base import BaseProbe, _failure_message
 
+# Most topic names listed in details.  Large clusters have thousands, and the
+# history keeps many copies of every result, so details must stay bounded.
+_MAX_TOPICS_LISTED = 100
+
 
 class KafkaProbe(BaseProbe):
     """Health probe for Apache Kafka using aiokafka.
 
     Actively connects an admin client on each poll, lists topics, and
-    describes the cluster. No topics are created or consumed.
+    describes the cluster. No topics are created or consumed.  Details list
+    at most 100 topic names; ``topic_count`` is the full number of
+    (non-internal) topics.
 
     Install with: ``pip install fastapi-watch[kafka]``
 
@@ -70,10 +76,13 @@ class KafkaProbe(BaseProbe):
                     client.list_topics(),
                     client.describe_cluster(),
                 )
-                details["broker_count"] = len(cluster.brokers)
-                details["controller_id"] = cluster.controller_id
-                details["topics"] = sorted(t for t in topics if not t.startswith("__"))
-                details["internal_topics"] = sorted(t for t in topics if t.startswith("__"))
+                # describe_cluster() returns the metadata response as a dict.
+                details["broker_count"] = len(cluster.get("brokers") or [])
+                details["controller_id"] = cluster.get("controller_id")
+                user_topics = sorted(t for t in topics if not t.startswith("__"))
+                details["topic_count"] = len(user_topics)
+                details["topics"] = user_topics[:_MAX_TOPICS_LISTED]
+                details["internal_topics"] = sorted(t for t in topics if t.startswith("__"))[:_MAX_TOPICS_LISTED]
             except Exception:
                 pass  # details are best-effort
 
