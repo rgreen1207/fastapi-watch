@@ -44,6 +44,7 @@ import asyncio
 import ipaddress
 import json
 import math
+import re
 import socket
 import threading
 import time
@@ -114,6 +115,7 @@ def _validate_webhook_url(url: str) -> None:
       a resolver accepts, including IPv4-mapped IPv6 (``::ffff:127.0.0.1``)
       and integer forms (``2130706433``, ``0x7f000001``)
     - ``localhost`` and ``*.localhost`` hostnames, with or without a trailing dot
+    - Credentials in the URL (``https://user:password@host/``)
 
     Both ``http://`` and ``https://`` are accepted. Use ``https://`` for
     production endpoints. Plain HTTP is only appropriate for local sidecars
@@ -135,6 +137,15 @@ def _validate_webhook_url(url: str) -> None:
             f"Webhook URL must use https:// or http:// scheme, got {parsed.scheme!r}"
         )
 
+    # urllib does not send userinfo as credentials: it takes "user:pw@host" as
+    # the host, fails every request, and the error it raises (logged with each
+    # failed alert) quotes the password.
+    if "@" in parsed.netloc:
+        raise ValueError(
+            "Webhook URL must not contain credentials (user:password@host); "
+            "pass them in a header instead."
+        )
+
     if not hostname or hostname == "localhost" or hostname.endswith(".localhost"):
         raise ValueError(
             "Webhook URL must not target localhost. Use a public HTTPS endpoint."
@@ -146,6 +157,43 @@ def _validate_webhook_url(url: str) -> None:
             f"Webhook URL hostname {hostname!r} is a private, loopback, or otherwise "
             "non-public address. Use a public HTTPS endpoint."
         )
+
+
+def _validate_timeout(timeout: float | None) -> None:
+    """Raise ``ValueError`` unless *timeout* is ``None`` or a finite positive number.
+
+    Zero, negative and NaN timeouts fail every request; an infinite one
+    overflows the request deadline's timer.  Every alert would be dropped.
+    """
+    if timeout is not None and not (math.isfinite(timeout) and timeout > 0):
+        raise ValueError(f"timeout must be a finite positive number or None, got {timeout!r}")
+
+
+# Header fields http.client would refuse to send.  A value read from a file or
+# environment variable often ends in a newline; http.client then rejects every
+# request with an error that quotes the value -- the token -- into the log.
+_HEADER_NAME = re.compile(r"[^:\s][^:\r\n]*")
+_HEADER_VALUE_FORBIDDEN = re.compile(r"[\r\n\x00]")
+
+
+def _validate_headers(headers: dict[str, str]) -> None:
+    """Raise ``ValueError`` for a header http.client would reject, without echoing its value."""
+    for name, value in headers.items():
+        if not isinstance(name, str) or not _HEADER_NAME.fullmatch(name):
+            raise ValueError(f"Invalid HTTP header name {name!r}")
+        if isinstance(value, (bytes, bytearray)):
+            value = value.decode("latin-1")
+        if not isinstance(value, str):
+            continue  # http.client sends ints as their decimal form
+        if _HEADER_VALUE_FORBIDDEN.search(value):
+            raise ValueError(
+                f"Value of HTTP header {name!r} must not contain line breaks "
+                "or NUL characters (check for a trailing newline)"
+            )
+        try:
+            value.encode("latin-1")
+        except UnicodeEncodeError:
+            raise ValueError(f"Value of HTTP header {name!r} must be Latin-1 text") from None
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -391,6 +439,8 @@ class WebhookAlerter(BaseAlerter):
         timeout: float = 5.0,
     ) -> None:
         _validate_webhook_url(url)
+        _validate_headers(headers or {})
+        _validate_timeout(timeout)
         self.url = url
         self.headers = headers or {}
         self.timeout = timeout
@@ -461,6 +511,7 @@ class SlackAlerter(BaseAlerter):
         timeout: float = 5.0,
     ) -> None:
         _validate_webhook_url(webhook_url)
+        _validate_timeout(timeout)
         self.webhook_url = webhook_url
         self.channel = channel
         self.username = username
@@ -526,6 +577,7 @@ class TeamsAlerter(BaseAlerter):
 
     def __init__(self, webhook_url: str, *, timeout: float = 5.0) -> None:
         _validate_webhook_url(webhook_url)
+        _validate_timeout(timeout)
         self.webhook_url = webhook_url
         self.timeout = timeout
 
@@ -597,6 +649,7 @@ class PagerDutyAlerter(BaseAlerter):
         source: str = "fastapi-watch",
         timeout: float = 5.0,
     ) -> None:
+        _validate_timeout(timeout)
         self.routing_key = routing_key
         self.source = source
         self.timeout = timeout
@@ -685,6 +738,8 @@ class OpsGenieAlerter(BaseAlerter):
     ) -> None:
         if region not in self._BASE_URL:
             raise ValueError(f"region must be 'us' or 'eu', got {region!r}")
+        _validate_headers({"Authorization": f"GenieKey {api_key}"})
+        _validate_timeout(timeout)
         self.api_key = api_key
         self._base_url = self._BASE_URL[region]
         self.source = source

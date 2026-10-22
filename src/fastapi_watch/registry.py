@@ -2110,8 +2110,10 @@ class HealthRegistry:
         try:
             self._alert_queue.put_nowait(transition)
         except asyncio.QueueFull:
-            if self._logger:
-                self._logger.warning("Alert queue full, dropping alert for probe %r", transition.probe)
+            (self._logger or _LIB_LOGGER).warning(
+                "fastapi-watch: alert queue full; the alert for probe %r is retried at its next check",
+                transition.probe,
+            )
             return
         self._alerted_states[name] = status
         self._alert_last_sent_at[name] = now

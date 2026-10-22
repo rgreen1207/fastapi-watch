@@ -29,6 +29,7 @@ Most fixes need no action. These change what you see or what is accepted:
 - **`EventLoopProbe(sample_interval_ms=...)` below 1 raises `ValueError`**; `alert_dedupe_window_s` and `alert_min_interval_s` must be finite.
 - **A custom `check()` that returns something other than a `ProbeResult`** is reported as that probe's `UNHEALTHY` result instead of failing every health endpoint with `500`.
 - **The dashboard is served with `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and `frame-ancestors 'none'`.**
+- **Alerters reject settings that failed every alert, at construction (`ValueError`)**: credentials in a webhook URL (`https://user:pw@host/`), a header value or OpsGenie `api_key` containing a line break or NUL (often a trailing newline from a secrets file), and a `timeout` that is zero, negative, NaN or infinite (`None` still means unbounded).
 
 ### Bug Fixes
 
@@ -399,6 +400,12 @@ With the default `auth=None`, anyone who could reach the service could `POST /he
 `_validate_webhook_url` only rejected a short list of private ranges in their canonical spelling, and alerter requests followed redirects. `0.0.0.0`, IPv4-mapped IPv6 (`::ffff:127.0.0.1`), integer/octal/hex hosts (`http://2130706433/`), multicast/reserved addresses, and `localhost.` all passed, and any validated public URL could redirect the POST — with its auth headers — to an internal address.
 
 **Fix:** every IP literal that is not publicly routable unicast is rejected, in any spelling a resolver accepts, along with `localhost` / `*.localhost`. Alerter requests use an opener that never follows redirects.
+
+#### Misconfigured alerters no longer write secrets to the log
+
+A webhook URL with credentials (`https://user:pw@host/`), or a header value or OpsGenie `api_key` ending in a newline, made every post fail before connecting — with an error that quoted the password or token (`nonnumeric port: 'pw@host'`, `Invalid header value b'Bearer <token>\n'`), logged with every alert. Every alert was lost, and the secret landed in the application's logs.
+
+**Fix:** all three raise `ValueError` when the alerter is created, without echoing the value. A full alert queue is now also logged through the `fastapi_watch` logger when no `logger=` is passed (it was silent).
 
 #### Basic auth no longer short-circuits on the username
 
