@@ -202,6 +202,31 @@ async def test_non_int_status_code_on_result_still_records(value):
 
 
 @pytest.mark.asyncio
+async def test_status_code_field_on_a_returned_model_is_not_the_http_status():
+    """FastAPI serialises a non-Response result with the route's status code,
+    so a domain model's own ``status_code`` field must not count as a 503."""
+    from pydantic import BaseModel
+    from starlette.responses import JSONResponse
+
+    class UpstreamCall(BaseModel):
+        status_code: int
+
+    probe = FastAPIRouteProbe("r")
+
+    @probe.watch
+    async def handler(response_cls=None):
+        return response_cls(None, status_code=503) if response_cls else UpstreamCall(status_code=503)
+
+    await handler()
+    details = (await probe.check()).details
+    assert (details["last_status_code"], details["error_count"]) == (200, 0)
+
+    await handler(JSONResponse)
+    details = (await probe.check()).details
+    assert (details["last_status_code"], details["error_count"]) == (503, 1)
+
+
+@pytest.mark.asyncio
 async def test_non_int_status_code_on_exception_counts_as_500():
     probe = FastAPIRouteProbe("r")
 
