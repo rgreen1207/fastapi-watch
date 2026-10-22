@@ -278,29 +278,25 @@ def test_health_routes_under_a_router_prefix_are_not_counted():
 # Bounded route table and argument validation
 # ---------------------------------------------------------------------------
 
-def _tenant_app(**kwargs) -> FastAPI:
+def _many_routes_app(count: int = 20, **kwargs) -> FastAPI:
     app = FastAPI()
-    sub = FastAPI()
-
-    @sub.get("/items")
-    async def items():
-        return []
+    for n in range(count):
+        app.add_api_route(f"/r{n}", lambda: {}, name=f"r{n}")
 
     @app.get("/ok")
     async def ok():
         return {}
 
-    app.mount("/t/{tenant}", sub)
     app.add_middleware(RequestMetricsMiddleware, **kwargs)
     return app
 
 
 def test_route_table_capped_at_max_routes():
-    app = _tenant_app(max_routes=3)
+    app = _many_routes_app(max_routes=3)
     client = TestClient(app)
     client.get("/ok")
-    for tenant in range(20):
-        client.get(f"/t/{tenant}/items")
+    for n in range(20):
+        client.get(f"/r{n}")
     client.get("/ok")
 
     middleware = _installed_middleware(app)
@@ -313,13 +309,39 @@ def test_route_table_capped_at_max_routes():
 
 @pytest.mark.asyncio
 async def test_overflow_bucket_reported_by_probe():
-    app = _tenant_app(max_routes=2)
+    app = _many_routes_app(max_routes=2)
     client = TestClient(app)
-    for tenant in range(5):
-        client.get(f"/t/{tenant}/items")
+    for n in range(5):
+        client.get(f"/r{n}")
 
     result = await RequestMetricsProbe(app).check()
-    assert set(result.details["routes"]) == {"/t/0/items", "/t/1/items", OTHER_ROUTE}
+    assert set(result.details["routes"]) == {"/r0", "/r1", OTHER_ROUTE}
+
+
+def test_mount_path_parameters_are_keyed_by_name():
+    """A tenant ID in a Mount path must neither make a key per tenant nor
+    appear in the metrics; the inner route's own parameters stay templated."""
+    app = FastAPI()
+    sub = FastAPI()
+
+    @sub.get("/items/{item_id}")
+    async def item(item_id: str):
+        return {}
+
+    app.mount("/t/{tenant}", sub)
+    app.mount("/n/{shard:int}/x", sub)
+    app.add_middleware(RequestMetricsMiddleware)
+    client = TestClient(app)
+    for tenant in ("acme", "globex", "items"):
+        assert client.get(f"/t/{tenant}/items/{tenant}").status_code == 200
+    client.get("/t/acme/nothing")
+    client.get("/n/7/x/items/7")
+
+    assert set(_installed_middleware(app)._routes) == {
+        "/t/{tenant}/items/{item_id}",
+        "/t/{tenant}/{path:path}",
+        "/n/{shard}/x/items/{item_id}",
+    }
 
 
 def test_default_max_routes_is_500():

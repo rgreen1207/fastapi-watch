@@ -109,6 +109,25 @@ class _RouteStats:
 UNMATCHED_ROUTE = "<unmatched>"
 
 
+def _mount_template(mount_prefix: str, path_params: dict, template: str | None) -> str:
+    """Put a Mount's parameter names back in place of their values.
+
+    Routing records only the concrete prefix (``/t/acme``), but the Mount's
+    parameters are in ``path_params``: each prefix segment equal to one of
+    them becomes ``{name}`` (``/t/{tenant}``), so a tenant ID neither makes a
+    key of its own nor shows up in the metrics.  The inner route's own
+    parameters (those named in *template*) are not the Mount's and are skipped.
+    """
+    values: dict[str, str] = {}
+    for name, value in path_params.items():
+        if template is not None and ("{" + name + "}" in template or "{" + name + ":" in template):
+            continue
+        values.setdefault(str(value), name)
+    if not values:
+        return mount_prefix
+    return "/".join("{" + values[segment] + "}" if segment in values else segment for segment in mount_prefix.split("/"))
+
+
 def _route_key(scope: dict, entry_root_path: str) -> str:
     """Return the per-route bucket for a finished request.
 
@@ -117,7 +136,8 @@ def _route_key(scope: dict, entry_root_path: str) -> str:
 
     * A matched route keys on its full template, including any router prefix
       and Mount prefix.  FastAPI 0.137+ keeps included routes' short paths on
-      ``route.path`` and the full one on the effective route context.
+      ``route.path`` and the full one on the effective route context.  A
+      Mount's path parameters are restored to ``{name}`` form.
     * A Mount that matched no inner route (static files, raw ASGI apps, or a
       404 inside a mounted app) shares one ``<mount>/{path:path}`` bucket.
     * Anything else shares the single ``<unmatched>`` bucket.
@@ -129,6 +149,10 @@ def _route_key(scope: dict, entry_root_path: str) -> str:
         mount_prefix = root_path[len(entry_root_path):] if root_path.startswith(entry_root_path) else ""
     effective = (scope.get("fastapi") or {}).get("effective_route_context")
     template = getattr(effective, "path", None) or getattr(scope.get("route"), "path", None)
+    if mount_prefix:
+        path_params = scope.get("path_params")
+        if path_params:
+            mount_prefix = _mount_template(mount_prefix, path_params, template)
     if template:
         return mount_prefix + template
     if mount_prefix:
@@ -204,8 +228,10 @@ class RequestMetricsMiddleware:
             ``details["routes"]``.  Requests that match no route share a single
             ``"<unmatched>"`` entry, and a Mount without inner routes (e.g.
             static files) shares one ``"/static/{path:path}"``-style entry, so
-            the table stays bounded however many distinct URLs arrive.  When
-            ``False``, only aggregate stats are tracked.
+            the table stays bounded however many distinct URLs arrive.  A
+            Mount's path parameters are keyed by name too
+            (``app.mount("/t/{tenant}", sub)`` gives ``/t/{tenant}/...``).
+            When ``False``, only aggregate stats are tracked.
         window_size: Number of recent requests used for the error rate,
             percentiles, and requests-per-minute (default ``200``).
         ema_alpha: Smoothing factor for the exponential moving average RTT
@@ -215,10 +241,8 @@ class RequestMetricsMiddleware:
             as errors (default ``500``).  4xx client errors such as 404 are not
             counted as errors by default; set to ``400`` to include them.
         max_routes: Most per-route entries kept (default ``500``).  Requests
-            for further routes share one ``"<other>"`` entry — this caps the
-            table when route keys are not a fixed set, e.g. a Mount with a path
-            parameter (``app.mount("/t/{tenant}", sub)``) yields a key per
-            tenant.
+            for further routes share one ``"<other>"`` entry — a backstop for
+            apps whose route keys are not a fixed set.
 
     Raises:
         ValueError: If ``window_size`` or ``max_routes`` is not positive, or
