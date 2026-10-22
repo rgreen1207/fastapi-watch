@@ -795,6 +795,7 @@ class HealthRegistry:
         # Bounded alert queue — avoids unbounded create_task() per state-change.
         # A None item only wakes the worker to re-check coalesced alerts.
         self._alert_queue: asyncio.Queue[AlertRecord | None] = asyncio.Queue(maxsize=256)
+        self._alert_queue_loop: asyncio.AbstractEventLoop | None = None  # see _alert_queue_on
         self._alert_worker: asyncio.Task | None = None
 
         # Flap limiting: monotonic time of each probe's last alert, and the
@@ -1963,9 +1964,9 @@ class HealthRegistry:
         """
         if not self._alert_queue.empty() and (self._alert_worker is None or self._alert_worker.done()):
             # Queued with no worker to send them (it is not started once shutting down).
-            self._alert_worker = asyncio.get_running_loop().create_task(
-                self._alert_loop(), name="fastapi-watch-alert-worker"
-            )
+            loop = asyncio.get_running_loop()
+            self._alert_queue_on(loop)
+            self._alert_worker = loop.create_task(self._alert_loop(), name="fastapi-watch-alert-worker")
         if self._alert_worker is None:
             return
         try:
@@ -2295,11 +2296,28 @@ class HealthRegistry:
             return  # a check finishing during shutdown must not leave a new worker pending
         if self._alert_worker is None or self._alert_worker.done():
             try:
-                self._alert_worker = asyncio.get_running_loop().create_task(
-                    self._alert_loop(), name="fastapi-watch-alert-worker"
-                )
+                loop = asyncio.get_running_loop()
             except RuntimeError:
-                pass  # no running loop yet
+                return  # no running loop yet
+            self._alert_queue_on(loop)
+            self._alert_worker = loop.create_task(self._alert_loop(), name="fastapi-watch-alert-worker")
+
+    def _alert_queue_on(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Make the alert queue usable from *loop*, keeping the alerts queued in it.
+
+        An ``asyncio.Queue`` binds to the first loop that waits on it.  When the
+        app runs again on a new loop (``with TestClient(app)`` per test), the
+        worker died on its first wait with "bound to a different event loop",
+        losing coalesced alerts; so the queue moves to the new loop instead.
+        """
+        if self._alert_queue_loop is loop:
+            return
+        if self._alert_queue_loop is not None:
+            queue: asyncio.Queue[AlertRecord | None] = asyncio.Queue(maxsize=self._alert_queue.maxsize)
+            while not self._alert_queue.empty():
+                queue.put_nowait(self._alert_queue.get_nowait())
+            self._alert_queue = queue
+        self._alert_queue_loop = loop
 
     async def _alert_loop(self) -> None:
         """Drain the alert queue, dispatching each alert to all registered alerters.
