@@ -1393,7 +1393,7 @@ registry.add(RabbitMQProbe(
 ))
 ```
 
-If `management_url` is unreachable, the probe still reports AMQP connectivity.
+If `management_url` is unreachable, the probe still reports AMQP connectivity. `queues` lists at most the 50 queues holding the most messages (the API pages and sorts them, so the broker does not serialize every queue on each check); `server.queues` is the total. Percent-encoded credentials in `url` are decoded before they are sent to the Management API, as aio-pika does for AMQP.
 
 ---
 
