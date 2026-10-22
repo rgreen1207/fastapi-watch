@@ -56,10 +56,13 @@ class _RouteStats:
         self._ema_alpha = ema_alpha
         self._min_error_status = min_error_status
 
-    def record(self, status_code: int, rtt_ms: float) -> None:
+    def record(self, status_code: int, rtt_ms: float, now: float | None = None) -> None:
+        """Record one request; *now* is any monotonic timestamp in seconds."""
+        if now is None:
+            now = time.perf_counter()
         with self._lock:
             self._request_count += 1
-            self._request_timestamps.append(time.monotonic())
+            self._request_timestamps.append(now)
             is_error = status_code >= self._min_error_status
             if len(self._error_window) == self._error_window.maxlen and self._error_window[0]:
                 self._window_error_count -= 1
@@ -120,7 +123,10 @@ def _route_key(scope: dict, entry_root_path: str) -> str:
     * Anything else shares the single ``<unmatched>`` bucket.
     """
     root_path = scope.get("root_path", "")
-    mount_prefix = root_path[len(entry_root_path):] if root_path.startswith(entry_root_path) else ""
+    if root_path == entry_root_path:
+        mount_prefix = ""
+    else:
+        mount_prefix = root_path[len(entry_root_path):] if root_path.startswith(entry_root_path) else ""
     effective = (scope.get("fastapi") or {}).get("effective_route_context")
     template = getattr(effective, "path", None) or getattr(scope.get("route"), "path", None)
     if template:
@@ -141,16 +147,37 @@ OTHER_ROUTE = "<other>"
 _is_health_handler: "Callable[[Any], bool] | None" = None
 
 
-def _is_health_route(scope: Scope) -> bool:
-    """True when routing sent the request to a HealthRegistry's own handler."""
+# Most endpoints whose health-handler verdict a middleware caches.  Endpoints
+# are the app's route handlers, a fixed set; the cap only guards odd apps.
+_MAX_CACHED_ENDPOINTS = 1024
+
+
+def _is_health_route(scope: Scope, cache: "dict[Any, bool] | None" = None) -> bool:
+    """True when routing sent the request to a HealthRegistry's own handler.
+
+    *cache* maps endpoints to the verdict, so a request costs a dict lookup
+    rather than an unwrap-and-compare of the handler's qualified name.
+    """
     global _is_health_handler
+    effective = (scope.get("fastapi") or {}).get("effective_route_context")
+    endpoint = getattr(effective, "endpoint", None) or getattr(scope.get("route"), "endpoint", None)
+    if endpoint is None:
+        return False
+    if cache is not None:
+        try:
+            cached = cache.get(endpoint)
+        except TypeError:  # an unhashable callable endpoint
+            cache = cached = None
+        if cached is not None:
+            return cached
     if _is_health_handler is None:
         from .registry import _is_health_handler as is_health_handler
 
         _is_health_handler = is_health_handler
-    effective = (scope.get("fastapi") or {}).get("effective_route_context")
-    endpoint = getattr(effective, "endpoint", None) or getattr(scope.get("route"), "endpoint", None)
-    return endpoint is not None and _is_health_handler(endpoint)
+    is_health = _is_health_handler(endpoint)
+    if cache is not None and len(cache) < _MAX_CACHED_ENDPOINTS:
+        cache[endpoint] = is_health
+    return is_health
 
 
 class RequestMetricsMiddleware:
@@ -233,6 +260,7 @@ class RequestMetricsMiddleware:
         self._aggregate = _RouteStats(window_size, ema_alpha, min_error_status)
         self._routes: dict[str, _RouteStats] = {}
         self._routes_lock = threading.Lock()
+        self._health_endpoints: dict[Any, bool] = {}
 
     def _get_or_create(self, path: str) -> _RouteStats:
         # Lock-free hit for known routes — the common case; dict reads are atomic.
@@ -292,13 +320,15 @@ class RequestMetricsMiddleware:
 
     def _record(self, scope: Scope, status_code: int, start: float, entry_root_path: str) -> None:
         """Record one finished request in the aggregate and its per-route bucket."""
-        if _is_health_route(scope):
+        end = time.perf_counter()
+        if _is_health_route(scope, self._health_endpoints):
             return
-        rtt_ms = round((time.perf_counter() - start) * 1000, 2)
-        self._aggregate.record(status_code, rtt_ms)
+        # Unrounded: snapshots round what they report, so recording need not.
+        rtt_ms = (end - start) * 1000
+        self._aggregate.record(status_code, rtt_ms, end)
 
         if self.per_route:
-            self._get_or_create(_route_key(scope, entry_root_path)).record(status_code, rtt_ms)
+            self._get_or_create(_route_key(scope, entry_root_path)).record(status_code, rtt_ms, end)
 
 
 # ---------------------------------------------------------------------------
