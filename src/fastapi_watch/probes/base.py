@@ -59,6 +59,18 @@ def _status_family(status: int) -> str:
 _STATUS_FAMILIES = {family: f"{family}xx" for family in range(1, 6)}
 
 
+def _is_async_callable(func: Any) -> bool:
+    """True if calling *func* returns an awaitable coroutine.
+
+    Covers ``partial`` objects and callable instances with an ``async def
+    __call__`` (``alru_cache`` wrappers, for one), which
+    ``inspect.iscoroutinefunction`` alone reports as plain functions.
+    """
+    while isinstance(func, functools.partial):
+        func = func.func
+    return inspect.iscoroutinefunction(func) or inspect.iscoroutinefunction(getattr(type(func), "__call__", None))
+
+
 def _round_ms(value: float | None) -> float | None:
     return None if value is None else round(value, 2)
 
@@ -500,7 +512,7 @@ class PassiveProbe(BaseProbe):
             except Exception:
                 _LOGGER.debug("fastapi-watch: failed to record a call for probe %r", self.name, exc_info=True)
 
-        if inspect.iscoroutinefunction(func):
+        if _is_async_callable(func):
             @functools.wraps(func)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
                 started = _start()

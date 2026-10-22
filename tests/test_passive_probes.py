@@ -320,3 +320,41 @@ async def test_concurrent_recording_from_threads_gives_consistent_checks():
     details = (await probe.check()).details
     assert details["call_count"] == 8000
     assert details["error_count"] == 2000
+
+
+class _AsyncCallable:
+    """Like an ``alru_cache`` wrapper: an instance with an ``async def __call__``."""
+
+    def __init__(self, fail: bool = False):
+        self.fail = fail
+        self.__name__ = self.__qualname__ = "async_callable"
+
+    async def __call__(self, x: int = 0):
+        await asyncio.sleep(0.02)
+        if self.fail:
+            raise RuntimeError("down")
+        return {"ok": True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wrap", [lambda f: f, lambda f: functools.partial(f, 1)])
+async def test_async_callable_object_is_timed_and_its_errors_counted(wrap):
+    probe = PassiveProbe("p")
+    watched = probe.watch(wrap(_AsyncCallable(fail=True)))
+
+    with pytest.raises(RuntimeError):
+        await watched()
+
+    details = (await probe.check()).details
+    assert details["error_count"] == 1
+    assert details["last_rtt_ms"] >= 15
+
+
+def test_async_callable_route_endpoint_still_served():
+    from fastapi.testclient import TestClient
+
+    probe = FastAPIRouteProbe("r")
+    app = FastAPI()
+    app.add_api_route("/x", probe.watch(_AsyncCallable()))
+    assert TestClient(app).get("/x").json() == {"ok": True}
+    assert probe._call_count == 1 and probe._rtt_window[0] >= 15
