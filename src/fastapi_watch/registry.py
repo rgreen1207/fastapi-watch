@@ -1572,12 +1572,16 @@ class HealthRegistry:
     # Caching / result retrieval
     # ------------------------------------------------------------------
 
-    async def _get_results(self) -> list[ProbeResult]:
+    async def _get_results(self, reuse_within_s: float | None = None) -> list[ProbeResult]:
         """Return the current result of every registered probe, as checked by this process.
 
-        Single-fetch probes always run fresh.  Polled probes run when their
-        interval has elapsed, when they have not yet run in this process, or
-        when no result is held for them.
+        Single-fetch probes run fresh, unless *reuse_within_s* is given: a
+        stream passes its event interval, so a result checked within it is
+        reused.  Otherwise every open stream would re-run each single-fetch
+        probe once per event — N streams, N checks of that dependency per
+        interval.  Polled probes run when their interval has elapsed, when
+        they have not yet run in this process, or when no result is held
+        for them.
 
         Results come from the in-process copy of each probe's last result, not
         from storage.  A shared backend (e.g. Redis) also holds other
@@ -1589,13 +1593,17 @@ class HealthRegistry:
         self._ensure_background_polling()
         self._schedule_forget()
         now = asyncio.get_running_loop().time()
-        to_run = [
-            (p, c) for p, c in self._probes
-            if self._effective_interval_s(p) is None
-            or p.name not in self._probe_last_run
-            or p.name not in self._last_results
-            or self._is_probe_due(p, now)
-        ]
+
+        def _needs_run(probe: BaseProbe) -> bool:
+            last = self._probe_last_run.get(probe.name)
+            if last is None or probe.name not in self._last_results:
+                return True
+            interval_s = self._effective_interval_s(probe)
+            if interval_s is None:  # single-fetch
+                return reuse_within_s is None or now - last >= reuse_within_s
+            return now - last >= interval_s
+
+        to_run = [(p, c) for p, c in self._probes if _needs_run(p)]
         if to_run:
             await self._execute_probes(to_run)
         results: dict[str, ProbeResult] = {}
@@ -1923,12 +1931,12 @@ class HealthRegistry:
 
         try:
             while not self._shutting_down and not _expired():
-                results = await self._get_results()
+                interval_s = self._stream_interval_s()
+                results = await self._get_results(reuse_within_s=interval_s)
                 if filter_tags:
                     results = [r for r in results if filter_tags & set(r.tags)]
                 if filter_probes:
                     results = [r for r in results if r.name in filter_probes]
-                interval_s = self._stream_interval_s()
                 if interval_s is None:
                     yield f"retry: {_SINGLE_FETCH_RETRY_MS}\ndata: {make_report(results)}\n\n"
                     return

@@ -217,3 +217,49 @@ def test_cap_applies_after_auth():
 def test_invalid_stream_cap_is_rejected(value):
     with pytest.raises(ValueError, match="max_stream_connections"):
         HealthRegistry(FastAPI(), max_stream_connections=value)
+
+
+@pytest.mark.asyncio
+async def test_streams_share_single_fetch_results_within_an_interval():
+    # Each open stream used to re-run every single-fetch probe at its own
+    # event tick: N streams, N checks of that dependency per interval.
+    class _Counting(NoOpProbe):
+        calls = 0
+
+        async def check(self):
+            self.calls += 1
+            return await super().check()
+
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=None)
+    single = _Counting(name="db")
+    registry.add(single).add(NoOpProbe(name="fast", poll_interval_ms=1000))
+
+    async def _client(delay):
+        await asyncio.sleep(delay)
+        async for _ in registry._event_stream(_FakeRequest(), _make_report):
+            pass
+
+    clients = [asyncio.create_task(_client(i * 0.05)) for i in range(10)]
+    await asyncio.sleep(2.2)
+    for task in clients:
+        task.cancel()
+    await asyncio.gather(*clients, return_exceptions=True)
+    await registry._shutdown()
+    assert single.calls <= 4  # about one per 1 s interval, not one per stream event (~30)
+
+
+@pytest.mark.asyncio
+async def test_requests_still_run_single_fetch_probes_fresh():
+    class _Counting(NoOpProbe):
+        calls = 0
+
+        async def check(self):
+            self.calls += 1
+            return await super().check()
+
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=None)
+    probe = _Counting(name="db")
+    registry.add(probe).add(NoOpProbe(name="fast", poll_interval_ms=1000))
+    for _ in range(3):
+        await registry._get_results()
+    assert probe.calls == 3

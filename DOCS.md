@@ -102,7 +102,7 @@ Each event is a JSON-encoded health report on a `data:` line:
 data: {"status": "healthy", "checked_at": "2024-06-01T12:00:00.123456+00:00", "probes": [...]}
 ```
 
-Events are sent at the shortest effective probe interval (a probe with `poll_interval_ms=5_000` gets 5-second updates even when the registry default is 60 s). Between events the stream sends a `: keepalive` comment line every 15 seconds so proxies and load balancers with idle timeouts don't close it; `EventSource` ignores comment lines.
+Events are sent at the shortest effective probe interval (a probe with `poll_interval_ms=5_000` gets 5-second updates even when the registry default is 60 s). Probes without an interval are re-checked at most once per event interval however many streams are open: a stream reuses a result checked within it. Between events the stream sends a `: keepalive` comment line every 15 seconds so proxies and load balancers with idle timeouts don't close it; `EventSource` ignores comment lines.
 
 In single-fetch mode (no probe has an interval) the stream sends one event, preceded by `retry: 30000`, and closes. Browsers then wait 30 seconds before reconnecting instead of their ~3-second default — each reconnect runs every probe again.
 
