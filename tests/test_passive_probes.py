@@ -41,6 +41,27 @@ async def test_passive_probe_reports_requests_per_minute():
     assert (await probe.check()).details["requests_per_minute"] > 0
 
 
+@pytest.mark.asyncio
+async def test_requests_per_minute_ignores_wall_clock_steps(monkeypatch):
+    """Throughput runs on a monotonic clock; an NTP step of the wall clock
+    (here: back an hour between two calls) must not skew it or hide it."""
+    clock = SimpleNamespace(ticks=100.0, wall=1_700_000_000.0)
+    monkeypatch.setattr(base_module, "time", SimpleNamespace(
+        perf_counter=lambda: clock.ticks, time=lambda: clock.wall, monotonic=lambda: clock.ticks,
+    ))
+    probe = PassiveProbe("p")
+    call = probe.watch(lambda: None)
+
+    call()
+    clock.ticks += 30.0
+    clock.wall -= 3600.0
+    call()
+
+    details = (await probe.check()).details
+    assert details["requests_per_minute"] == 2.0  # 1 interval in 30 s
+    assert details["min_rtt_ms"] == details["max_rtt_ms"] == 0.0
+
+
 def test_no_deprecated_coroutine_check_in_source():
     """asyncio.iscoroutinefunction warns on 3.14+ and is removed in 3.16."""
     src = pathlib.Path(__file__).resolve().parent.parent / "src"
