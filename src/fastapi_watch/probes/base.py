@@ -71,6 +71,24 @@ def _is_async_callable(func: Any) -> bool:
     return inspect.iscoroutinefunction(func) or inspect.iscoroutinefunction(getattr(type(func), "__call__", None))
 
 
+def _resolved_signature(wrapper: Callable, func: Callable) -> Callable:
+    """Give *wrapper* *func*'s signature with string annotations already evaluated.
+
+    Older FastAPI releases evaluate a handler's string annotations (``from
+    __future__ import annotations``) in the namespace of the callable they
+    are given -- here this module, not the handler's -- so ``request:
+    "Request"`` turned into a required query parameter and every call failed
+    validation.  ``inspect.signature`` honours ``__signature__``, so FastAPI
+    sees real types instead.  Left as is when an annotation cannot be
+    evaluated from the handler's module (a class local to a function, say).
+    """
+    try:
+        wrapper.__signature__ = inspect.signature(func, eval_str=True)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return wrapper
+
+
 def _round_ms(value: float | None) -> float | None:
     return None if value is None else round(value, 2)
 
@@ -523,7 +541,7 @@ class PassiveProbe(BaseProbe):
                     raise
                 _on_success(result, started)
                 return result
-            return async_wrapper
+            return _resolved_signature(async_wrapper, func)
 
         @functools.wraps(func)
         def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -535,7 +553,7 @@ class PassiveProbe(BaseProbe):
                 raise
             _on_success(result, started)
             return result
-        return sync_wrapper
+        return _resolved_signature(sync_wrapper, func)
 
     async def check(self) -> ProbeResult:
         # Sync callables record from threadpool threads, so copy one consistent

@@ -5,7 +5,7 @@ from collections import deque
 from typing import Any, Callable
 
 from ..models import ProbeResult, ProbeStatus
-from .base import BaseProbe, _update_ema, _validate_stats_params
+from .base import BaseProbe, _resolved_signature, _update_ema, _validate_stats_params
 
 
 def _find_ws_param(func: Callable) -> str | None:
@@ -273,7 +273,7 @@ class FastAPIWebSocketProbe(BaseProbe):
 
         wrapper._fastapi_watch = "manual"
         wrapper._fastapi_watch_probe = self
-        return wrapper
+        return _resolved_signature(wrapper, func)
 
     # ------------------------------------------------------------------
     # BaseProbe interface
