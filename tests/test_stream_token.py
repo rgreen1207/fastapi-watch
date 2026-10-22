@@ -244,3 +244,61 @@ async def test_expired_stream_sends_nothing():
     registry.add(NoOpProbe(name="a"))
     events = [e async for e in registry._event_stream(_ConnectedRequest(), str, expires_at=time.time() - 1)]
     assert events == []
+
+
+# ---------------------------------------------------------------------------
+# Dashboard hardening: headers, off-loop render, token refresh
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("auth", [None, _APIKEY])
+@pytest.mark.parametrize("dashboard", [True, lambda report: "<html>custom</html>"])
+def test_dashboard_is_never_cached_sniffed_or_framed(auth, dashboard):
+    app = FastAPI()
+    HealthRegistry(app, auth=auth, poll_interval_ms=None, dashboard=dashboard)
+    resp = TestClient(app).get("/health/dashboard", headers=_HEADER)
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "no-store"
+    assert resp.headers["x-content-type-options"] == "nosniff"
+    assert resp.headers["x-frame-options"] == "DENY"
+    assert resp.headers["content-security-policy"] == "frame-ancestors 'none'"
+
+
+def test_builtin_dashboard_renders_off_the_event_loop(monkeypatch):
+    import threading
+
+    import fastapi_watch.registry as registry_module
+
+    threads = []
+    real = registry_module.render_dashboard
+
+    def _recording(*args, **kwargs):
+        threads.append(threading.current_thread().name)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(registry_module, "render_dashboard", _recording)
+    resp = TestClient(_app(None)).get("/health/dashboard")
+    assert resp.status_code == 200 and "data-stream-url" in resp.text
+    assert threads and threads[0].startswith("fastapi-watch")
+
+
+def test_stream_url_endpoint_returns_a_fresh_working_url():
+    client = TestClient(_app(_APIKEY))
+    resp = client.get("/health/dashboard/stream-url", headers=_HEADER)
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "no-store"
+    body = resp.json()
+    assert body["expires_at"] > time.time()
+    assert "view=dashboard" in body["stream_url"] and "token=" in body["stream_url"]
+    assert client.get(body["stream_url"]).status_code == 200  # no header, as from EventSource
+
+
+def test_stream_url_endpoint_needs_credentials_not_a_token():
+    client = TestClient(_app(_APIKEY))
+    token = _stream_url(client.get("/health/dashboard", headers=_HEADER).text).split("token=")[1]
+    assert client.get("/health/dashboard/stream-url").status_code == 403
+    # A leaked token must not be able to renew itself.
+    assert client.get(f"/health/dashboard/stream-url?token={token}").status_code == 403
+
+
+def test_stream_url_endpoint_absent_without_auth():
+    assert TestClient(_app(None)).get("/health/dashboard/stream-url").status_code in (404, 405)

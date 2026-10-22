@@ -23,6 +23,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel, Field
 from pydantic_core import to_json
 
+from ._executor import run_blocking
 from .alerts import BaseAlerter, WebhookAlerter
 from .dashboard import _current_probe, render_dashboard
 from .models import AlertRecord, HealthReport, ProbeResult, ProbeStatus
@@ -69,6 +70,13 @@ _WRITE_FLUSH_TIMEOUT_S = 2.0
 # alerts may take to send.
 _ACLOSE_TIMEOUT_S = 5.0
 _ALERT_DRAIN_TIMEOUT_S = 5.0
+# The dashboard page embeds a stream token: never cache it, sniff it, or frame it.
+_DASHBOARD_HEADERS = {
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": "frame-ancestors 'none'",
+}
 # Retry-After (seconds) sent when max_stream_connections streams are open.
 _STREAM_RETRY_AFTER_S = 30
 
@@ -2621,15 +2629,52 @@ class HealthRegistry:
                     )
             else:
 
-                def _renderer(report: HealthReport, maintenance: bool, request: Request, history: dict | None) -> str:
+                def _dashboard_stream(request: Request) -> tuple[str, int | None]:
+                    """The built-in page's stream URL, and when its token expires (None without auth)."""
                     # root_path carries any mount or proxy prefix the app is served
                     # under; without it the page would stream from the wrong URL.
                     root_path = request.scope.get("root_path", "").rstrip("/")
                     params = {"view": "dashboard"}  # slimmed events: only what the page reads
+                    expires_at = None
                     if token_key is not None:
-                        params["token"] = _mint_stream_token(token_key)
-                    stream_url = f"{root_path}{prefix}/status/stream?{urlencode(params)}"
-                    return render_dashboard(report, stream_url=stream_url, maintenance_banner=maintenance, history=history)
+                        params["token"] = token = _mint_stream_token(token_key)
+                        expires_at = int(token.partition(".")[0])
+                    return f"{root_path}{prefix}/status/stream?{urlencode(params)}", expires_at
+
+                # One render at a time, in fastapi-watch's own thread pool: a page
+                # with long history is CPU work (tens of ms, megabytes of HTML)
+                # that would otherwise block the app's event loop, and one
+                # thread keeps the pool free for blocking probe checks.
+                render_lock = asyncio.Lock()
+
+                async def _renderer(report: HealthReport, maintenance: bool, request: Request, history: dict | None) -> str:
+                    stream_url, _ = _dashboard_stream(request)
+                    render = functools.partial(
+                        render_dashboard, report, stream_url=stream_url, maintenance_banner=maintenance, history=history
+                    )
+                    async with render_lock:
+                        return await run_blocking(render)
+
+                if token_key is not None:
+
+                    @self.app.get(
+                        f"{prefix}/dashboard/stream-url",
+                        tags=tags,
+                        summary="Fresh dashboard stream URL",
+                        description=(
+                            "Returns the dashboard's live-update stream URL with a newly minted token, "
+                            "``{\"stream_url\": ..., \"expires_at\": <unix time>}``, so an open page can "
+                            "reconnect without reloading.  Requires the configured credentials; a stream "
+                            "token is not accepted here, so a leaked token cannot renew itself."
+                        ),
+                        dependencies=auth_deps,
+                    )
+                    async def dashboard_stream_url(request: Request) -> Response:
+                        stream_url, expires_at = _dashboard_stream(request)
+                        return JSONResponse(
+                            {"stream_url": stream_url, "expires_at": expires_at},
+                            headers={"Cache-Control": "no-store"},
+                        )
 
             @self.app.get(
                 f"{prefix}/dashboard",
@@ -2649,4 +2694,7 @@ class HealthRegistry:
                 history = await registry._storage_call("get_history") if builtin_dashboard else None
                 if history is _STORAGE_FAILED:
                     history = {}  # the page still renders, from live results only
-                return HTMLResponse(content=_renderer(report, registry._in_maintenance(), request, history))
+                content = _renderer(report, registry._in_maintenance(), request, history)
+                if inspect.isawaitable(content):
+                    content = await content
+                return HTMLResponse(content=content, headers=_DASHBOARD_HEADERS)
