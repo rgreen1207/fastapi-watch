@@ -237,9 +237,14 @@ class FastAPIWebSocketProbe(BaseProbe):
         async def wrapper(*args: Any, **kwargs: Any) -> Any:  # type: ignore[return]
             ws_instance = kwargs.get(ws_param) if ws_param else None
             if ws_instance is None:
+                # FastAPI passes parameters by keyword, and a string annotation
+                # (``from __future__ import annotations``) hides the type from
+                # _find_ws_param, so look for the socket among all arguments.
                 try:
                     from fastapi import WebSocket
-                    ws_instance = next((a for a in args if isinstance(a, WebSocket)), None)
+                    ws_instance = next(
+                        (a for a in (*args, *kwargs.values()) if isinstance(a, WebSocket)), None
+                    )
                 except ImportError:
                     pass
             if ws_instance is not None:
