@@ -1715,6 +1715,8 @@ class HealthRegistry:
 
         for sig in (_signal.SIGTERM, _signal.SIGINT):
             existing_handler = _signal.getsignal(sig)
+            if existing_handler is None:
+                continue  # installed outside Python: it could not be restored or chained to
 
             def _make_handler(existing):
                 def _chained(signum, frame):
@@ -1724,6 +1726,11 @@ class HealthRegistry:
                     # Delegate to uvicorn's handler so it still shuts down.
                     if callable(existing):
                         existing(signum, frame)
+                    elif existing == _signal.SIG_DFL:
+                        # The default action (terminate) has no function to call:
+                        # restore it and re-raise, or the signal would be ignored.
+                        _signal.signal(signum, _signal.SIG_DFL)
+                        _signal.raise_signal(signum)
                 return _chained
 
             try:

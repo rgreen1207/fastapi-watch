@@ -1,6 +1,9 @@
 """User callbacks and storage errors must not break health checks or polling."""
 import asyncio
 import signal
+import subprocess
+import sys
+import textwrap
 
 import httpx
 import pytest
@@ -165,6 +168,28 @@ def test_signal_handler_without_a_running_loop_only_sets_the_flag(monkeypatch):
     installed[signal.SIGINT](signal.SIGINT, None)
     assert registry._shutting_down is True
     assert chained_to == [signal.SIGINT]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")
+def test_signal_hook_keeps_default_sigterm_fatal():
+    # With no Python handler (SIG_DFL), the hook used to swallow SIGTERM: the
+    # process kept running until SIGKILL.
+    script = textwrap.dedent("""
+        import asyncio, os, signal
+        from fastapi import FastAPI
+        from fastapi_watch import HealthRegistry
+
+        async def main():
+            HealthRegistry(FastAPI()).set_started()
+            os.kill(os.getpid(), signal.SIGTERM)
+            await asyncio.sleep(2)
+            print("survived")
+
+        asyncio.run(main())
+    """)
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30)
+    assert "survived" not in proc.stdout
+    assert proc.returncode == -signal.SIGTERM
 
 
 # ---------------------------------------------------------------------------
