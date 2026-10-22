@@ -142,7 +142,7 @@ def test_page_with_many_routes_and_full_history_stays_small():
     history = _request_metrics_history()
     html = render_dashboard(HealthReport.from_results([history[-1]]), stream_url="/s",
                             history={"request_metrics": history})
-    assert len(html.encode()) < 300_000
+    assert len(html.encode()) < 200_000  # 215 KB while older entries kept every charted route field
 
 
 def test_embedded_history_keeps_only_charted_fields():
@@ -160,8 +160,10 @@ def test_embedded_history_keeps_only_charted_fields():
         assert set(point["details"]) <= _POINT_DETAIL_KEYS
         # The same busiest routes of the newest entry in every entry, so each line spans the history.
         assert list(point["details"]["routes"]) == top
+        # The newest entry feeds the route labels and ranking; older ones only the p95 line.
+        keys = _ROUTE_KEYS if point is points[-1] else {"p95_rtt_ms"}
         for stats in point["details"]["routes"].values():
-            assert set(stats) == _ROUTE_KEYS
+            assert set(stats) == keys
     assert points[-1]["details"]["p95_rtt_ms"] == 40.25
     assert points[-1]["details"]["routes"][top[0]]["p95_rtt_ms"] == 40.25
 

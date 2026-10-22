@@ -226,6 +226,8 @@ _CHART_DETAIL_FIELDS = (
 )
 # Per-route fields the routes section reads (topRoutes() ranks, drawRoutes() charts and labels).
 _CHART_ROUTE_FIELDS = ("request_count", "p95_rtt_ms", "error_rate", "requests_per_minute")
+# The only one it reads from older entries: their p95 line.
+_CHART_ROUTE_HISTORY_FIELDS = ("p95_rtt_ms",)
 # Routes charted; matches TOP_ROUTES in dashboard.js.
 _CHART_ROUTES = 8
 # Newest results embedded per probe; matches MAX_POINTS in dashboard.js.
@@ -241,10 +243,10 @@ def _top_routes(routes: dict) -> list[str]:
     return sorted(routes, key=lambda path: (-count(path), path))[:_CHART_ROUTES]
 
 
-def _slim_routes(routes: dict, keep: list[str]) -> dict:
-    """*routes* reduced to the paths in *keep*, each with only the fields the charts read."""
+def _slim_routes(routes: dict, keep: list[str], fields: tuple[str, ...] = _CHART_ROUTE_FIELDS) -> dict:
+    """*routes* reduced to the paths in *keep*, each with only *fields* (by default all the charts read)."""
     return {
-        path: {field: _finite(routes[path][field]) for field in _CHART_ROUTE_FIELDS if field in routes[path]}
+        path: {field: _finite(routes[path][field]) for field in fields if field in routes[path]}
         for path in keep
         if isinstance(routes.get(path), dict)
     }
@@ -255,18 +257,21 @@ def _chart_history(results: list[ProbeResult]) -> list[dict]:
 
     Routes are cut to the busiest few of the newest breakdown — the ones the
     page charts — and kept under the same paths in every entry so each chart
-    line covers the whole history.  At most the newest ``_MAX_CHART_POINTS``
-    results are kept, as the page itself keeps no more.
+    line covers the whole history; older entries carry only the charted p95.
+    At most the newest ``_MAX_CHART_POINTS`` results are kept, as the page
+    itself keeps no more.
     """
     results = results[-_MAX_CHART_POINTS:]
     keep: list[str] = []
-    for result in reversed(results):
-        routes = (result.details or {}).get("routes")
+    newest_routes = -1
+    for index in range(len(results) - 1, -1, -1):
+        routes = (results[index].details or {}).get("routes")
         if isinstance(routes, dict):
             keep = _top_routes(routes)
+            newest_routes = index
             break
     points = []
-    for result in results:
+    for index, result in enumerate(results):
         point: dict[str, Any] = {
             "checked_at": result.checked_at.isoformat() if result.checked_at else None,
             "status": result.status.value,
@@ -276,7 +281,8 @@ def _chart_history(results: list[ProbeResult]) -> list[dict]:
         slim = {field: _finite(details[field]) for field in _CHART_DETAIL_FIELDS if field in details}
         routes = details.get("routes")
         if isinstance(routes, dict):
-            slim["routes"] = _slim_routes(routes, keep)
+            fields = _CHART_ROUTE_FIELDS if index == newest_routes else _CHART_ROUTE_HISTORY_FIELDS
+            slim["routes"] = _slim_routes(routes, keep, fields)
         if slim:
             point["details"] = slim
         points.append(point)
