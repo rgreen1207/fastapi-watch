@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import contextlib
 import fnmatch
 import functools
 import hashlib
@@ -14,7 +15,7 @@ import time
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, AsyncGenerator, Awaitable, Callable, Iterator, Literal
+from typing import Any, AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator, Literal
 from urllib.parse import urlencode, urlsplit
 from zoneinfo import ZoneInfo
 
@@ -780,7 +781,7 @@ class HealthRegistry:
 
         if serve_routes:
             self._register_routes(tags or ["health"], dashboard=dashboard)
-        self.app.router.on_shutdown.append(self._shutdown)
+        self._hook_lifespan()
         for group in groups or []:
             self.include(group)
 
@@ -793,6 +794,27 @@ class HealthRegistry:
                 "set_maintenance()/clear_maintenance() or pass auth= to HealthRegistry.",
                 prefix,
             )
+
+    def _hook_lifespan(self) -> None:
+        """Run :meth:`_shutdown` when the app's lifespan ends.
+
+        ``router.on_shutdown`` is skipped whenever the app has a ``lifespan=``,
+        so queued alerts, pending storage writes and probe ``aclose()`` were
+        dropped there.  Wrapping the lifespan context covers both forms, and
+        runs before the application's own teardown, while the clients it
+        closes (a shared Redis, say) are still open for the final writes.
+        """
+        original = self.app.router.lifespan_context
+
+        @contextlib.asynccontextmanager
+        async def _lifespan(app: Any) -> AsyncIterator[Any]:
+            async with original(app) as state:
+                try:
+                    yield state
+                finally:
+                    await self._shutdown()
+
+        self.app.router.lifespan_context = _lifespan
 
     def _configure_storage(self, retention: dict, passed: dict) -> None:
         """Apply explicitly passed retention arguments to a caller-supplied *storage*.
@@ -1466,13 +1488,28 @@ class HealthRegistry:
         hung check would otherwise hang every one of them.
         """
         timeout = probe.timeout if probe.timeout is not None else self._probe_timeout
+        loop = asyncio.get_running_loop()
+        started = loop.time()
         try:
             coro = probe.check()
             result = await asyncio.wait_for(coro, timeout) if timeout is not None else await coro
             if not isinstance(result, ProbeResult):
                 # Left unchecked, one buggy custom probe turned every endpoint into a 500.
                 raise TypeError(f"check() returned {type(result).__name__}, not ProbeResult")
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
+            # Since Python 3.11 asyncio.TimeoutError is the builtin TimeoutError,
+            # which a probe raises itself on a connect or read timeout.  Only the
+            # deadline expiring is reported as one: formatting a None timeout
+            # turned every health endpoint into a 500.
+            if timeout is None or loop.time() - started < timeout:
+                if self._logger:
+                    self._logger.exception("Probe %r raised an unhandled %s", probe.name, type(exc).__name__)
+                return ProbeResult(
+                    name=probe.name,
+                    status=ProbeStatus.UNHEALTHY,
+                    critical=critical,
+                    error=_failure_message(probe.name, exc),
+                )
             if self._logger:
                 self._logger.warning("Probe %r timed out after %g s", probe.name, timeout)
             return ProbeResult(
