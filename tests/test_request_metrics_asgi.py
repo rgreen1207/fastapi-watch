@@ -196,6 +196,30 @@ async def test_send_failing_mid_response_keeps_the_status_already_sent():
 
 
 @pytest.mark.asyncio
+async def test_server_refusing_the_response_is_still_a_500():
+    """Only an OSError from send means the client hung up.  The server
+    rejecting what the app sent (h11 raises LocalProtocolError for a header
+    value with a newline, and the client gets no response) is a server error."""
+    class LocalProtocolError(Exception):
+        pass
+
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": [(b"x-bad", b"a\nb")]})
+        await send({"type": "http.response.body", "body": b"x"})
+
+    async def send(message):
+        raise LocalProtocolError("Illegal header value")
+
+    middleware = RequestMetricsMiddleware(app)
+    with pytest.raises(LocalProtocolError):
+        await middleware(_http_scope(), _receive, send)
+
+    snap = middleware._aggregate.snapshot()
+    assert snap["request_count"] == 1
+    assert snap["error_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_unhandled_exception_after_response_start_is_still_a_500():
     async def app(scope, receive, send):
         await send({"type": "http.response.start", "status": 200, "headers": []})

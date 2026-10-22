@@ -335,8 +335,10 @@ class RequestMetricsMiddleware:
                 return
             try:
                 await send(message)
-            except Exception:
-                client_gone = True  # the server could not deliver it: the client hung up
+            except OSError:
+                # ASGI servers raise an OSError subclass when the client has gone.
+                # Anything else (h11 refusing an invalid header) is a server error.
+                client_gone = True
                 raise
 
         try:
