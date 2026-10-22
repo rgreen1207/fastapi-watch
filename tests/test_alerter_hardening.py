@@ -179,3 +179,125 @@ async def test_alert_loop_survives_and_drains_on_dispatch_error(caplog):
     assert not registry._alert_worker.done()
     assert any("Dispatching alert" in r.getMessage() for r in caplog.records)
     await registry._shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Misconfiguration fails at startup, without echoing secrets
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("url", [
+    "https://user:s3cret-pw@hooks.example.com/hook",
+    "https://s3cret-pw@hooks.example.com/hook",
+    "https://hooks.example.com:443@evil.example.com/hook",
+])
+def test_credentials_in_webhook_url_rejected_without_echo(url):
+    # urllib takes "user:pw@host" as the host: every post failed with
+    # InvalidURL("nonnumeric port: 's3cret-pw@...'"), logged with each alert.
+    with pytest.raises(ValueError, match="credentials") as excinfo:
+        WebhookAlerter(url=url)
+    assert "s3cret-pw" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("value", ["Bearer s3cret-token\n", "Bearer s3cret-token\r\nX-Injected: 1", "s3cret-token\x00"])
+def test_webhook_header_with_line_break_rejected_without_echo(value):
+    # A token read from a file keeps its trailing newline; http.client then
+    # refused every post with "Invalid header value b'Bearer s3cret-token\n'".
+    with pytest.raises(ValueError, match="Authorization") as excinfo:
+        WebhookAlerter(url="https://hooks.example.com/hook", headers={"Authorization": value})
+    assert "s3cret-token" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("name", ["", "X:Y", "X Y\n", " X"])
+def test_invalid_webhook_header_name_rejected(name):
+    with pytest.raises(ValueError, match="header name"):
+        WebhookAlerter(url="https://hooks.example.com/hook", headers={name: "v"})
+
+
+def test_non_latin1_webhook_header_value_rejected():
+    with pytest.raises(ValueError, match="Latin-1"):
+        WebhookAlerter(url="https://hooks.example.com/hook", headers={"X-Token": "café’"})
+
+
+def test_valid_webhook_headers_accepted():
+    alerter = WebhookAlerter(
+        url="https://hooks.example.com/hook",
+        headers={"Authorization": "Bearer abc.def-123", "X-Request-Source": "fastapi-watch café",
+                 "X-Retries": 3, "X-Raw": b"raw"},
+    )
+    assert alerter.headers["Authorization"] == "Bearer abc.def-123"
+
+
+def test_accepted_headers_are_sendable(local_server):
+    alerter = WebhookAlerter(url="https://hooks.example.com/hook", headers={"X-Retries": 3, "X-Raw": b"raw"})
+    alerts._post_json(f"{local_server}/ok", b"{}", 2, alerter.headers)
+    assert _Handler.hits == ["/ok"]
+
+
+def test_bytes_header_value_with_newline_rejected_without_echo():
+    with pytest.raises(ValueError, match="X-Token") as excinfo:
+        WebhookAlerter(url="https://hooks.example.com/hook", headers={"X-Token": b"s3cret-token\n"})
+    assert "s3cret-token" not in str(excinfo.value)
+
+
+def test_opsgenie_api_key_with_newline_rejected_without_echo():
+    with pytest.raises(ValueError, match="trailing newline") as excinfo:
+        alerts.OpsGenieAlerter(api_key="genie-s3cret\n")
+    assert "genie-s3cret" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("make", [
+    lambda: WebhookAlerter(url="https://hooks.invalid/hook", headers={"Authorization": "Bearer s3cret\n"}),
+    lambda: WebhookAlerter(url="https://user:s3cret@hooks.invalid/hook"),
+    lambda: alerts.OpsGenieAlerter(api_key="s3cret\n"),
+], ids=["header", "userinfo", "opsgenie"])
+def test_misconfigured_alerters_never_leak_secrets_into_alert_logs(make, caplog, monkeypatch):
+    # Each of these used to construct, then fail every post -- before any
+    # connection -- with an error quoting the secret, logged per alert.
+    monkeypatch.setattr(alerts._OPENER, "open", urllib.request.OpenerDirector.open.__get__(alerts._OPENER))
+    try:
+        alerter = make()
+    except ValueError as exc:
+        assert "s3cret" not in str(exc)
+        return
+    registry = HealthRegistry(FastAPI(), alerters=[alerter], serve_routes=False)
+    with caplog.at_level("WARNING", logger="fastapi_watch"):
+        asyncio.run(registry._dispatch_alert(_alert()))
+    logged = "\n".join(f"{r.getMessage()} {r.exc_info and r.exc_info[1]!r}" for r in caplog.records)
+    assert "s3cret" not in logged
+
+
+_ALERTER_FACTORIES = {
+    "webhook": lambda t: WebhookAlerter(url="https://hooks.example.com/hook", timeout=t),
+    "slack": lambda t: alerts.SlackAlerter(webhook_url="https://hooks.slack.com/services/x", timeout=t),
+    "teams": lambda t: alerts.TeamsAlerter(webhook_url="https://outlook.office.com/webhook/x", timeout=t),
+    "pagerduty": lambda t: alerts.PagerDutyAlerter(routing_key="k" * 32, timeout=t),
+    "opsgenie": lambda t: alerts.OpsGenieAlerter(api_key="key", timeout=t),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_ALERTER_FACTORIES))
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+def test_alerter_rejects_timeouts_that_fail_every_post(kind, timeout):
+    # 0, negative and NaN made every post fail; inf overflowed the deadline's
+    # timer thread.  Each alert was then dropped with only a warning.
+    with pytest.raises(ValueError, match="timeout"):
+        _ALERTER_FACTORIES[kind](timeout)
+
+
+@pytest.mark.parametrize("kind", sorted(_ALERTER_FACTORIES))
+@pytest.mark.parametrize("timeout", [None, 0.5, 5, 30.0])
+def test_alerter_accepts_valid_timeouts(kind, timeout):
+    assert _ALERTER_FACTORIES[kind](timeout).timeout == timeout
+
+
+@pytest.mark.asyncio
+async def test_full_alert_queue_is_logged_without_a_logger(caplog):
+    # Without logger= a dropped alert left no trace at all.
+    registry = HealthRegistry(FastAPI(), alerters=[_Recording()], serve_routes=False)
+    registry._alert_queue = asyncio.Queue(maxsize=1)
+    registry._alert_queue.put_nowait(_alert("other"))
+    registry._ensure_alert_worker = lambda: None  # keep the queue full
+    with caplog.at_level("WARNING", logger="fastapi_watch"):
+        registry._send_to_alerters("db", ProbeStatus.UNHEALTHY, None)
+    assert "db" not in registry._alerted_states  # retried at the next check
+    assert any("alert queue full" in r.getMessage() and "'db'" in r.getMessage() for r in caplog.records)
