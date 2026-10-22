@@ -54,6 +54,19 @@ def _payload(member: Any) -> Any:
     return member[member.index(":") + 1:]
 
 
+def _decode(model: Any, raw: Any, *, tagged: bool = False) -> Any:
+    """Parse one stored value as *model*, or None if this version cannot read it.
+
+    Other versions may share the prefix (a rolling deploy) and write values
+    this one does not know, e.g. a new status; one such entry must not fail
+    every read until it ages out.
+    """
+    try:
+        return model.model_validate_json(_payload(raw) if tagged else raw)
+    except ValueError:  # includes pydantic's ValidationError
+        return None
+
+
 def _score(moment: Any) -> float:
     return moment.timestamp() if moment is not None else time.time()
 
@@ -258,10 +271,8 @@ class RedisProbeStorage:
     async def get_latest(self, name: str) -> ProbeResult | None:
         async with self._slot():
             raw = await self._redis.get(self._latest_key(name))
-        if raw is None:
-            return None
-        result = ProbeResult.model_validate_json(raw)
-        return result if self._fresh(result, time.time()) else None
+        result = _decode(ProbeResult, raw) if raw is not None else None
+        return result if result is not None and self._fresh(result, time.time()) else None
 
     async def get_all_latest(self) -> dict[str, ProbeResult]:
         now = time.time()
@@ -272,10 +283,9 @@ class RedisProbeStorage:
             values = await self._redis.mget([self._latest_key(n) for n in names])
         out: dict[str, ProbeResult] = {}
         for name, raw in zip(names, values):
-            if raw is not None:
-                result = ProbeResult.model_validate_json(raw)
-                if self._fresh(result, now):
-                    out[name] = result
+            result = _decode(ProbeResult, raw) if raw is not None else None
+            if result is not None and self._fresh(result, now):
+                out[name] = result
         return out
 
     async def set_latest(self, result: ProbeResult) -> None:
@@ -349,11 +359,12 @@ class RedisProbeStorage:
                 for name in names:
                     pipe.zrevrangebyscore(self._history_key(name), "+inf", cutoff, start=0, num=self._max_results)
                 replies = await pipe.execute()
-        return {
-            name: [ProbeResult.model_validate_json(_payload(m)) for m in reversed(members)]
-            for name, members in zip(names, replies)
-            if members
-        }
+        history = {}
+        for name, members in zip(names, replies):
+            entries = [r for r in (_decode(ProbeResult, m, tagged=True) for m in reversed(members)) if r is not None]
+            if entries:
+                history[name] = entries
+        return history
 
     # ----------------------------------------------------------------- alerts
 
@@ -377,7 +388,8 @@ class RedisProbeStorage:
             members = await self._redis.zrevrangebyscore(
                 self._alerts_key, "+inf", cutoff, start=0, num=self._max_alerts
             )
-        return [AlertRecord.model_validate_json(_payload(m)) for m in reversed(members)]
+        alerts = (_decode(AlertRecord, m, tagged=True) for m in reversed(members))
+        return [a for a in alerts if a is not None]
 
     async def claim_alert(self, key: str, value: str, ttl_seconds: float) -> bool:
         """Store *value* under *key* for *ttl_seconds*; return False only if the
