@@ -1423,8 +1423,7 @@ class HealthRegistry:
             await self._fire_state_changes([result])
             return result
         self._last_checked_at = checked_at
-        if result.name == probe.name:  # only ever forget a name both registered and written here
-            self._written_names.add(result.name)
+        self._written_names.add(result.name)  # always probe.name (see _guarded_check)
         await asyncio.gather(self._store_result(result), self._fire_state_changes([result]))
         return result
 
@@ -1576,7 +1575,16 @@ class HealthRegistry:
                 critical=critical,
                 error=_failure_message(probe.name, exc),
             )
-        return result if result.critical == critical else result.model_copy(update={"critical": critical})
+        # The result is filed under the registered name.  A check returning another
+        # name (e.g. an inner probe's result passed through) was stored under that
+        # name, which the registry never forgets: a name that changed per check
+        # added keys to storage without bound.
+        updates: dict = {}
+        if result.name != probe.name:
+            updates["name"] = probe.name
+        if result.critical != critical:
+            updates["critical"] = critical
+        return result.model_copy(update=updates) if updates else result
 
     async def _check_startup_probes(self) -> list[ProbeResult]:
         """Check every startup probe, joining a check already in flight.

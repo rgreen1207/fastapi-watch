@@ -28,6 +28,7 @@ Most fixes need no action. These change what you see or what is accepted:
 - **`RabbitMQProbe` reports the 50 deepest queues**, not every queue; **`KafkaProbe`** now actually reports `broker_count`/`controller_id` and lists at most 100 topics plus `topic_count`.
 - **`EventLoopProbe(sample_interval_ms=...)` below 1 raises `ValueError`**; `alert_dedupe_window_s` and `alert_min_interval_s` must be finite.
 - **A custom `check()` that returns something other than a `ProbeResult`** is reported as that probe's `UNHEALTHY` result instead of failing every health endpoint with `500`.
+- **A result is always filed under its probe's registered name.** A `check()` returning a `ProbeResult` with another `name` is now reported, stored and alerted under the probe's name.
 - **The dashboard is served with `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and `frame-ancestors 'none'`.**
 - **The built-in dashboard sends a strict `Content-Security-Policy`**: only its own script runs (by a per-page nonce), and it connects only to its own origin. A proxy that injects scripts into HTML pages will find them blocked there. Custom dashboards keep `frame-ancestors 'none'` only.
 - **`/health/metrics` writes non-finite values as `NaN`, `+Inf`, `-Inf`**, as the Prometheus text format spells them, and a non-numeric value as `NaN`.
@@ -49,6 +50,11 @@ Most fixes need no action. These change what you see or what is accepted:
 - **Shutdown never ran for apps with a `lifespan=`.** Starlette skips `on_shutdown` handlers once an app has its own lifespan, which is how every documented example is set up, so queued alerts were dropped, background storage writes abandoned, and probe `aclose()` never called. The registry now wraps the app's lifespan and shuts down before the app's own teardown. Each lifespan also starts it afresh: after one shutdown, streams of a second run in the same process (`with TestClient(app)` per test) returned nothing and alerts stopped.
 - **Unauthenticated clients could make the app parse arbitrary JSON.** FastAPI reads and parses a declared request body before any dependency runs, so `POST /health/maintenance` parsed bodies of any size on the event loop before checking credentials (40 MB took 0.6 s). The body is now read after authentication and capped at 4 KiB.
 - **Concurrent `/health/startup` requests share one check.** Each request ran every startup probe, so a burst of requests (from anyone, with `auth=None`) became that many concurrent checks of each startup dependency.
+
+#### Third review round: storage
+
+- **Storage no longer grows with a renamed result.** A probe whose `check()` returned a result under another name (an inner probe's result passed through, or a name that changed per check) was stored under that name, which the registry never forgets: each new name left a latest-result key and a history key behind until `result_ttl_seconds`, or forever with `result_ttl_seconds=0` (200 checks wrote 401 Redis keys). Results are now filed under the probe's registered name.
+- **One unreadable entry no longer fails history.** A history entry, alert or latest result that `RedisProbeStorage` could not parse (written by a newer version sharing the prefix during a rolling deploy, e.g. with a new status value, or corrupted) made every read raise, so `/health/history` and `/health/alerts` answered `503` until it aged out. Such entries are skipped.
 
 #### Second review round
 

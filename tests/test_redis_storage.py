@@ -662,3 +662,52 @@ async def test_many_probes_do_not_exhaust_a_shared_pool(prefix):
         assert len(await storage.get_history()) == 40
     finally:
         await shared.aclose()
+
+
+async def test_unreadable_entries_are_skipped_not_fatal(client, spy, prefix):
+    # An entry this version cannot decode (a newer version sharing the prefix
+    # during a rolling deploy, e.g. with a new status value, or a corrupted
+    # one) made every read raise: /health/history and /health/alerts answered
+    # 503 until it aged out, which with TTL 0 meant until enough newer entries
+    # pushed it out.
+    store = _store(spy, prefix, result_ttl_seconds=0, alert_ttl_seconds=0)
+    await store.set_latest(_result(name="bad"))
+    await store.append_history(_result())
+    await store.append_alert(_alert())
+    now = time.time()
+    unknown = _result().model_dump_json().replace('"healthy"', '"unknown"')
+    await client.zadd(f"{prefix}:history:db", {f"zz:{unknown}": now, "no-tag": now, "zy:{not json": now})
+    await client.zadd(f"{prefix}:alerts", {"zz:" + _alert().model_dump_json().replace('"unhealthy"', '"x"'): now})
+    await client.set(f"{prefix}:latest:bad", "{not json")
+    assert [r.status for r in (await store.get_history())["db"]] == [ProbeStatus.HEALTHY]
+    assert len(await store.get_alerts()) == 1
+    assert await store.get_latest("bad") is None
+    assert await store.get_all_latest() == {}
+
+    app = FastAPI()
+    HealthRegistry(app, storage=store, poll_interval_ms=None)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http:
+        assert (await http.get("/health/history")).status_code == 200
+        assert (await http.get("/health/alerts")).status_code == 200
+
+
+async def test_result_named_differently_is_stored_under_the_probe_name(client, spy, prefix):
+    # A check returning another name (here a new one each time) was stored
+    # under that name, which the registry never forgets: two more keys per
+    # check, with no expiry at result_ttl_seconds=0.
+    class Renaming(NoOpProbe):
+        calls = 0
+
+        async def check(self):
+            Renaming.calls += 1
+            return ProbeResult(name=f"inner-{Renaming.calls}", status=ProbeStatus.HEALTHY)
+
+    registry = HealthRegistry(FastAPI(), storage=_store(spy, prefix), poll_interval_ms=None, result_ttl_seconds=0)
+    registry.add(Renaming(name="composite"))
+    for _ in range(20):
+        await registry.run_all()
+        await registry._flush_writes()
+    assert await _keys(client, prefix) == [
+        f"{prefix}:history:composite", f"{prefix}:latest:composite", f"{prefix}:names",
+    ]
+    assert [r.name for r in (await _store(spy, prefix).get_history())["composite"]] == ["composite"] * 20
