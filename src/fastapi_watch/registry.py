@@ -177,6 +177,21 @@ def _name_slug(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9_\-.]+", "_", text).strip("_")
 
 
+def _installed_original(endpoint) -> Callable | None:
+    """Return the handler a monitoring wrapper installed by this module wraps, else ``None``.
+
+    Only that wrapper is ever unwrapped.  Following ``__wrapped__`` on any
+    callable would also strip the application's own ``functools.wraps``
+    decorators (authentication, rate limiting) and install the bare handler,
+    serving it unprotected.  The wrapper is recognised by identity, not by a
+    marker attribute: ``functools.wraps`` copies ``__dict__``, so a user
+    decorator applied over a monitored function carries the same attributes.
+    """
+    if endpoint is not None and getattr(endpoint, "_fastapi_watch_installed", None) is endpoint:
+        return endpoint.__wrapped__
+    return None
+
+
 def _is_health_handler(endpoint) -> bool:
     """True for route handlers that a HealthRegistry mounted itself.
 
@@ -184,16 +199,20 @@ def _is_health_handler(endpoint) -> bool:
     registry's, or a registry mounted at the root where no prefix can tell
     them apart from application routes.
     """
-    endpoint = getattr(endpoint, "__wrapped__", endpoint)
+    endpoint = _installed_original(endpoint) or endpoint
     return getattr(endpoint, "__qualname__", "").startswith(f"{HealthRegistry.__name__}._register_routes.")
 
 
 def _endpoint_keys(route) -> set:
-    """The route's endpoint and, if fastapi-watch wrapped it, the original function."""
+    """The route's endpoint and, if this module wrapped it for monitoring, the original handler.
+
+    A user decorator's inner function is not a key: two routes serving the
+    same function under different decorators are different routes.
+    """
     endpoint = getattr(route, "endpoint", None)
     if endpoint is None:
         return set()
-    return {endpoint, getattr(endpoint, "__wrapped__", endpoint)}
+    return {endpoint, _installed_original(endpoint) or endpoint}
 
 
 _STREAM_TOKEN_TTL_S = 300
@@ -1108,11 +1127,13 @@ class HealthRegistry:
             else:
                 probe = FastAPIRouteProbe(name=name, description=description, tags=probe_tags, **probe_kwargs)
 
-            # Watch the original function so re-monitoring never double-wraps.
-            wrapped = probe.watch(getattr(route.endpoint, "__wrapped__", route.endpoint))
+            # Re-monitoring wraps the original handler (with every decorator the
+            # application put on it), never our previous wrapper: no double wrap.
+            wrapped = probe.watch(_installed_original(route.endpoint) or route.endpoint)
             try:
                 wrapped._fastapi_watch = marker
                 wrapped._fastapi_watch_probe = probe
+                wrapped._fastapi_watch_installed = wrapped
                 route.dependant.call = wrapped
                 # FastAPI 0.137+ builds its request context from route.endpoint.
                 route.endpoint = wrapped
