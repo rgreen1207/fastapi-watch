@@ -653,6 +653,7 @@ async def test_forget_failure_is_contained_and_retried():
     registry = HealthRegistry(FastAPI(), storage=_BrokenStorage(), poll_interval_ms=None)
     registry.add(NoOpProbe(name="db"))
     await registry.run_all()  # writes fail, but may have landed: the name is tracked
+    await registry._flush_writes()  # forget skips names whose background write is in flight
     _without(registry, "db")
     await registry._forget_unregistered()  # must not raise
     assert "forget" in registry._storage.calls
@@ -674,6 +675,7 @@ async def test_storage_without_forget_is_fine():
     registry.add(NoOpProbe(name="db"))
     await registry._get_results()
     await asyncio.sleep(0)
+    await registry._flush_writes()  # forget skips names whose background write is in flight
     assert registry._last_forget is not None
     _without(registry, "db")
     await registry._forget_unregistered()
