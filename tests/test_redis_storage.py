@@ -662,3 +662,25 @@ async def test_many_probes_do_not_exhaust_a_shared_pool(prefix):
         assert len(await storage.get_history()) == 40
     finally:
         await shared.aclose()
+
+
+async def test_result_named_differently_is_stored_under_the_probe_name(client, spy, prefix):
+    # A check returning another name (here a new one each time) was stored
+    # under that name, which the registry never forgets: two more keys per
+    # check, with no expiry at result_ttl_seconds=0.
+    class Renaming(NoOpProbe):
+        calls = 0
+
+        async def check(self):
+            Renaming.calls += 1
+            return ProbeResult(name=f"inner-{Renaming.calls}", status=ProbeStatus.HEALTHY)
+
+    registry = HealthRegistry(FastAPI(), storage=_store(spy, prefix), poll_interval_ms=None, result_ttl_seconds=0)
+    registry.add(Renaming(name="composite"))
+    for _ in range(20):
+        await registry.run_all()
+        await registry._flush_writes()
+    assert await _keys(client, prefix) == [
+        f"{prefix}:history:composite", f"{prefix}:latest:composite", f"{prefix}:names",
+    ]
+    assert [r.name for r in (await _store(spy, prefix).get_history())["composite"]] == ["composite"] * 20

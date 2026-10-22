@@ -589,7 +589,9 @@ async def test_shared_storage_two_apps_keep_each_others_data():
 
 
 @pytest.mark.asyncio
-async def test_result_named_differently_from_its_probe_is_not_tracked():
+async def test_result_named_differently_from_its_probe_is_filed_under_the_probe():
+    # Neither written nor tracked (so never forgotten) under the other name,
+    # which may be another app's probe on a shared backend.
     class _Renaming(BaseProbe):
         name = "mine"
 
@@ -599,7 +601,8 @@ async def test_result_named_differently_from_its_probe_is_not_tracked():
     registry = HealthRegistry(FastAPI(), poll_interval_ms=None)
     registry.add(_Renaming())
     await registry.run_all()
-    assert registry._written_names == set()
+    assert registry._written_names == {"mine"}
+    assert set(await registry._storage.get_history()) == {"mine"}
 
 
 @pytest.mark.asyncio
