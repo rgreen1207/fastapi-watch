@@ -252,7 +252,7 @@ registry = HealthRegistry(app, circuit_breaker=False)
 Per-probe override:
 
 ```python
-probe = PostgreSQLProbe(url="postgresql://...")
+probe = TCPProbe(host="db.internal", port=5432)
 probe.circuit_breaker_threshold = 2
 probe.circuit_breaker_cooldown_ms = 60_000
 registry.add(probe)
@@ -368,8 +368,8 @@ from fastapi_watch import ProbeGroup
 from fastapi_watch.probes import PostgreSQLProbe, RedisProbe
 
 router = ProbeGroup()
-router.add(PostgreSQLProbe(url="postgresql://user:pass@db.internal/app"))
-router.add(RedisProbe(url="redis://cache.internal:6379"), critical=False)
+router.add(PostgreSQLProbe(name="postgres"))
+router.add(RedisProbe(name="redis"), critical=False)
 ```
 
 ```python
@@ -413,8 +413,8 @@ router.include(payments_router)
 
 ```python
 db_probes = ProbeGroup(tags=["database"])
-db_probes.add(PostgreSQLProbe(url="postgresql://..."))
-db_probes.add(RedisProbe(url="redis://..."), critical=False)
+db_probes.add(PostgreSQLProbe(name="postgres"))
+db_probes.add(RedisProbe(name="redis"), critical=False)
 
 # Both probes now carry the "database" tag
 registry = HealthRegistry(app, groups=[db_probes])
@@ -456,11 +456,11 @@ registry = HealthRegistry(app)
 Pass `startup_probes` to also require specific checks before the gate opens:
 
 ```python
-from fastapi_watch.probes import PostgreSQLProbe
+from fastapi_watch.probes import TCPProbe
 
 registry = HealthRegistry(
     app,
-    startup_probes=[PostgreSQLProbe(url="postgresql://...")],
+    startup_probes=[TCPProbe(host="db.internal", port=5432)],
 )
 ```
 
@@ -775,15 +775,15 @@ registry.add(S3BucketProbe("my-backups", "us-east-1", name="s3-backups"))
 
 ```python
 import asyncio
-from fastapi_watch.probes import BaseProbe, RedisProbe
+from fastapi_watch.probes import BaseProbe, TCPProbe
 from fastapi_watch.models import ProbeResult, ProbeStatus
 
 class RedisHAProbe(BaseProbe):
     name = "redis-ha"
 
-    def __init__(self, primary_url: str, replica_url: str) -> None:
-        self._primary = RedisProbe(url=primary_url, name="primary")
-        self._replica = RedisProbe(url=replica_url, name="replica")
+    def __init__(self, primary_host: str, replica_host: str) -> None:
+        self._primary = TCPProbe(host=primary_host, port=6379, name="primary")
+        self._replica = TCPProbe(host=replica_host, port=6379, name="replica")
 
     async def check(self) -> ProbeResult:
         primary, replica = await asyncio.gather(
@@ -1288,13 +1288,13 @@ Details: `call_count`, `error_count`, `error_rate`, `consecutive_errors`, `last_
 ```python
 from fastapi_watch.probes import ThresholdProbe, RedisProbe
 
-redis = RedisProbe(url="redis://localhost:6379")
+redis_probe = RedisProbe(name="redis")  # decorate your Redis calls with @redis_probe.watch
 
 registry.add(ThresholdProbe(
-    probe=redis,
-    name="redis-keys",
-    warn_if=lambda d: d.get("total_keys", 0) > 500_000,
-    fail_if=lambda d: d.get("total_keys", 0) > 1_000_000,
+    redis_probe,
+    name="redis-latency",
+    warn_if=lambda d: d.get("p95_rtt_ms", 0) > 50,
+    fail_if=lambda d: d.get("p95_rtt_ms", 0) > 200,
 ))
 ```
 

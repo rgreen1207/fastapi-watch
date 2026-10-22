@@ -49,13 +49,6 @@ from fastapi import FastAPI
 from fastapi_watch import HealthRegistry
 from fastapi_watch.probes import PostgreSQLProbe, RedisProbe
 
-app = FastAPI()
-registry = HealthRegistry(app)
-
-# Infrastructure probes
-registry.add(PostgreSQLProbe(url="postgresql://user:pass@localhost/mydb"))
-registry.add(RedisProbe(url="redis://localhost:6379"), critical=False)
-
 @asynccontextmanager
 async def lifespan(app):
     # Automatically monitor every route — no decorators needed
@@ -63,7 +56,19 @@ async def lifespan(app):
     registry.set_started()
     yield
 
+# Create the app first: the registry mounts its routes on this instance.
 app = FastAPI(lifespan=lifespan)
+registry = HealthRegistry(app)
+
+# Infrastructure probes observe your real calls: decorate them with @probe.watch
+db_probe = PostgreSQLProbe(name="postgres")
+cache_probe = RedisProbe(name="redis")
+registry.add(db_probe)
+registry.add(cache_probe, critical=False)
+
+@db_probe.watch
+async def fetch_user(user_id: int):
+    return await pool.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
 ```
 
 Every route is now monitored with real-traffic data. Health endpoints are live at `/health/*`.
@@ -193,8 +198,8 @@ The dashboard shows tag chips on each probe card and a clickable filter bar to i
 ```python
 from fastapi_watch.probes import PostgreSQLProbe, RedisProbe, HttpProbe, TCPProbe
 
-registry.add(PostgreSQLProbe(url="postgresql://..."))
-registry.add(RedisProbe(url="redis://..."), critical=False)
+registry.add(PostgreSQLProbe(name="postgres"))
+registry.add(RedisProbe(name="redis"), critical=False)
 registry.add(HttpProbe(name="payments-api"), critical=True)
 registry.add(TCPProbe(host="kafka.internal", port=9092))
 ```
