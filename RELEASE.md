@@ -16,11 +16,31 @@ Most fixes need no action. These change what you see or what is accepted:
 - **Retention arguments reach custom backends.** `history_size`, `result_ttl_seconds`, `alert_ttl_seconds`, and `max_alerts` passed together with `storage=` are applied through the backend's `configure()`; a backend without one logs a warning naming the ignored arguments.
 - **Request metrics no longer count fastapi-watch's own routes**, and streaming responses are timed until their last chunk, so their RTT rises.
 - **Invalid probe and middleware settings raise `ValueError`** (`window_size <= 0`, `cache_window_size <= 0`, `ema_alpha` outside (0, 1], `max_error_rate` outside [0, 1], `max_routes < 1`) instead of silently recording nothing.
-- **Dashboard stream tokens** are signed with a new key, so tokens minted before the upgrade stop validating (they lasted at most 5 minutes; the page reloads itself). A token-authorized dashboard reloads about every 5 minutes to fetch a fresh token.
+- **Dashboard stream tokens** are signed with a new key, so tokens minted before the upgrade stop validating (they lasted at most 5 minutes). When a page's token expires it fetches a fresh one from the new `GET /health/dashboard/stream-url` and reconnects without reloading.
 - **`/health/history` and `/health/alerts` return `503 {"error": "storage unavailable"}`** when the storage backend fails, instead of `500`.
 - **Results are listed in registration order**, not storage insertion order.
+- **`claim_alert(key, value, ttl_seconds)`** is the storage hook for cross-replica alert dedupe (a compare-and-set of the last status announced per probe). A custom backend written against a 2-argument `claim_alert(key, ttl_seconds)` from a pre-release build must be updated.
+- **`RedisProbeStorage` indexes probe names in `<prefix>:names`** (a sorted set) instead of `<prefix>:probes`. New instances delete the old set on their first write. During a rolling deploy, old and new replicas list only the names their own version has written.
+- **Writes to shared storage happen in the background.** With any backend other than the default in-memory one, health checks no longer wait for `set_latest`/`append_history`/`append_alert`; while the store is slow only the newest unwritten result per probe is kept, and shutdown waits up to 2 s for pending writes.
+- **Stored results are capped by size.** `RedisProbeStorage` now also caps *latest* results at `max_entry_bytes`, and `InMemoryProbeStorage(max_entry_bytes=8192)` caps history entries; oversized entries lose their largest `details` values and are marked `details["_truncated"] = True`.
+- **`RedisProbeStorage(max_connections=4)`** limits the commands it has in flight at once; pass `None` for no limit. The `redis` extra now requires `redis>=4.5.4`.
+- **Per-route keys for mounted apps use the Mount's parameter names**: `app.mount("/t/{tenant}", sub)` reports `/t/{tenant}/items/{item_id}` instead of one key per tenant.
+- **`RabbitMQProbe` reports the 50 deepest queues**, not every queue; **`KafkaProbe`** now actually reports `broker_count`/`controller_id` and lists at most 100 topics plus `topic_count`.
+- **`EventLoopProbe(sample_interval_ms=...)` below 1 raises `ValueError`**; `alert_dedupe_window_s` and `alert_min_interval_s` must be finite.
+- **A custom `check()` that returns something other than a `ProbeResult`** is reported as that probe's `UNHEALTHY` result instead of failing every health endpoint with `500`.
+- **The dashboard is served with `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and `frame-ancestors 'none'`.**
 
 ### Bug Fixes
+
+#### Second review round
+
+- **Alert dedupe could swallow a repeat outage.** With `alert_dedupe_window_s`, claims were keyed on `<probe>:<status>`, so a probe that failed, recovered and failed again inside the window never alerted the second failure; the last thing your pager saw was "healthy". Claims are now a compare-and-set of the last announced status per probe.
+- **Queued alerts survive shutdown.** The SIGTERM hook cancelled the alert worker, dropping queued alerts, and a check finishing during shutdown could start a worker nothing awaited. Shutdown now drains the queue for up to 5 s.
+- **SIGTERM stays fatal without a server handler.** With SIGTERM at its default disposition, the early-shutdown hook replaced "terminate" with "set a flag", so the process ignored SIGTERM until SIGKILL.
+- **Watched handlers with string annotations work on older FastAPI.** With `from __future__ import annotations`, `probe.watch()` made FastAPI before it followed `__wrapped__` treat `request: Request` as a required query parameter: every call returned `422` (a WebSocket closed with `1008`).
+- **Dashboard fixes:** a NaN or infinite value from a custom probe no longer drops all embedded data or freezes live updates; a non-numeric `error_rate` or mixed-type detail keys no longer return `500`; a probe name containing `"` no longer stops live updates; points are no longer cut off when the browser clock runs behind the server.
+- **Probe fixes:** async callable objects (`alru_cache` wrappers, partials) are timed and their errors counted; a returned model with a `status_code` field no longer counts as an HTTP error; WebSocket handlers whose socket parameter has another name and a string annotation are instrumented; `ThresholdProbe` keeps the inner probe's circuit-breaker settings; `RabbitMQProbe` decodes percent-encoded management credentials; `ProbeGroup.include()` keeps nested group tags; circuit-breaker state of removed probes is cleaned up.
+- **Webhook deadlines cover connecting.** A host resolving to several unreachable addresses gave each the full timeout (a 1 s budget took 3 s with three); they now share it.
 
 #### `error_rate` now reflects recent traffic, not the process lifetime
 
@@ -316,7 +336,24 @@ Each request that found a probe due ran it independently, so a burst of readines
 
 #### Bounded per-route table
 
-A `Mount` with a path parameter (`/t/{tenant}`) produced one per-route entry per concrete tenant. New `RequestMetricsMiddleware(max_routes=500)` sends further routes to one `"<other>"` entry.
+A `Mount` with a path parameter (`/t/{tenant}`) produced one per-route entry per concrete tenant; it is now keyed by the parameter name. New `RequestMetricsMiddleware(max_routes=500)` sends any further routes to one `"<other>"` entry as a backstop.
+
+#### Monitoring storage stays off the request path and inside its limits
+
+- **A slow or hung store no longer slows health checks.** Writes to a shared backend waited on the probe run, so a blackholed Redis added `storage_timeout` (2 s) to every `/health/ready` — failing Kubernetes' default 1 s readiness timeout because the *monitoring* store was down. They now run in a bounded background writer per probe.
+- **The monitoring store cannot exhaust the application's Redis pool.** Each check issued two or three concurrent pipelines; with 60 probes on the application's client every host `GET` failed with `MaxConnectionsError` during a check. `RedisProbeStorage` now keeps at most `max_connections` (4) commands in flight.
+- **The Redis name index is bounded.** Names of renamed or removed probes were only reaped on reads and every write refreshed the index TTL, so they accumulated for the life of the app, and the reap could recreate the index without a TTL. The index is now trimmed by age inside every write's transaction, and reads never write.
+- **Entries are bounded in bytes everywhere.** Latest results in Redis and in-memory history entries had no size cap (one 200 KB error made a 410 KB key; a 150-route probe held 2.7 MB in memory).
+- **`TTL=0` keeps data.** A key that once had an expiry kept it after switching to `result_ttl_seconds=0` and was wiped when it lapsed; writes now `PERSIST`. Non-finite TTLs are rejected instead of failing every write.
+- **Circuit-open results are not re-appended.** Each request while a circuit was open appended another copy of the cached result, pushing real history out of the window.
+
+#### Less work per request
+
+- `RequestMetricsMiddleware` caches whether an endpoint is a health route, takes one clock reading per request and skips Mount handling when there is none (≈1.8 → 1.4 µs of middleware work per request). Passive probes do their formatting at check time (≈1.5 → 1.1 µs per watched call) and time throughput on a monotonic clock, so an NTP step no longer skews `requests_per_minute`.
+- The dashboard is rendered in fastapi-watch's thread pool, one render at a time (68 ms of event-loop time for 20 probes × 2,000 history entries), embeds only the charted p95 for older route entries, and `/health/history` serializes in one pass (about 4× faster).
+- Open streams share a single-fetch probe's result checked within their interval instead of each running the probe (20 streams ran a database check 100 times in 5 s), and registry-interval probes are polled only while a stream is open.
+- Alerters post from their own thread pool, so a slow webhook can no longer occupy the threads blocking probe checks use and time them out; their connect attempts share the request deadline across every resolved address.
+- Dashboard tabs whose stream is refused retry the stream alone with jittered backoff (up to 5 minutes) instead of re-rendering the page every 30 s, and renew expired tokens without a reload.
 
 #### A smaller dashboard that stays small
 
@@ -327,6 +364,27 @@ The dashboard embedded every stored result with full `details` — about 4 MB fo
 `/health/status/stream` sent every probe's full `details` on every event, including every route from `RequestMetricsProbe` with all its fields, although the dashboard draws only the busiest eight. Both streams now accept `?view=dashboard`, which trims `details.routes` to the eight busiest routes and their charted fields (about 42 KB → 1.4 KB per event with 150 routes). The built-in dashboard uses it; clients that don't pass `view` get exactly the previous payload.
 
 ### Security Fixes
+
+#### Monitoring a route no longer strips its decorators (also affects v1.7.1)
+
+`discover_routes()` and `watch_router()` wrapped `getattr(route.endpoint, "__wrapped__", route.endpoint)`. That follows any `functools.wraps` decorator, so an endpoint behind an authentication, authorization or rate-limit decorator was replaced by its bare handler: a route that answered `403` served `200` and its data as soon as monitoring was switched on. Re-discovery (`refresh=True`) and a second `discover_routes()` did the same.
+
+**Fix:** only the wrapper fastapi-watch itself installed is ever unwrapped, recognised by identity rather than by an attribute a user decorator could copy. A regression matrix covers async, sync and request-reading decorators across every discovery path on FastAPI 0.100 and the latest release.
+
+**Action:** if you run v1.7.1 with `discover_routes()` or `watch_router()` over decorated endpoints, upgrade.
+
+#### Requires redis-py 4.5.4+
+
+`RedisProbeStorage` cancels commands that exceed `storage_timeout`. Before redis-py 4.5.4 (CVE-2023-28858/28859) a cancelled command could leave a shared connection returning the wrong replies to the application's next command. The `redis` extra now requires `redis>=4.5.4`.
+
+#### Tenant IDs no longer appear in request metrics
+
+A Mount with a path parameter keyed per-route metrics by the concrete value (`/t/acme/...`), publishing tenant IDs on `/health/status`, the dashboard and shared storage. They are keyed by the parameter name now.
+
+#### Smaller fixes
+
+- A non-ASCII `?token=` on a stream endpoint raised inside `compare_digest` and returned `500` with a traceback; it is a `403` now.
+- The dashboard page, which embeds a live stream token, is no longer cacheable or frameable.
 
 #### Maintenance write endpoints require `auth=`
 
