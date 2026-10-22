@@ -54,7 +54,7 @@ async def test_run_blocking_uses_a_bounded_pool_of_named_daemon_threads():
     await asyncio.sleep(0.05)
     try:
         assert len(names) == _MAX_WORKERS  # the rest wait their turn
-        pool_threads = _threads("fastapi-watch")
+        pool_threads = _threads("fastapi-watch_")  # not the alerters' own pool
         assert len(pool_threads) <= _MAX_WORKERS
         assert all(t.daemon for t in pool_threads)
     finally:
