@@ -13,6 +13,7 @@ or pass a custom renderer callable to replace the default design.
 """
 import html as _html
 import json
+import math
 from importlib.resources import files
 from typing import Any
 
@@ -98,8 +99,8 @@ def _fmt_detail_value(key: str, value: Any) -> str:
         return "—"
     if isinstance(value, bool):
         return "yes" if value else "no"
-    if key == "error_rate":
-        return f"{float(value):.2%}"
+    if key == "error_rate" and isinstance(value, (int, float)):
+        return f"{value:.2%}"
     if isinstance(value, float):
         if key.endswith("_ms"):
             return f"{value:.2f} ms"
@@ -115,7 +116,7 @@ def _fmt_detail_value(key: str, value: Any) -> str:
             return _e(f"open — suspended ({failures} consecutive failure{'s' if failures != 1 else ''}{trip_str})")
         return _e(f"closed{trip_str}")
     if key in ("status_distribution", "error_types") and isinstance(value, dict):
-        parts = ", ".join(f"{k}: {v}" for k, v in sorted(value.items()))
+        parts = ", ".join(f"{k}: {v}" for k, v in sorted(value.items(), key=lambda kv: str(kv[0])))
         return _e(parts) if parts else "—"
     if key == "routes" and isinstance(value, dict):
         return _routes_table(value)
@@ -192,6 +193,15 @@ def _summary(report: HealthReport) -> str:
     return f"{healthy} / {total} {noun} healthy"
 
 
+def _finite(value: Any) -> Any:
+    """*value*, or ``None`` for a NaN or infinite float.
+
+    ``json.dumps`` writes those as ``NaN``/``Infinity``, which ``JSON.parse``
+    rejects — one such value would cost the page all of its embedded data.
+    """
+    return None if isinstance(value, float) and not math.isfinite(value) else value
+
+
 def _json_for_script(value: Any) -> str:
     """JSON safe to embed in a ``<script type="application/json">`` element.
 
@@ -234,7 +244,7 @@ def _top_routes(routes: dict) -> list[str]:
 def _slim_routes(routes: dict, keep: list[str]) -> dict:
     """*routes* reduced to the paths in *keep*, each with only the fields the charts read."""
     return {
-        path: {field: routes[path][field] for field in _CHART_ROUTE_FIELDS if field in routes[path]}
+        path: {field: _finite(routes[path][field]) for field in _CHART_ROUTE_FIELDS if field in routes[path]}
         for path in keep
         if isinstance(routes.get(path), dict)
     }
@@ -260,10 +270,10 @@ def _chart_history(results: list[ProbeResult]) -> list[dict]:
         point: dict[str, Any] = {
             "checked_at": result.checked_at.isoformat() if result.checked_at else None,
             "status": result.status.value,
-            "latency_ms": result.latency_ms,
+            "latency_ms": _finite(result.latency_ms),
         }
         details = result.details or {}
-        slim = {field: details[field] for field in _CHART_DETAIL_FIELDS if field in details}
+        slim = {field: _finite(details[field]) for field in _CHART_DETAIL_FIELDS if field in details}
         routes = details.get("routes")
         if isinstance(routes, dict):
             slim["routes"] = _slim_routes(routes, keep)
@@ -276,6 +286,8 @@ def _chart_history(results: list[ProbeResult]) -> list[dict]:
 def _current_probe(probe: ProbeResult) -> dict:
     """A current result for the page script: full details, but routes cut to those the page shows."""
     data = probe.model_dump(mode="json")
+    # JSON mode nulls non-finite floats in details, not in typed fields.
+    data["latency_ms"] = _finite(data["latency_ms"])
     routes = (data.get("details") or {}).get("routes")
     if isinstance(routes, dict):
         data["details"]["routes"] = _slim_routes(routes, _top_routes(routes))
