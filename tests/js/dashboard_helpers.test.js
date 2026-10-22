@@ -88,7 +88,19 @@ const tests = {
     const slim = h.slimRoutes(routes, h.TOP_ROUTES);
     assert.deepStrictEqual(Object.keys(slim), ['/r19', '/r18', '/r17', '/r16', '/r15', '/r14', '/r13', '/r12']);
     assert.deepStrictEqual(slim['/r19'], { request_count: 19, p95_rtt_ms: 19, error_rate: 0.1, requests_per_minute: 5 });
-    assert.deepStrictEqual(h.slimRoutes({ '/x': null }, 8), {});
+    assert.deepStrictEqual(Object.keys(h.slimRoutes({ '/x': null }, 8)), []);
+  },
+
+  routesNamedLikeObjectBuiltinsAndOddCounts() {
+    // Custom probes' route breakdowns are free-form: a "__proto__" key was
+    // dropped (assigned as the prototype), and a non-numeric count made the
+    // ranking compare by name only for that route.
+    const routes = JSON.parse('{"__proto__": {"request_count": 9}, "constructor": {"request_count": 7}, ' +
+      '"/a": {"request_count": "lots"}, "/b": {"request_count": 8}, "/c": {"request_count": null}}');
+    const slim = h.slimRoutes(routes, 8);
+    assert.deepStrictEqual(Object.keys(slim), ['__proto__', '/b', 'constructor', '/a', '/c']);
+    assert.deepStrictEqual(slim.__proto__, { request_count: 9 });
+    assert.deepStrictEqual(h.topRoutes([{ routes: slim }], 2), ['__proto__', '/b']);
   },
 
   pointsForSlimsRoutes() {

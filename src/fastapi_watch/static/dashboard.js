@@ -67,16 +67,23 @@
       .map(function (t) { return byTime[t]; });
   }
 
-  /** Route paths ranked by request volume, busiest first. */
+  /**
+   * Route paths ranked by request volume, busiest first; a count that is not
+   * a number counts as 0, as _top_routes() in dashboard.py ranks them.
+   */
   function rankRoutes(routes) {
+    var count = function (path) { return num((routes[path] || {}).request_count) || 0; };
     return Object.keys(routes).sort(function (a, b) {
-      return ((routes[b] || {}).request_count || 0) - ((routes[a] || {}).request_count || 0) || (a < b ? -1 : 1);
+      return count(b) - count(a) || (a < b ? -1 : 1);
     });
   }
 
-  /** The *limit* busiest routes, each with only the fields the routes section reads. */
+  /**
+   * The *limit* busiest routes, each with only the fields the routes section
+   * reads.  No prototype: a route keyed "__proto__" is kept as a route.
+   */
   function slimRoutes(routes, limit) {
-    var out = {};
+    var out = Object.create(null);
     rankRoutes(routes).slice(0, limit).forEach(function (path) {
       var stats = routes[path];
       if (!stats || typeof stats !== 'object') return;
