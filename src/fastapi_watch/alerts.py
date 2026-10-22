@@ -44,6 +44,7 @@ import ipaddress
 import json
 import socket
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -149,17 +150,24 @@ class _Deadline:
     which makes the blocked call fail at once.  It holds a duplicate of each
     socket because TLS wrapping detaches the original socket object.
 
-    DNS resolution of the webhook host happens before any socket exists and
-    is bounded only by the system resolver's own timeouts.
+    Connecting is bounded too: each address the host resolves to is tried
+    with only what is left of the budget (see :func:`_connect_within`).  DNS
+    resolution of the webhook host happens before any socket exists and is
+    bounded only by the system resolver's own timeouts.
     """
 
     def __init__(self, seconds: float) -> None:
         self.expired = False
+        self._ends_at = time.monotonic() + seconds
         self._lock = threading.Lock()
         self._socks: list[socket.socket] = []
         self._timer = threading.Timer(seconds, self._expire)
         self._timer.daemon = True
         self._timer.start()
+
+    def remaining(self) -> float:
+        """Seconds left in the budget (zero or negative once it is spent)."""
+        return self._ends_at - time.monotonic()
 
     def watch(self, sock: socket.socket) -> None:
         """Shut *sock* down when the deadline passes (at once if it already has)."""
@@ -193,6 +201,38 @@ def _shutdown(sock: socket.socket) -> None:
         pass  # already closed or never connected
 
 
+def _connect_within(deadline: _Deadline, address: tuple, timeout: Any, source_address: Any = None) -> socket.socket:
+    """``socket.create_connection``, with every attempt drawn from *deadline*'s budget.
+
+    ``create_connection`` gives each resolved address the full *timeout*, so a
+    host with N unreachable addresses takes N times as long; here the attempts
+    share what is left of the budget.  The connected socket is handed to the
+    deadline.
+    """
+    host, port = address
+    error: OSError | None = None
+    for family, type_, proto, _, sockaddr in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
+        remaining = deadline.remaining()
+        if remaining <= 0:
+            break
+        sock = socket.socket(family, type_, proto)
+        try:
+            sock.settimeout(min(timeout, remaining) if isinstance(timeout, (int, float)) else remaining)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+        except OSError as exc:
+            sock.close()
+            error = exc
+            continue
+        sock.settimeout(timeout if isinstance(timeout, (int, float)) else None)
+        deadline.watch(sock)
+        return sock
+    if deadline.remaining() <= 0:
+        raise TimeoutError("connect did not complete within the request deadline")
+    raise error if error is not None else OSError(f"no addresses resolved for {host!r}")
+
+
 class _DeadlineHandler:
     """Mixin for the HTTP(S) handlers: hand each new socket to the request's :class:`_Deadline`."""
 
@@ -203,16 +243,9 @@ class _DeadlineHandler:
 
         def connection(host, **kwargs):
             conn = http_class(host, **kwargs)
-            create = getattr(conn, "_create_connection", None)
-            if create is None:
+            if not hasattr(conn, "_create_connection"):
                 return conn  # unknown http.client internals: per-operation timeouts only
-
-            def create_and_watch(*args, **kw):
-                sock = create(*args, **kw)
-                deadline.watch(sock)
-                return sock
-
-            conn._create_connection = create_and_watch
+            conn._create_connection = lambda *a, **kw: _connect_within(deadline, *a, **kw)
             return conn
 
         return super().do_open(connection, req, **http_conn_args)
@@ -258,7 +291,7 @@ def _post_json(
         exc.close()
         raise
     except Exception as exc:
-        if deadline.expired:
+        if deadline.remaining() <= 0:
             raise TimeoutError(f"webhook request did not complete within {timeout:g} s") from exc
         raise
     finally:
