@@ -200,3 +200,33 @@ def test_render_prometheus_writes_only_parseable_values():
     assert 'probe_circuit_consecutive_failures{name="a",critical="true"} 1' in text
     assert 'probe_circuit_consecutive_failures{name="b",critical="true"} NaN' in text
     assert 'probe_circuit_consecutive_failures{name="c",critical="true"} 4.0' in text
+
+
+def test_render_prometheus_writes_number_subclasses_and_huge_ints_as_numbers():
+    # numpy's float64 is a float whose repr is "np.float64(2.0)"; an IntEnum's
+    # str is "Name.MEMBER" on Python 3.10; an int past the float range is a
+    # number Prometheus cannot parse.  Each failed the whole scrape.
+    import enum
+
+    class Float64(float):
+        def __repr__(self) -> str:
+            return f"np.float64({float(self)})"
+
+    class Count(enum.IntEnum):
+        THREE = 3
+
+        def __str__(self) -> str:  # as on Python 3.10
+            return f"Count.{self.name}"
+
+    results = [
+        ProbeResult(name=name, status=ProbeStatus.HEALTHY, latency_ms=1.0,
+                    details={"circuit_breaker": {"consecutive_failures": value}})
+        for name, value in (("a", Float64(2.0)), ("b", Count.THREE), ("c", 10**400), ("d", -(10**400)), ("e", 10**20))
+    ]
+    text = render_prometheus(results)
+    _assert_valid_exposition(text)
+    assert 'probe_circuit_consecutive_failures{name="a",critical="true"} 2.0' in text
+    assert 'probe_circuit_consecutive_failures{name="b",critical="true"} 3' in text
+    assert 'probe_circuit_consecutive_failures{name="c",critical="true"} +Inf' in text
+    assert 'probe_circuit_consecutive_failures{name="d",critical="true"} -Inf' in text
+    assert 'probe_circuit_consecutive_failures{name="e",critical="true"} 100000000000000000000' in text

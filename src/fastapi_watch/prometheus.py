@@ -30,12 +30,14 @@ names above so existing dashboards and alerts continue to work.
 """
 import math
 import re
+import sys
 from typing import Callable
 
 from .models import ProbeResult, ProbeStatus
 
 # Valid start of a Prometheus metric name; the prefix is prepended to "probe_...".
 _METRIC_PREFIX_RE = re.compile(r"[a-zA-Z_:][a-zA-Z0-9_:]*")
+_FLOAT_MAX = sys.float_info.max
 
 
 def validate_metrics_prefix(prefix: str) -> str:
@@ -70,6 +72,8 @@ def _sample(value: object) -> str:
 
     One value Prometheus cannot parse (``True``, ``nan``, a string) fails the
     whole scrape, so anything that is not a number is written as ``NaN``.
+    Subclasses are written by the base type's ``repr``: numpy's ``float64``
+    repr is ``np.float64(2.0)``, an ``IntEnum``'s ``Name.MEMBER`` before 3.11.
     """
     if isinstance(value, bool):
         return "1" if value else "0"
@@ -78,9 +82,12 @@ def _sample(value: object) -> str:
             return "NaN"
         if math.isinf(value):
             return "+Inf" if value > 0 else "-Inf"
-        return repr(value)
+        return float.__repr__(value)
     if isinstance(value, int):
-        return str(value)
+        # Beyond the float range Prometheus rejects the number itself.
+        if abs(value) > _FLOAT_MAX:
+            return "+Inf" if value > 0 else "-Inf"
+        return int.__repr__(value)
     return "NaN"
 
 
