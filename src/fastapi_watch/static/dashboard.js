@@ -13,6 +13,9 @@
   // MAX_POINTS points, and none older than the retention span (retentionMs).
   var MAX_POINTS = 2000;  // matches _MAX_CHART_POINTS in dashboard.py
   var TOP_ROUTES = 8;     // routes charted; matches _CHART_ROUTES in dashboard.py
+  var RETRY_BASE_MS = 2000;       // first stream retry after a refused connection
+  var RETRY_MAX_MS = 5 * 60e3;    // retries back off to at most this
+  var MAX_STREAM_RETRIES = 6;     // then reload for a fresh page and token
   var ROUTE_FIELDS = ['request_count', 'p95_rtt_ms', 'error_rate', 'requests_per_minute'];
 
   // ── Pure helpers ──────────────────────────────────────────────────────
@@ -244,6 +247,32 @@
     return [];
   }
 
+  /**
+   * Wait before retry number *attempt* (1, 2, ...): exponential backoff with
+   * jitter, so tabs refused together (a restart, a full stream limit) do not
+   * all come back at once.  *rand* is a number in [0, 1).
+   */
+  function retryDelayMs(attempt, rand) {
+    var cap = Math.min(RETRY_MAX_MS, RETRY_BASE_MS * Math.pow(2, Math.max(0, attempt - 1)));
+    return cap / 2 + rand * cap / 2;
+  }
+
+  /** True if the stream URL carries a token (``<expiry>.<sig>``) that has expired by *now* (ms). */
+  function tokenExpired(url, now) {
+    var m = /[?&]token=(\d+)\./.exec(url || '');
+    return m !== null && now >= parseInt(m[1], 10) * 1000;
+  }
+
+  /** The newest point time across *history*, or -Infinity. */
+  function newestTime(history) {
+    var newest = -Infinity;
+    Object.keys(history).forEach(function (name) {
+      var pts = history[name];
+      if (pts.length) newest = Math.max(newest, pts[pts.length - 1].t);
+    });
+    return newest;
+  }
+
   /** The header sentence for a set of current results. */
   function statusSentence(probes, history, now) {
     var failing = probes.filter(function (p) { return p.critical !== false && p.status === 'unhealthy'; });
@@ -265,8 +294,9 @@
     retentionMs: retentionMs, slimRoutes: slimRoutes, series: series,
     gapThreshold: gapThreshold, pathD: pathD, areaD: areaD, segments: segments, transitions: transitions,
     nearest: nearest, heldSince: heldSince, fmtDuration: fmtDuration, fmtValue: fmtValue,
-    topRoutes: topRoutes, statusSentence: statusSentence, RANGES: RANGES, MAX_POINTS: MAX_POINTS,
-    TOP_ROUTES: TOP_ROUTES,
+    topRoutes: topRoutes, statusSentence: statusSentence, retryDelayMs: retryDelayMs,
+    tokenExpired: tokenExpired, newestTime: newestTime, RANGES: RANGES, MAX_POINTS: MAX_POINTS,
+    TOP_ROUTES: TOP_ROUTES, RETRY_MAX_MS: RETRY_MAX_MS,
   };
   if (typeof module !== 'undefined' && module.exports) { module.exports = api; return; }
 
@@ -305,8 +335,12 @@
 
   function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
 
+  // The server's clock stamps the points; a browser clock running behind it
+  // must not push the newest ones off the right edge of every chart.
+  function nowMs() { return Math.max(Date.now(), newestTime(history)); }
+
   function timeWindow() {
-    var now = Date.now();
+    var now = nowMs();
     var span = RANGES[range];
     if (span) return [now - span, now];
     var first = now;
@@ -697,8 +731,11 @@
   }
 
   function updateCard(probe) {
-    var card = doc.querySelector('.probe-card[data-probe="' + probe.name + '"]');
-    var lane = doc.querySelector('.lane[data-probe="' + probe.name + '"]');
+    // Escaped: a name with a quote or backslash would otherwise make an
+    // invalid selector, and the throw would stop this and every later update.
+    var sel = '[data-probe="' + root.CSS.escape(String(probe.name)) + '"]';
+    var card = doc.querySelector('.probe-card' + sel);
+    var lane = doc.querySelector('.lane' + sel);
     if (lane) {
       var chip = lane.querySelector('.status-chip');
       if (chip) chip.className = 'status-chip ' + probe.status;
@@ -756,18 +793,25 @@
     return healthy + ' / ' + total + ' ' + noun + ' healthy';
   }
 
+  function stored(key) {
+    try { return parseInt(root.sessionStorage.getItem(key) || '0', 10) || 0; } catch (_) { return 0; }
+  }
+  function store(key, value) {
+    try { root.sessionStorage.setItem(key, String(value)); } catch (_) {}
+  }
+
   // Cards are server-rendered; when the set of probes changes, reload to pick
-  // it up — at most once per 30 s, deferring rather than dropping a request.
+  // it up — at most once per 30 s (or *minDelay*), deferring rather than
+  // dropping a request.  Each load renders the whole page on the server.
   var reloadPending = false;
-  function reloadPage() {
+  function reloadPage(minDelay) {
     if (reloadPending) return;
     reloadPending = true;
-    var key = 'fastapi-watch-reloaded-at', last = 0;
-    try { last = parseInt(root.sessionStorage.getItem(key) || '0', 10); } catch (_) {}
+    var key = 'fastapi-watch-reloaded-at';
     setTimeout(function () {
-      try { root.sessionStorage.setItem(key, String(Date.now())); } catch (_) {}
+      store(key, Date.now());
       root.location.reload();
-    }, Math.max(0, 30000 - (Date.now() - last)));
+    }, Math.max(minDelay || 0, 30000 - (Date.now() - stored(key))));
   }
 
   function probeSetChanged(probes) {
@@ -784,7 +828,7 @@
       if (addPoint(points, pointsFor([p])[0])) capPoints(points, retainMs, MAX_POINTS);
     });
     if (header) header.className = 'header ' + report.status;
-    if (badge) badge.textContent = statusSentence(probes, history, Date.now());
+    if (badge) badge.textContent = statusSentence(probes, history, nowMs());
     if (subtitle) subtitle.textContent = summaryText(probes);
     if (checkedEl && report.checked_at) {
       checkedEl.textContent = 'Last checked ' + report.checked_at.replace('T', ' ').slice(0, 19) + ' ' + (report.timezone || 'UTC');
@@ -794,7 +838,7 @@
     scheduleRender();
   }
 
-  if (badge) badge.textContent = statusSentence(initial.probes || [], history, Date.now());
+  if (badge) badge.textContent = statusSentence(initial.probes || [], history, nowMs());
   render();
   if (root.ResizeObserver) {
     var main = doc.querySelector('.content');
@@ -805,16 +849,35 @@
   // Keep the time axis moving even between stream events.
   setInterval(scheduleRender, 15000);
 
-  if (!streamUrl) return;
-  var source = new root.EventSource(streamUrl);
-  source.onopen = function () { if (liveDot) liveDot.className = 'live-dot connected'; };
-  source.onmessage = function (e) {
-    try { applyReport(JSON.parse(e.data)); } catch (_) {}
-  };
-  source.onerror = function () {
-    if (liveDot) liveDot.className = 'live-dot';
-    // CLOSED means the browser gave up (e.g. a non-200 such as an expired
-    // stream token); a fresh page load gets a new token and reconnects.
-    if (source.readyState === 2) reloadPage();
-  };
+  // Refused connections in a row, kept across reloads so a server that keeps
+  // refusing (503 at max_stream_connections, a proxy error page) is retried
+  // ever more slowly instead of re-rendering this page every 30 s.
+  var FAILURES_KEY = 'fastapi-watch-stream-failures';
+  var hasToken = /[?&]token=/.test(streamUrl || '');
+  function connect() {
+    var source = new root.EventSource(streamUrl);
+    source.onopen = function () {
+      store(FAILURES_KEY, 0);
+      if (liveDot) liveDot.className = 'live-dot connected';
+    };
+    source.onmessage = function (e) {
+      try { applyReport(JSON.parse(e.data)); } catch (_) {}
+    };
+    source.onerror = function () {
+      if (liveDot) liveDot.className = 'live-dot';
+      // CONNECTING: the browser retries by itself.  CLOSED: it gave up on a
+      // non-200 — an expired stream token, which only a fresh page replaces,
+      // or a refusal that a later retry of the stream alone can get past.
+      if (source.readyState !== 2) return;
+      var failures = stored(FAILURES_KEY) + 1;
+      store(FAILURES_KEY, failures);
+      var delay = retryDelayMs(failures, Math.random());
+      // A token that keeps being refused though unexpired here (this clock
+      // runs behind the server's) is replaced by a reload too.
+      var stale = tokenExpired(streamUrl, Date.now()) || (hasToken && failures >= MAX_STREAM_RETRIES);
+      if (stale) reloadPage(delay);
+      else setTimeout(connect, delay);
+    };
+  }
+  if (streamUrl) connect();
 })(this);

@@ -118,3 +118,25 @@ def test_dashboard_stream_url_with_token_keeps_both_parameters():
     assert params["view"] == "dashboard" and params["token"]
     _, data = _event(client.get(url))  # no header, as from EventSource
     assert len(data["probes"][0]["details"]["routes"]) == 8
+
+
+class _NaNLatency(BaseProbe):
+    name = "nan"
+
+    async def check(self) -> ProbeResult:
+        return ProbeResult(name=self.name, status=ProbeStatus.HEALTHY, latency_ms=float("nan"),
+                           details={"error_rate": float("nan")})
+
+
+def test_dashboard_view_events_stay_valid_json_with_non_finite_numbers():
+    # The page's JSON.parse rejects NaN; an event it cannot parse is dropped,
+    # so one probe reporting NaN froze every card and chart on the page.
+    app = FastAPI()
+    HealthRegistry(app, poll_interval_ms=None, circuit_breaker=False).add(_NaNLatency())
+    raw, _ = _event(TestClient(app).get("/health/status/stream?view=dashboard"))
+
+    def reject(constant):
+        raise ValueError(constant)
+
+    probe = json.loads(raw, parse_constant=reject)["probes"][0]
+    assert probe["latency_ms"] is None and probe["details"]["error_rate"] is None

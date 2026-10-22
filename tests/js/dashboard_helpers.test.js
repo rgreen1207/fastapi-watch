@@ -191,6 +191,29 @@ const tests = {
     );
     assert.strictEqual(h.statusSentence([], {}, now), 'No probes registered');
   },
+
+  retryDelayBacksOffWithJitterUpToACap() {
+    assert.strictEqual(h.retryDelayMs(1, 0), 1000);
+    assert.strictEqual(h.retryDelayMs(1, 0.999999) < 2000, true);
+    assert.strictEqual(h.retryDelayMs(3, 0), 4000);
+    // Tabs refused together spread out over half the backoff window.
+    assert.ok(h.retryDelayMs(3, 0.9) - h.retryDelayMs(3, 0.1) >= 3000);
+    for (let n = 1; n < 50; n++) assert.ok(h.retryDelayMs(n, 0.999999) <= h.RETRY_MAX_MS);
+    assert.strictEqual(h.retryDelayMs(50, 0), h.RETRY_MAX_MS / 2);
+  },
+
+  tokenExpiredReadsTheStreamUrl() {
+    const url = '/health/status/stream?view=dashboard&token=1700000000.abcdef';
+    assert.strictEqual(h.tokenExpired(url, 1700000000 * 1000 - 1), false);
+    assert.strictEqual(h.tokenExpired(url, 1700000000 * 1000), true);
+    assert.strictEqual(h.tokenExpired('/health/status/stream?view=dashboard', 9e15), false, 'no token: never expires');
+    assert.strictEqual(h.tokenExpired(null, 0), false);
+  },
+
+  newestTimeAcrossProbes() {
+    assert.strictEqual(h.newestTime({}), -Infinity);
+    assert.strictEqual(h.newestTime({ a: [{ t: 1 }, { t: 5 }], b: [], c: [{ t: 9 }] }), 9);
+  },
 };
 
 let failed = 0;

@@ -13,6 +13,7 @@ or pass a custom renderer callable to replace the default design.
 """
 import html as _html
 import json
+import math
 from importlib.resources import files
 from typing import Any
 
@@ -98,8 +99,8 @@ def _fmt_detail_value(key: str, value: Any) -> str:
         return "—"
     if isinstance(value, bool):
         return "yes" if value else "no"
-    if key == "error_rate":
-        return f"{float(value):.2%}"
+    if key == "error_rate" and isinstance(value, (int, float)):
+        return f"{value:.2%}"
     if isinstance(value, float):
         if key.endswith("_ms"):
             return f"{value:.2f} ms"
@@ -115,7 +116,7 @@ def _fmt_detail_value(key: str, value: Any) -> str:
             return _e(f"open — suspended ({failures} consecutive failure{'s' if failures != 1 else ''}{trip_str})")
         return _e(f"closed{trip_str}")
     if key in ("status_distribution", "error_types") and isinstance(value, dict):
-        parts = ", ".join(f"{k}: {v}" for k, v in sorted(value.items()))
+        parts = ", ".join(f"{k}: {v}" for k, v in sorted(value.items(), key=lambda kv: str(kv[0])))
         return _e(parts) if parts else "—"
     if key == "routes" and isinstance(value, dict):
         return _routes_table(value)
@@ -192,6 +193,15 @@ def _summary(report: HealthReport) -> str:
     return f"{healthy} / {total} {noun} healthy"
 
 
+def _finite(value: Any) -> Any:
+    """*value*, or ``None`` for a NaN or infinite float.
+
+    ``json.dumps`` writes those as ``NaN``/``Infinity``, which ``JSON.parse``
+    rejects — one such value would cost the page all of its embedded data.
+    """
+    return None if isinstance(value, float) and not math.isfinite(value) else value
+
+
 def _json_for_script(value: Any) -> str:
     """JSON safe to embed in a ``<script type="application/json">`` element.
 
@@ -216,6 +226,8 @@ _CHART_DETAIL_FIELDS = (
 )
 # Per-route fields the routes section reads (topRoutes() ranks, drawRoutes() charts and labels).
 _CHART_ROUTE_FIELDS = ("request_count", "p95_rtt_ms", "error_rate", "requests_per_minute")
+# The only one it reads from older entries: their p95 line.
+_CHART_ROUTE_HISTORY_FIELDS = ("p95_rtt_ms",)
 # Routes charted; matches TOP_ROUTES in dashboard.js.
 _CHART_ROUTES = 8
 # Newest results embedded per probe; matches MAX_POINTS in dashboard.js.
@@ -231,10 +243,10 @@ def _top_routes(routes: dict) -> list[str]:
     return sorted(routes, key=lambda path: (-count(path), path))[:_CHART_ROUTES]
 
 
-def _slim_routes(routes: dict, keep: list[str]) -> dict:
-    """*routes* reduced to the paths in *keep*, each with only the fields the charts read."""
+def _slim_routes(routes: dict, keep: list[str], fields: tuple[str, ...] = _CHART_ROUTE_FIELDS) -> dict:
+    """*routes* reduced to the paths in *keep*, each with only *fields* (by default all the charts read)."""
     return {
-        path: {field: routes[path][field] for field in _CHART_ROUTE_FIELDS if field in routes[path]}
+        path: {field: _finite(routes[path][field]) for field in fields if field in routes[path]}
         for path in keep
         if isinstance(routes.get(path), dict)
     }
@@ -245,28 +257,32 @@ def _chart_history(results: list[ProbeResult]) -> list[dict]:
 
     Routes are cut to the busiest few of the newest breakdown — the ones the
     page charts — and kept under the same paths in every entry so each chart
-    line covers the whole history.  At most the newest ``_MAX_CHART_POINTS``
-    results are kept, as the page itself keeps no more.
+    line covers the whole history; older entries carry only the charted p95.
+    At most the newest ``_MAX_CHART_POINTS`` results are kept, as the page
+    itself keeps no more.
     """
     results = results[-_MAX_CHART_POINTS:]
     keep: list[str] = []
-    for result in reversed(results):
-        routes = (result.details or {}).get("routes")
+    newest_routes = -1
+    for index in range(len(results) - 1, -1, -1):
+        routes = (results[index].details or {}).get("routes")
         if isinstance(routes, dict):
             keep = _top_routes(routes)
+            newest_routes = index
             break
     points = []
-    for result in results:
+    for index, result in enumerate(results):
         point: dict[str, Any] = {
             "checked_at": result.checked_at.isoformat() if result.checked_at else None,
             "status": result.status.value,
-            "latency_ms": result.latency_ms,
+            "latency_ms": _finite(result.latency_ms),
         }
         details = result.details or {}
-        slim = {field: details[field] for field in _CHART_DETAIL_FIELDS if field in details}
+        slim = {field: _finite(details[field]) for field in _CHART_DETAIL_FIELDS if field in details}
         routes = details.get("routes")
         if isinstance(routes, dict):
-            slim["routes"] = _slim_routes(routes, keep)
+            fields = _CHART_ROUTE_FIELDS if index == newest_routes else _CHART_ROUTE_HISTORY_FIELDS
+            slim["routes"] = _slim_routes(routes, keep, fields)
         if slim:
             point["details"] = slim
         points.append(point)
@@ -276,6 +292,8 @@ def _chart_history(results: list[ProbeResult]) -> list[dict]:
 def _current_probe(probe: ProbeResult) -> dict:
     """A current result for the page script: full details, but routes cut to those the page shows."""
     data = probe.model_dump(mode="json")
+    # JSON mode nulls non-finite floats in details, not in typed fields.
+    data["latency_ms"] = _finite(data["latency_ms"])
     routes = (data.get("details") or {}).get("routes")
     if isinstance(routes, dict):
         data["details"]["routes"] = _slim_routes(routes, _top_routes(routes))
