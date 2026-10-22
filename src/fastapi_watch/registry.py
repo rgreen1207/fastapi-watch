@@ -27,7 +27,7 @@ from pydantic_core import to_json
 
 from ._executor import run_render
 from .alerts import BaseAlerter, WebhookAlerter
-from .dashboard import _current_probe, render_dashboard
+from .dashboard import _current_probe, _render_dashboard_bytes
 from .models import AlertRecord, HealthReport, ProbeResult, ProbeStatus
 from .prometheus import render_prometheus, validate_metrics_prefix
 from .probe_group import ProbeGroup
@@ -2783,10 +2783,12 @@ class HealthRegistry:
                 # thread never waits behind hung blocking probe checks.
                 render_lock = asyncio.Lock()
 
-                async def _renderer(report: HealthReport, maintenance: bool, request: Request, history: dict | None, nonce: str | None) -> str:
+                async def _renderer(report: HealthReport, maintenance: bool, request: Request, history: dict | None, nonce: str | None) -> bytes:
                     stream_url, _ = _dashboard_stream(request)
+                    # Encoded on the render thread too: a str response would be
+                    # encoded (megabytes) on the event loop.
                     render = functools.partial(
-                        render_dashboard, report, stream_url=stream_url, maintenance_banner=maintenance, history=history,
+                        _render_dashboard_bytes, report, stream_url=stream_url, maintenance_banner=maintenance, history=history,
                         nonce=nonce,
                     )
                     async with render_lock:

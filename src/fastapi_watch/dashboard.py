@@ -409,6 +409,36 @@ def render_dashboard(
         nonce: Content-Security-Policy nonce for the page script, the only
             script the page runs.
     """
+    return "".join(_page_parts(report, stream_url, maintenance_banner, history, nonce))
+
+
+def _render_dashboard_bytes(
+    report: HealthReport,
+    stream_url: str,
+    maintenance_banner: bool = False,
+    history: dict[str, list[ProbeResult]] | None = None,
+    nonce: str | None = None,
+) -> bytes:
+    """:func:`render_dashboard`'s page, UTF-8 encoded, as the registry serves it.
+
+    Encoded a part at a time: the embedded data (most of a page with long
+    history) is ASCII, as ``json.dumps`` escapes the rest, so its encoding is a
+    copy.  Joined into one ``str`` with the page's non-ASCII text it would be
+    widened to 2 bytes a character, and encoded back, each in one GIL-holding
+    call (about 20 and 30 ms for 78 MB); a ``str`` response would also be
+    encoded on the event loop itself.
+    """
+    return b"".join(part.encode("utf-8") for part in _page_parts(report, stream_url, maintenance_banner, history, nonce))
+
+
+def _page_parts(
+    report: HealthReport,
+    stream_url: str,
+    maintenance_banner: bool,
+    history: dict[str, list[ProbeResult]] | None,
+    nonce: str | None,
+) -> list[str]:
+    """The page in parts: markup, the embedded data a probe at a time, markup."""
     checked_at_text = ""
     if report.checked_at:
         checked_at_text = f"Last checked {report.checked_at.strftime('%Y-%m-%d %H:%M:%S')} {report.timezone or 'UTC'}"
@@ -432,17 +462,17 @@ def render_dashboard(
     # Encoded a probe at a time: this runs in a worker thread, but json.dumps
     # holds the GIL for a whole call, so one call over every probe's history
     # stalled the app's event loop for all of it (~0.4 s at 200 x 2000 points).
+    # Kept as parts, not joined: see _render_dashboard_bytes().
     probes_json = ",".join(_json_for_script(_current_probe(p)) for p in report.probes)
-    history_json = ",".join(
-        f"{_json_for_script(str(name))}:{_json_for_script(_chart_history(results))}"
-        for name, results in (history or {}).items()
-    )
-    data_json = f'{{"probes":[{probes_json}],"history":{{{history_json}}}}}'
+    data = [f'{{"probes":[{probes_json}],"history":{{']
+    for index, (name, results) in enumerate((history or {}).items()):
+        data.append(f"{',' if index else ''}{_json_for_script(str(name))}:{_json_for_script(_chart_history(results))}")
+    data.append("}}")
     nonce_attr = f' nonce="{_e(nonce)}"' if nonce else ""
     lanes = "".join(_lane(p) for p in report.probes)
     cards = "\n".join(_probe_card(p) for p in report.probes)
 
-    return f"""<!DOCTYPE html>
+    head = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -487,7 +517,9 @@ def render_dashboard(
     </div>
   </main>
   <div class="chart-tooltip" id="chart-tooltip" hidden></div>
-  <script type="application/json" id="fw-data">{data_json}</script>
+  <script type="application/json" id="fw-data">"""
+    tail = f"""</script>
   <script{nonce_attr}>{_JS}</script>
 </body>
 </html>"""
+    return [head, *data, tail]
