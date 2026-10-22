@@ -36,6 +36,7 @@ Most fixes need no action. These change what you see or what is accepted:
 - **`POST`/`DELETE /health/maintenance` read the body only after authentication** and refuse one over 4 KiB with `413`. An unauthenticated request now gets `401`/`403` whatever its body (a malformed one used to get `422`); non-JSON bodies from authenticated clients still get `415`.
 - **`auth={"type": "apikey", "header": ...}`** must be a non-empty string; a blank or non-string header name raises `ValueError` at startup.
 - **A negative or NaN `result_ttl_seconds` / `alert_ttl_seconds` raises `ValueError`** with the default in-memory storage too, as it already did with `RedisProbeStorage`; it used to switch time-based expiry off silently.
+- **A client that hangs up before the response starts is recorded as `499`, not `500`**, by `RequestMetricsMiddleware` and route probes (an aborted upload, where Starlette raises `ClientDisconnect`). With the default `min_error_status=500` it no longer counts as an error.
 
 ### Bug Fixes
 
@@ -72,6 +73,12 @@ Most fixes need no action. These change what you see or what is accepted:
 - **Dashboard fixes:** a NaN or infinite value from a custom probe no longer drops all embedded data or freezes live updates; a non-numeric `error_rate` or mixed-type detail keys no longer return `500`; a probe name containing `"` no longer stops live updates; points are no longer cut off when the browser clock runs behind the server.
 - **Probe fixes:** async callable objects (`alru_cache` wrappers, partials) are timed and their errors counted; a returned model with a `status_code` field no longer counts as an HTTP error; WebSocket handlers whose socket parameter has another name and a string annotation are instrumented; `ThresholdProbe` keeps the inner probe's circuit-breaker settings; `RabbitMQProbe` decodes percent-encoded management credentials; `ProbeGroup.include()` keeps nested group tags; circuit-breaker state of removed probes is cleaned up.
 - **Webhook deadlines cover connecting.** A host resolving to several unreachable addresses gave each the full timeout (a 1 s budget took 3 s with three); they now share it.
+
+#### Third review round
+
+- **Watched `yield` dependencies work on older FastAPI.** `probe.watch()` wrapped a generator function in a plain function, so FastAPI before it followed `__wrapped__` (0.100, for one) injected the generator object itself into the route instead of the session it yields. Newer releases ran it, but the probe timed only the creation of the generator (~0 ms) and missed any error raised while it ran, including mid-stream failures of streaming (generator) endpoints. Watched generators now stay generators, forward every send, throw and close, and are recorded when they finish: RTT is the time spent running the generator (a dependency's setup and teardown, not the endpoint's work in between), and an endpoint's exception passing back out of a dependency is not counted against it.
+- **Aborted uploads no longer make the app unhealthy.** A client that disconnected while a handler read its body was counted as a server error (500) by `RequestMetricsMiddleware` and route probes, so clients on flaky networks could push `RequestMetricsProbe`, and with it readiness, to `UNHEALTHY`. Such requests are now recorded as `499`, and a response the server could not finish delivering keeps the status it started with.
+- **`RequestMetricsProbe` no longer stalls the event loop.** Building the per-route breakdown sorted every route's latency window in one go: about 8 ms of blocked event loop per check at the 500-route cap. The check now yields between batches of 50 routes (under 1 ms each).
 
 #### `error_rate` now reflects recent traffic, not the process lifetime
 

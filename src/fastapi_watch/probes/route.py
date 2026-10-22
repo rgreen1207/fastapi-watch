@@ -1,8 +1,13 @@
 from typing import Any, Callable
 
+from starlette.requests import ClientDisconnect
 from starlette.responses import Response
 
 from .base import PassiveProbe
+
+# Recorded for a request whose client hung up before the response (nginx's
+# 499): an aborted upload is not a server error.
+CLIENT_CLOSED_REQUEST = 499
 
 
 def _status_code(value: Any, default: int) -> int:
@@ -168,6 +173,10 @@ class FastAPIRouteProbe(PassiveProbe):
         return status >= self.min_error_status, status
 
     def _classify_exception(self, exc: Exception) -> tuple[bool, int | None]:
-        """Use an ``HTTPException``'s status code; anything else counts as a 500."""
-        status = _status_code(getattr(exc, "status_code", 500), 500)
+        """Use an ``HTTPException``'s status code; a client that hung up while
+        the handler read its body is a 499; anything else counts as a 500."""
+        if isinstance(exc, ClientDisconnect):
+            status = CLIENT_CLOSED_REQUEST
+        else:
+            status = _status_code(getattr(exc, "status_code", 500), 500)
         return status >= self.min_error_status, status

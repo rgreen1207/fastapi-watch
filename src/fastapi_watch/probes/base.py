@@ -466,6 +466,8 @@ class PassiveProbe(BaseProbe):
 
         Works with both ``async def`` and ``def``. Records latency and whether
         the call raised an exception. Re-raises all exceptions unchanged.
+        Generator functions (``yield`` dependencies) stay generators and are
+        recorded when they finish, with the time spent running them.
 
         If the decorated function has a ``cache_info()`` method (i.e. it is
         wrapped with ``@lru_cache`` or ``@alru_cache``) and ``cache_reporting``
@@ -504,10 +506,11 @@ class PassiveProbe(BaseProbe):
 
         # Recording must never break the call it observes: failures are logged
         # and the original result or exception passes through unchanged.
-        def _on_success(result: Any, started: tuple[Any, float]) -> None:
+        def _on_success(result: Any, started: tuple[Any, float], rtt_ms: float | None = None) -> None:
             cache_before, start = started
             # Unrounded: check() rounds what it reports, so recording need not.
-            rtt_ms = (time.perf_counter() - start) * 1000
+            if rtt_ms is None:
+                rtt_ms = (time.perf_counter() - start) * 1000
             try:
                 if cache_before is not None:
                     self._record_cache_delta(cache_before, func.cache_info())
@@ -516,8 +519,9 @@ class PassiveProbe(BaseProbe):
             except Exception:
                 _LOGGER.debug("fastapi-watch: failed to record a call for probe %r", self.name, exc_info=True)
 
-        def _on_error(exc: Exception, started: tuple[Any, float]) -> None:
-            rtt_ms = (time.perf_counter() - started[1]) * 1000
+        def _on_error(exc: Exception, started: tuple[Any, float], rtt_ms: float | None = None) -> None:
+            if rtt_ms is None:
+                rtt_ms = (time.perf_counter() - started[1]) * 1000
             try:
                 is_error, status = self._classify_exception(exc)
                 self._record(
@@ -529,6 +533,82 @@ class PassiveProbe(BaseProbe):
                 )
             except Exception:
                 _LOGGER.debug("fastapi-watch: failed to record a call for probe %r", self.name, exc_info=True)
+
+        # Generators (``yield`` dependencies, streaming endpoints) stay generators,
+        # so FastAPI still runs them as such, and every send, throw and close is
+        # forwarded.  A call is recorded when the generator finishes: its RTT is
+        # the time spent running it, not the time suspended at a yield (the
+        # endpoint's work, for a dependency).  An exception thrown in that comes
+        # back out unchanged is the caller's error, not the generator's.
+        if inspect.isasyncgenfunction(func):
+            @functools.wraps(func)
+            async def async_gen_wrapper(*args: Any, **kwargs: Any) -> Any:
+                started = _start()
+                inner = func(*args, **kwargs)
+                busy_s = 0.0
+                sent: Any = None
+                thrown: BaseException | None = None
+                while True:
+                    resumed = time.perf_counter()
+                    try:
+                        item = await (inner.asend(sent) if thrown is None else inner.athrow(thrown))
+                    except StopAsyncIteration:
+                        _on_success(None, started, (busy_s + time.perf_counter() - resumed) * 1000)
+                        return
+                    except Exception as exc:
+                        rtt_ms = (busy_s + time.perf_counter() - resumed) * 1000
+                        _on_success(None, started, rtt_ms) if exc is thrown else _on_error(exc, started, rtt_ms)
+                        raise
+                    busy_s += time.perf_counter() - resumed
+                    try:
+                        sent, thrown = (yield item), None
+                    except GeneratorExit:
+                        resumed = time.perf_counter()
+                        try:
+                            await inner.aclose()
+                        except Exception as exc:
+                            _on_error(exc, started, (busy_s + time.perf_counter() - resumed) * 1000)
+                            raise
+                        _on_success(None, started, (busy_s + time.perf_counter() - resumed) * 1000)
+                        raise
+                    except BaseException as exc:
+                        sent, thrown = None, exc
+            return _resolved_signature(async_gen_wrapper, func)
+
+        if inspect.isgeneratorfunction(func):
+            @functools.wraps(func)
+            def gen_wrapper(*args: Any, **kwargs: Any) -> Any:
+                started = _start()
+                inner = func(*args, **kwargs)
+                busy_s = 0.0
+                sent: Any = None
+                thrown: BaseException | None = None
+                while True:
+                    resumed = time.perf_counter()
+                    try:
+                        item = inner.send(sent) if thrown is None else inner.throw(thrown)
+                    except StopIteration as stop:
+                        _on_success(None, started, (busy_s + time.perf_counter() - resumed) * 1000)
+                        return stop.value
+                    except Exception as exc:
+                        rtt_ms = (busy_s + time.perf_counter() - resumed) * 1000
+                        _on_success(None, started, rtt_ms) if exc is thrown else _on_error(exc, started, rtt_ms)
+                        raise
+                    busy_s += time.perf_counter() - resumed
+                    try:
+                        sent, thrown = (yield item), None
+                    except GeneratorExit:
+                        resumed = time.perf_counter()
+                        try:
+                            inner.close()
+                        except Exception as exc:
+                            _on_error(exc, started, (busy_s + time.perf_counter() - resumed) * 1000)
+                            raise
+                        _on_success(None, started, (busy_s + time.perf_counter() - resumed) * 1000)
+                        raise
+                    except BaseException as exc:
+                        sent, thrown = None, exc
+            return _resolved_signature(gen_wrapper, func)
 
         if _is_async_callable(func):
             @functools.wraps(func)
