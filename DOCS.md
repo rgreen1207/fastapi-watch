@@ -1249,6 +1249,8 @@ Details: `host`, `port`, `resolved_ips`, `connect_ms`.
 
 The name is resolved once per check, then the probe connects to the resolved addresses in order until one accepts. The lookup is a blocking call, so it runs in fastapi-watch's own small thread pool (see [Blocking checks](#blocking-checks-and-the-thread-pool)); if a DNS server hangs past the probe's deadline, later checks report `"previous check still running"` until that lookup returns.
 
+The probe closes each connection without speaking the server's protocol, and some servers count that as a failed client. PostgreSQL logs `incomplete startup packet` on every check. MySQL and MariaDB count it toward `max_connect_errors` (default 100) and then **block the host**, including your application's new connections from it, until `FLUSH HOSTS`. Don't point `TCPProbe` at a MySQL port; observe real queries with `MySQLProbe` instead.
+
 ---
 
 ### SMTP
