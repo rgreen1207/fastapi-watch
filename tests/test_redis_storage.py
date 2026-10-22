@@ -711,3 +711,43 @@ async def test_result_named_differently_is_stored_under_the_probe_name(client, s
         f"{prefix}:history:composite", f"{prefix}:latest:composite", f"{prefix}:names",
     ]
     assert [r.name for r in (await _store(spy, prefix).get_history())["composite"]] == ["composite"] * 20
+
+
+async def test_reads_by_name_touch_only_those_probes(client, spy, prefix):
+    """Apps sharing a prefix read only their own probes' history and alerts."""
+    store = _store(spy, prefix)
+    for name in ("billing-db", "search-db"):
+        await store.append_history(_result(name))
+        await store.append_alert(_alert(name))
+    commands = []
+    original = spy.pipeline
+
+    def recording_pipeline(transaction=True):
+        pipe = original(transaction)
+
+        class _Recorder:
+            async def __aenter__(self):
+                await pipe.__aenter__()
+                return self
+
+            async def __aexit__(self, *exc):
+                return await pipe.__aexit__(*exc)
+
+            async def execute(self):
+                return await pipe.execute()
+
+            def __getattr__(self, name):
+                def queue(*args, **kwargs):
+                    commands.append((name, args[0] if args else None))
+                    return getattr(pipe, name)(*args, **kwargs)
+                return queue
+
+        return _Recorder()
+
+    spy.pipeline = recording_pipeline
+    history = await store.get_history(["billing-db"])
+    assert set(history) == {"billing-db"}
+    assert commands == [("zrevrangebyscore", f"{prefix}:history:billing-db")]
+    assert [a.probe for a in await store.get_alerts(["billing-db"])] == ["billing-db"]
+    assert await store.get_history([]) == {}
+    assert set(await store.get_history()) == {"billing-db", "search-db"}

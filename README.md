@@ -249,7 +249,7 @@ registry = HealthRegistry(
 
 The four retention arguments are passed to `HealthRegistry` here, so the registry applies them to the backend through `configure()`. Leave all four out and the backend keeps its own constructor values (`RedisProbeStorage(..., max_results=..., result_ttl_seconds=..., alert_ttl_seconds=..., max_alerts=...)`, same defaults).
 
-It is safe to point at the Redis your app already uses: it never runs `KEYS` or `SCAN`, every write is a single `MULTI/EXEC` round trip, and all keys sit under `prefix`. Cleanup of removed probes (`forget()`) only deletes names the same process wrote and no longer registers, so apps and replicas sharing a prefix never delete each other's data, even during a rolling deploy. Still, give each app its own prefix: two apps that register the same probe name on one prefix share that probe's data. Storage is capped by count, by age (per entry), and by bytes:
+It is safe to point at the Redis your app already uses: it never runs `KEYS` or `SCAN`, every write is a single `MULTI/EXEC` round trip, and all keys sit under `prefix`. Cleanup of removed probes (`forget()`) only deletes names the same process wrote and no longer registers, so apps and replicas sharing a prefix never delete each other's data, even during a rolling deploy. History, alerts and the dashboard show only the app's own probes, so apps sharing a prefix do not see each other's data. Still, give each app its own prefix: two apps that register the same probe name on one prefix share that probe's data. Storage is capped by count, by age (per entry), and by bytes:
 
 ```
 redis bytes ≤ probes × ((history_size + 1) × max_entry_bytes + probe name) + max_alerts × (~150 B + probe name)

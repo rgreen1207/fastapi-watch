@@ -624,6 +624,9 @@ class HealthRegistry:
             and only the first to announce each change sends it.  A failing claim sends anyway.  Without
             ``claim_alert`` a warning is logged at init and alerts are not
             deduplicated.
+        include_in_schema: List the health endpoints in the app's OpenAPI
+            schema and ``/docs`` (keyword-only, default ``False``: they are
+            operational endpoints, not part of the application's API).
         stream_token_secret: Key that signs the dashboard's short-lived stream
             tokens (keyword-only).  By default the key is derived from the
             *auth* credentials with scrypt, or is random per process for a
@@ -674,6 +677,7 @@ class HealthRegistry:
         max_stream_connections: int | None = 100,
         alert_min_interval_s: float = 0.0,
         alert_dedupe_window_s: float | None = None,
+        include_in_schema: bool = False,
     ) -> None:
         if probe_timeout is not None and probe_timeout <= 0:
             raise ValueError(f"probe_timeout must be positive or None, got {probe_timeout!r}")
@@ -819,7 +823,7 @@ class HealthRegistry:
             self._alert_dedupe_window_s = None
 
         if serve_routes:
-            self._register_routes(tags or ["health"], dashboard=dashboard)
+            self._register_routes(tags or ["health"], dashboard=dashboard, include_in_schema=include_in_schema)
         self._shut_down: bool = False
         self._hook_shutdown()
         for group in groups or []:
@@ -1502,6 +1506,38 @@ class HealthRegistry:
         except Exception as exc:
             self._log_storage_failure(op, exc)
             return _STORAGE_FAILED
+
+    def _storage_reads_by_name(self, op: str) -> bool:
+        """True if ``storage.<op>`` takes ``names`` (the built-in backends do)."""
+        try:
+            return "names" in inspect.signature(getattr(self._storage, op)).parameters
+        except (TypeError, ValueError):
+            return False
+
+    async def _own_history(self) -> Any:
+        """History of the probes this registry registers, or ``_STORAGE_FAILED``.
+
+        Apps sharing a storage namespace (the same Redis prefix) must not see
+        each other's probes; replicas of one app register the same names, so
+        they still share their history.
+        """
+        names = {p.name for p, _ in self._probes}
+        if self._storage_reads_by_name("get_history"):
+            return await self._storage_call("get_history", names)
+        history = await self._storage_call("get_history")
+        if history is _STORAGE_FAILED:
+            return history
+        return {name: entries for name, entries in history.items() if name in names}
+
+    async def _own_alerts(self) -> Any:
+        """Alerts of the probes this registry registers, or ``_STORAGE_FAILED``."""
+        names = {p.name for p, _ in self._probes}
+        if self._storage_reads_by_name("get_alerts"):
+            return await self._storage_call("get_alerts", names)
+        alerts = await self._storage_call("get_alerts")
+        if alerts is _STORAGE_FAILED:
+            return alerts
+        return [alert for alert in alerts if alert.probe in names]
 
     def _log_storage_failure(self, op: str, exc: BaseException) -> None:
         """Log a failed storage *op*, at most once per ``_STORAGE_LOG_INTERVAL_S``."""
@@ -2371,6 +2407,7 @@ class HealthRegistry:
         self,
         tags: list[str],
         dashboard: bool | Callable[..., str] | str | Path = True,
+        include_in_schema: bool = False,
     ) -> None:
         registry = self
         prefix = self.prefix
@@ -2445,6 +2482,7 @@ class HealthRegistry:
         @self.app.get(
             f"{prefix}/live",
             tags=tags,
+            include_in_schema=include_in_schema,
             summary="Liveness check",
             description="Returns 200 while the process is running.",
             dependencies=auth_deps,
@@ -2455,6 +2493,7 @@ class HealthRegistry:
         @self.app.get(
             f"{prefix}/ready",
             tags=tags,
+            include_in_schema=include_in_schema,
             summary="Readiness check",
             description="Returns 200 if all critical probes pass, 503 otherwise.",
             dependencies=auth_deps,
@@ -2491,6 +2530,7 @@ class HealthRegistry:
         @self.app.get(
             f"{prefix}/status",
             tags=tags,
+            include_in_schema=include_in_schema,
             summary="Detailed health status",
             description="Returns full probe results. 200 when all healthy, 207 when any probe fails.",
             dependencies=auth_deps,
@@ -2521,6 +2561,7 @@ class HealthRegistry:
         @self.app.get(
             f"{prefix}/history",
             tags=tags,
+            include_in_schema=include_in_schema,
             summary="Probe result history",
             description=(
                 "Returns the last N results for each probe (oldest-first), within the result TTL window. "
@@ -2529,7 +2570,7 @@ class HealthRegistry:
             dependencies=auth_deps,
         )
         async def probe_history() -> Response:
-            history = await registry._storage_call("get_history")
+            history = await registry._own_history()
             if history is _STORAGE_FAILED:
                 return _storage_unavailable()
             # Serialized in one pass by pydantic-core: history can run to
@@ -2540,6 +2581,7 @@ class HealthRegistry:
         @self.app.get(
             f"{prefix}/alerts",
             tags=tags,
+            include_in_schema=include_in_schema,
             summary="Alert history",
             description=(
                 "Returns probe state-change alerts retained within the alert TTL window (default 72 hours). "
@@ -2548,7 +2590,7 @@ class HealthRegistry:
             dependencies=auth_deps,
         )
         async def alert_history() -> Response:
-            alerts = await registry._storage_call("get_alerts")
+            alerts = await registry._own_alerts()
             if alerts is _STORAGE_FAILED:
                 return _storage_unavailable()
             return Response(content=to_json({"alerts": alerts}), media_type="application/json")
@@ -2556,6 +2598,7 @@ class HealthRegistry:
         @self.app.get(
             f"{prefix}/startup",
             tags=tags,
+            include_in_schema=include_in_schema,
             summary="Startup check",
             description=(
                 "Returns 503 until :meth:`set_started` is called (and any startup probes pass). "
@@ -2580,6 +2623,7 @@ class HealthRegistry:
         @self.app.get(
             f"{prefix}/probes",
             tags=tags,
+            include_in_schema=include_in_schema,
             summary="Probe introspection",
             description="Lists all registered probes and their config without running them.",
             dependencies=auth_deps,
@@ -2600,6 +2644,7 @@ class HealthRegistry:
         @self.app.get(
             f"{prefix}/ready/stream",
             tags=tags,
+            include_in_schema=include_in_schema,
             summary="Readiness stream",
             description="SSE (Server-Sent Events) stream of readiness. Poll loop stops when last client disconnects.",
             dependencies=stream_deps,
@@ -2621,6 +2666,7 @@ class HealthRegistry:
         @self.app.get(
             f"{prefix}/status/stream",
             tags=tags,
+            include_in_schema=include_in_schema,
             summary="Health status stream",
             description=(
                 "SSE (Server-Sent Events) stream of full probe results. Poll loop stops when last client disconnects. "
@@ -2645,6 +2691,7 @@ class HealthRegistry:
         @self.app.get(
             f"{prefix}/metrics",
             tags=tags,
+            include_in_schema=include_in_schema,
             summary="Prometheus metrics",
             description=(
                 "Probe health exported in Prometheus text format 0.0.4.  "
@@ -2663,6 +2710,7 @@ class HealthRegistry:
         @self.app.get(
             f"{prefix}/maintenance",
             tags=tags,
+            include_in_schema=include_in_schema,
             summary="Maintenance mode status",
             description="Returns whether maintenance mode is currently active and when it expires.",
             dependencies=auth_deps,
@@ -2686,6 +2734,7 @@ class HealthRegistry:
             @self.app.post(
                 f"{prefix}/maintenance",
                 tags=tags,
+                include_in_schema=include_in_schema,
                 summary="Enable maintenance mode",
                 description=(
                     "Enables maintenance mode. Optional body: ``{\"minutes\": N}`` or "
@@ -2731,6 +2780,7 @@ class HealthRegistry:
             @self.app.delete(
                 f"{prefix}/maintenance",
                 tags=tags,
+                include_in_schema=include_in_schema,
                 summary="Disable maintenance mode",
                 description="Clears maintenance mode immediately. Browser cross-site requests get 403.",
                 dependencies=change_deps,
@@ -2797,6 +2847,7 @@ class HealthRegistry:
                     @self.app.get(
                         f"{prefix}/dashboard/stream-url",
                         tags=tags,
+                        include_in_schema=include_in_schema,
                         summary="Fresh dashboard stream URL",
                         description=(
                             "Returns the dashboard's live-update stream URL with a newly minted token, "
@@ -2816,6 +2867,7 @@ class HealthRegistry:
             @self.app.get(
                 f"{prefix}/dashboard",
                 tags=tags,
+                include_in_schema=include_in_schema,
                 summary="Health dashboard",
                 description="Server-rendered HTML dashboard with live SSE updates.",
                 response_class=HTMLResponse,
@@ -2828,7 +2880,7 @@ class HealthRegistry:
                     checked_at=registry._last_checked_at,
                     timezone=registry._timezone_name,
                 )
-                history = await registry._storage_call("get_history") if builtin_dashboard else None
+                history = await registry._own_history() if builtin_dashboard else None
                 if history is _STORAGE_FAILED:
                     history = {}  # the page still renders, from live results only
                 # The built-in page runs only its own script, so it gets a strict

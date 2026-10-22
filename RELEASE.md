@@ -37,6 +37,8 @@ Most fixes need no action. These change what you see or what is accepted:
 - **`auth={"type": "apikey", "header": ...}`** must be a non-empty string; a blank or non-string header name raises `ValueError` at startup.
 - **A negative or NaN `result_ttl_seconds` / `alert_ttl_seconds` raises `ValueError`** with the default in-memory storage too, as it already did with `RedisProbeStorage`; it used to switch time-based expiry off silently.
 - **A client that hangs up before the response starts is recorded as `499`, not `500`**, by `RequestMetricsMiddleware` and route probes (an aborted upload, where Starlette raises `ClientDisconnect`). With the default `min_error_status=500` it no longer counts as an error.
+- **Health endpoints are no longer listed in the app's OpenAPI schema and `/docs`.** Pass `HealthRegistry(..., include_in_schema=True)` to list them again.
+- **`/health/history`, `/health/alerts` and the dashboard show only this app's probes.** Apps sharing a storage namespace (the same Redis prefix, which defaults to `fastapi-watch` for every app) each served the other's probe history, details and alerts. Replicas of one app register the same names and still share them. `get_history()` and `get_alerts()` on the built-in backends take an optional `names` argument, so only those keys are read; a custom backend without it keeps working and is filtered by the registry.
 
 ### Bug Fixes
 
