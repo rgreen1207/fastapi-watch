@@ -1220,7 +1220,7 @@ registry.add(chat_probe)
 
 ### Event loop lag
 
-`EventLoopProbe` measures asyncio event loop blocking. Its first check starts a lightweight background sampler that sleeps for `sample_interval_ms` (default 100) and records how late it wakes up, so stalls that happen *between* checks are caught — a single measurement at check time only runs once the loop is free again.
+`EventLoopProbe` measures asyncio event loop blocking. Its first check starts a lightweight background sampler that sleeps for `sample_interval_ms` (default 100, at least 1) and records how late it wakes up, so stalls that happen *between* checks are caught — a single measurement at check time only runs once the loop is free again.
 
 ```python
 from fastapi_watch.probes import EventLoopProbe
