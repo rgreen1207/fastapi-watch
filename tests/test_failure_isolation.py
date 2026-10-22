@@ -441,3 +441,26 @@ def test_threshold_probe_carries_inner_metadata():
     wrapped = ThresholdProbe(inner, warn_if=lambda d: False)
     assert (wrapped.description, wrapped.tags) == ("session cache", ["redis"])
     assert wrapped.circuit_breaker_enabled is False  # passive inner keeps the breaker off
+
+
+@pytest.mark.parametrize("returned", [None, {"status": "healthy"}])
+def test_probe_returning_a_non_result_is_unhealthy_not_a_500(returned):
+    class _Bad(BaseProbe):
+        name = "bad"
+
+        async def check(self):
+            return returned
+
+    class _Good(BaseProbe):
+        name = "good"
+
+        async def check(self):
+            return ProbeResult(name="good", status=ProbeStatus.HEALTHY)
+
+    app = FastAPI()
+    HealthRegistry(app, poll_interval_ms=None).add(_Bad()).add(_Good())
+    resp = TestClient(app, raise_server_exceptions=False).get("/health/status")
+    assert resp.status_code == 207
+    probes = {p["name"]: p for p in resp.json()["probes"]}
+    assert probes["bad"]["status"] == "unhealthy" and "TypeError" in probes["bad"]["error"]
+    assert probes["good"]["status"] == "healthy"

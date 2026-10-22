@@ -1469,6 +1469,9 @@ class HealthRegistry:
         try:
             coro = probe.check()
             result = await asyncio.wait_for(coro, timeout) if timeout is not None else await coro
+            if not isinstance(result, ProbeResult):
+                # Left unchecked, one buggy custom probe turned every endpoint into a 500.
+                raise TypeError(f"check() returned {type(result).__name__}, not ProbeResult")
         except asyncio.TimeoutError:
             if self._logger:
                 self._logger.warning("Probe %r timed out after %g s", probe.name, timeout)
