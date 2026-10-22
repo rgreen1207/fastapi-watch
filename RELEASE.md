@@ -29,8 +29,16 @@ Most fixes need no action. These change what you see or what is accepted:
 - **`EventLoopProbe(sample_interval_ms=...)` below 1 raises `ValueError`**; `alert_dedupe_window_s` and `alert_min_interval_s` must be finite.
 - **A custom `check()` that returns something other than a `ProbeResult`** is reported as that probe's `UNHEALTHY` result instead of failing every health endpoint with `500`.
 - **The dashboard is served with `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and `frame-ancestors 'none'`.**
+- **`POST`/`DELETE /health/maintenance` read the body only after authentication** and refuse one over 4 KiB with `413`. An unauthenticated request now gets `401`/`403` whatever its body (a malformed one used to get `422`); non-JSON bodies from authenticated clients still get `415`.
+- **`auth={"type": "apikey", "header": ...}`** must be a non-empty string; a blank or non-string header name raises `ValueError` at startup.
 
 ### Bug Fixes
+
+#### Registry review round
+
+- **Shutdown never ran for apps with a `lifespan=`.** Starlette skips `on_shutdown` handlers once an app has its own lifespan, which is how every documented example is set up, so queued alerts were dropped, background storage writes abandoned, and probe `aclose()` never called. The registry now wraps the app's lifespan and shuts down before the app's own teardown. Each lifespan also starts it afresh: after one shutdown, streams of a second run in the same process (`with TestClient(app)` per test) returned nothing and alerts stopped.
+- **Unauthenticated clients could make the app parse arbitrary JSON.** FastAPI reads and parses a declared request body before any dependency runs, so `POST /health/maintenance` parsed bodies of any size on the event loop before checking credentials (40 MB took 0.6 s). The body is now read after authentication and capped at 4 KiB.
+- **Concurrent `/health/startup` requests share one check.** Each request ran every startup probe, so a burst of requests (from anyone, with `auth=None`) became that many concurrent checks of each startup dependency.
 
 #### Second review round
 

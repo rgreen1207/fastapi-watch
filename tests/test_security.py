@@ -563,6 +563,10 @@ async def test_rabbitmq_management_api_sends_basic_auth_header_without_deprecate
     {"type": "basic", "username": "ops", "password": ""},
     {"type": "basic", "username": "ops", "password": " \t"},
     {"type": "basic", "username": "ops"},
+    # A blank header name refused every request; a non-string one failed it with 500.
+    {"type": "apikey", "key": "k", "header": ""},
+    {"type": "apikey", "key": "k", "header": "  "},
+    {"type": "apikey", "key": "k", "header": None},
 ])
 @pytest.mark.parametrize("serve_routes", [True, False])
 def test_blank_credentials_raise_at_init(auth, serve_routes):

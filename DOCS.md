@@ -327,7 +327,7 @@ curl https://your-app/health/maintenance
 
 An `until` without a UTC offset is read in the registry's `timezone`. An `until` that has already passed is rejected with `422` and leaves any current maintenance window untouched.
 
-Because browsers attach cached Basic credentials to any request to your site, `POST` and `DELETE` refuse cross-site browser requests with `403`: a `Sec-Fetch-Site: cross-site` header, or an `Origin` whose host and port don't match the request's `Host` (or `X-Forwarded-Host`). A non-empty body must be `Content-Type: application/json`, otherwise `415`. curl, scripts and other non-browser clients send neither header, so the commands above, including the empty-body `POST`, work unchanged.
+Because browsers attach cached Basic credentials to any request to your site, `POST` and `DELETE` refuse cross-site browser requests with `403`: a `Sec-Fetch-Site: cross-site` header, or an `Origin` whose host and port don't match the request's `Host` (or `X-Forwarded-Host`). A non-empty body must be `Content-Type: application/json`, otherwise `415`, and at most 4 KiB, otherwise `413`; it is read only after the credentials are checked. curl, scripts and other non-browser clients send neither header, so the commands above, including the empty-body `POST`, work unchanged.
 
 ### Deployment workflow
 

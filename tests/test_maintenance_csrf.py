@@ -169,6 +169,70 @@ def test_json_with_charset_parameter_is_accepted():
     assert resp.status_code == 200
 
 
+def test_body_is_not_read_before_auth():
+    """FastAPI parses a declared Body() before any dependency, so anyone could make
+    the event loop parse megabytes of JSON; a malformed body answered 422, not 401."""
+    registry, client = _setup()
+    resp = client.post("/health/maintenance", content=b"{not json", headers={"Content-Type": "application/json"})
+    assert resp.status_code == 401
+    big = b'{"minutes": [' + b",".join([b"1"] * 100_000) + b"]}"
+    resp = client.post("/health/maintenance", content=big, headers={"Content-Type": "application/json"})
+    assert resp.status_code == 401
+    assert registry._in_maintenance() is False
+
+
+def test_oversized_body_is_refused_with_413():
+    registry, client = _setup()
+    body = b'{"minutes": 5, "pad": "' + b"x" * 5000 + b'"}'
+    resp = client.post("/health/maintenance", content=body, headers={**_CREDS, "Content-Type": "application/json"})
+    assert resp.status_code == 413
+    assert registry._in_maintenance() is False
+
+
+def test_oversized_chunked_body_is_refused_with_413():
+    """No Content-Length: the limit is enforced while reading."""
+    registry, client = _setup()
+
+    def _chunks():
+        yield b'{"minutes": 5, "pad": "'
+        for _ in range(10):
+            yield b"x" * 1000
+        yield b'"}'
+
+    resp = client.post("/health/maintenance", content=_chunks(), headers={**_CREDS, "Content-Type": "application/json"})
+    assert resp.status_code == 413
+    assert registry._in_maintenance() is False
+
+
+@pytest.mark.parametrize("body, field", [
+    ({"minutes": 0}, "minutes"),
+    ({"minutes": "soon"}, "minutes"),
+    ({"until": "not a date"}, "until"),
+])
+def test_invalid_body_is_a_422_naming_the_field(body, field):
+    registry, client = _setup()
+    resp = client.post("/health/maintenance", headers=_CREDS, json=body)
+    assert resp.status_code == 422
+    assert resp.json()["detail"][0]["loc"] == ["body", field]
+    assert registry._in_maintenance() is False
+
+
+def test_malformed_json_is_a_422():
+    registry, client = _setup()
+    resp = client.post("/health/maintenance", headers={**_CREDS, "Content-Type": "application/json"}, content=b"{")
+    assert resp.status_code == 422
+    assert registry._in_maintenance() is False
+
+
+def test_maintenance_body_is_still_documented():
+    _, client = _setup()
+    spec = client.get("/openapi.json").json()
+    schema = spec["paths"]["/health/maintenance"]["post"]["requestBody"]["content"]["application/json"]["schema"]
+    if "$ref" in schema:  # how a Body() parameter was documented
+        schema = spec["components"]["schemas"][schema["$ref"].rsplit("/", 1)[-1]]
+    assert set(schema["properties"]) == {"minutes", "until"}
+
+
 @pytest.mark.parametrize("origin, hosts, expected", [
     ("https://example.com", ["example.com"], True),
     ("https://example.com", ["example.com:443"], True),
