@@ -34,7 +34,50 @@ import time
 from collections import deque
 from typing import Protocol, runtime_checkable
 
+from pydantic_core import to_json
+
 from .models import AlertRecord, ProbeResult
+
+_MIN_ENTRY_BYTES = 512
+_TRUNCATED = "_truncated"
+
+
+def _fit(result: ProbeResult, budget: int) -> "tuple[ProbeResult, bytes]":
+    """Return *result*, cut to serialize in at most *budget* bytes, and its JSON.
+
+    An oversized result loses its largest ``details`` values first and is
+    marked ``details["_truncated"] = True``; if that is not enough, its
+    ``description`` and ``tags`` go and ``error`` is shortened.  Only a probe
+    name longer than *budget* can leave it over.
+    """
+    raw = to_json(result)
+    if len(raw) <= budget:
+        return result, raw
+    details = {k: v for k, v in (result.details or {}).items() if k != _TRUNCATED}
+    sizes = {k: len(to_json(k)) + len(to_json(v)) + 2 for k, v in details.items()}
+    excess = len(raw) + 20 - budget  # 20 ≈ the "_truncated":true marker
+    droppable = sorted(details, key=sizes.__getitem__, reverse=True)
+    while droppable and excess > 0:  # drop the largest values until the estimate fits
+        key = droppable.pop(0)
+        del details[key]
+        excess -= sizes[key]
+    candidate = result.model_copy(update={"details": {**details, _TRUNCATED: True}})
+    raw = to_json(candidate)
+    while len(raw) > budget and droppable:  # estimate was short: keep dropping
+        del details[droppable.pop(0)]
+        candidate = result.model_copy(update={"details": {**details, _TRUNCATED: True}})
+        raw = to_json(candidate)
+    if len(raw) <= budget:
+        return candidate, raw
+    # Details alone were not the problem: shed free-text fields too.
+    candidate = result.model_copy(update={"details": {_TRUNCATED: True}, "description": None, "tags": []})
+    raw = to_json(candidate)
+    if len(raw) > budget and candidate.error:
+        error = candidate.error.encode("utf-8")
+        keep = max(0, len(error) - (len(raw) - budget) - 3)
+        candidate = candidate.model_copy(update={"error": error[:keep].decode("utf-8", "ignore") + "..."})
+        raw = to_json(candidate)
+    return candidate, raw
 
 
 @runtime_checkable
@@ -107,7 +150,10 @@ class InMemoryProbeStorage:
 
     **History** (rolling window per probe): capped at *max_results* entries
     (default 120 per probe); oldest entries are evicted when the cap is
-    reached.  The same *result_ttl_seconds* TTL applies on read.
+    reached.  The same *result_ttl_seconds* TTL applies on read.  Entries
+    larger than *max_entry_bytes* (as JSON) lose their biggest ``details``
+    values first and are marked ``details["_truncated"] = True``, so one
+    probe with a huge payload cannot hold *max_results* copies of it.
 
     **Alerts** (state-change log): capped at *max_alerts* entries (default
     120 total); oldest alerts are evicted when full.  Alerts older than
@@ -126,7 +172,11 @@ class InMemoryProbeStorage:
         result_ttl_seconds: float = 7200.0,
         alert_ttl_seconds: float = 259200.0,
         max_alerts: int = 120,
+        max_entry_bytes: int = 8192,
     ) -> None:
+        if max_entry_bytes < _MIN_ENTRY_BYTES:
+            raise ValueError(f"max_entry_bytes must be at least {_MIN_ENTRY_BYTES}")
+        self._max_entry_bytes = int(max_entry_bytes)
         self._max_results = max(1, max_results)
         self._result_ttl = result_ttl_seconds
         self._alert_ttl = alert_ttl_seconds
@@ -219,6 +269,7 @@ class InMemoryProbeStorage:
         self._cache_times.clear()
 
     async def append_history(self, result: ProbeResult) -> None:
+        result, _ = _fit(result, self._max_entry_bytes)
         name = result.name
         if name not in self._history:
             self._history[name] = deque(maxlen=self._max_results)

@@ -3,6 +3,8 @@ import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import pytest
+
 import fastapi_watch.storage as storage_module
 from fastapi_watch.models import AlertRecord, ProbeResult, ProbeStatus
 from fastapi_watch.storage import InMemoryProbeStorage
@@ -100,3 +102,25 @@ async def test_claim_alert_non_positive_ttl_always_true_and_stores_nothing():
         assert await store.claim_alert("db:unhealthy", 0) is True
         assert await store.claim_alert("db:unhealthy", -1) is True
     assert store._claims == {}
+
+
+async def test_history_entries_capped_by_bytes():
+    # A probe returning a huge payload must not keep max_results full copies in process memory.
+    store = InMemoryProbeStorage(max_results=50, max_entry_bytes=1024)
+    big = ProbeResult(
+        name="mq", status=ProbeStatus.HEALTHY,
+        details={"queues": {f"q{i}": {"messages": i} for i in range(5000)}, "p95_rtt_ms": 2.0},
+    )
+    small = _result()
+    for _ in range(50):
+        await store.append_history(big)
+        await store.append_history(small)
+    history = await store.get_history()
+    assert all(len(r.model_dump_json()) <= 1024 for r in history["mq"])
+    assert history["mq"][0].details == {"p95_rtt_ms": 2.0, "_truncated": True}
+    assert history["db"][0] is small  # entries within the cap are stored as is
+
+
+def test_rejects_tiny_entry_budget():
+    with pytest.raises(ValueError):
+        InMemoryProbeStorage(max_entry_bytes=100)
