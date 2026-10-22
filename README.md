@@ -250,7 +250,7 @@ It is safe to point at the Redis your app already uses: it never runs `KEYS` or 
 redis bytes ≤ probes × ((history_size + 1) × max_entry_bytes + probe name) + max_alerts × (~150 B + probe name)
 ```
 
-Replicas sharing a prefix also share alert dedupe: `claim_alert(key, ttl_seconds)` is one `SET NX PX`, so only one replica sends each alert, and every claim key expires.
+Replicas sharing a prefix also share alert dedupe: `claim_alert(key, value, ttl_seconds)` is one atomic compare-and-set (a short Lua script), so only one replica sends each alert, a status the probe returns to within the window is sent again, and every claim key expires.
 
 Latest results and history entries larger than `max_entry_bytes` drop their largest `details` values first and are marked `details["_truncated"] = true`. With the defaults, 20 probes take at most about 19 MB of history, and typically far less. The backend runs at most `max_connections` (default 4) Redis commands at once, so checking many probes together cannot drain a connection pool your app shares.
 

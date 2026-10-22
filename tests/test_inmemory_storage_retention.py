@@ -87,20 +87,31 @@ async def test_forget_drops_only_the_named_probes():
 
 async def test_claim_alert_first_caller_wins_until_expiry(monkeypatch):
     store = InMemoryProbeStorage()
-    assert await store.claim_alert("db:unhealthy", 10) is True
-    assert await store.claim_alert("db:unhealthy", 10) is False
-    assert await store.claim_alert("db:healthy", 10) is True
+    assert await store.claim_alert("db", "unhealthy", 10) is True
+    assert await store.claim_alert("db", "unhealthy", 10) is False
+    assert await store.claim_alert("cache", "unhealthy", 10) is True  # other key, own claim
     real = time.monotonic
     monkeypatch.setattr(storage_module, "time", SimpleNamespace(monotonic=lambda: real() + 60))
-    assert await store.claim_alert("db:unhealthy", 10) is True
-    assert list(store._claims) == ["db:unhealthy"]  # expired claims purged: stays bounded
+    assert await store.claim_alert("db", "unhealthy", 10) is True
+    assert list(store._claims) == ["db"]  # expired claims purged: stays bounded
+
+
+async def test_claim_alert_status_returned_to_within_window_is_claimable():
+    # unhealthy -> healthy -> unhealthy inside the window: the re-failure must be sent.
+    store = InMemoryProbeStorage()
+    assert await store.claim_alert("db", "unhealthy", 60) is True
+    assert await store.claim_alert("db", "unhealthy", 60) is False  # another replica, same change
+    assert await store.claim_alert("db", "healthy", 60) is True
+    assert await store.claim_alert("db", "unhealthy", 60) is True
+    assert await store.claim_alert("db", "unhealthy", 60) is False
+    assert len(store._claims) == 1  # one claim per key
 
 
 async def test_claim_alert_non_positive_ttl_always_true_and_stores_nothing():
     store = InMemoryProbeStorage()
     for _ in range(3):
-        assert await store.claim_alert("db:unhealthy", 0) is True
-        assert await store.claim_alert("db:unhealthy", -1) is True
+        assert await store.claim_alert("db", "unhealthy", 0) is True
+        assert await store.claim_alert("db", "unhealthy", -1) is True
     assert store._claims == {}
 
 

@@ -31,6 +31,13 @@ from pydantic_core import to_json
 from .models import AlertRecord, ProbeResult
 from .storage import _MIN_ENTRY_BYTES, _fit
 
+# claim_alert: replace the value unless it is already this one, atomically.
+_CLAIM_SCRIPT = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then return 0 end
+redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+return 1
+"""
+
 # Key-level PEXPIRE is a safety net on top of per-entry pruning: it removes a
 # whole collection once nothing has been written to it for ttl + this margin.
 _EXPIRY_MARGIN_MS = 60_000
@@ -100,8 +107,9 @@ class RedisProbeStorage:
     Keys (``P`` = *prefix*): ``P:names`` (sorted set of probe names scored by
     last write time), ``P:latest:<name>`` (string), ``P:history:<name>``
     (sorted set scored by ``checked_at``), ``P:alerts`` (sorted set scored by
-    ``timestamp``) and short-lived ``P:alert-claim:<key>`` markers written by
-    :meth:`claim_alert`.
+    ``timestamp``) and short-lived ``P:alert-claim:<key>`` strings written by
+    :meth:`claim_alert` (the registry uses one per probe, holding its last
+    announced status).
 
     **Size bound.**  Redis memory used by this backend is at most::
 
@@ -111,8 +119,8 @@ class RedisProbeStorage:
     written within the last ``result_ttl_seconds`` (or, when that TTL is
     ``0``, ever written and not yet removed by :meth:`forget`), ``A`` the size
     of one serialized alert (about 150 bytes plus the probe name) and ``C``
-    the alert claims live at once (one small key per claimed alert, each
-    expiring after its claim TTL).  Each latest result and history entry is
+    the alert claims live at once (one small key per probe, each expiring
+    after its claim TTL).  Each latest result and history entry is
     cut to ``max_entry_bytes`` (unless the probe name alone exceeds it); every
     write trims its collection, and the index, by count and by age in the
     same transaction that adds to it; and once a collection stops being
@@ -371,18 +379,21 @@ class RedisProbeStorage:
             )
         return [AlertRecord.model_validate_json(_payload(m)) for m in reversed(members)]
 
-    async def claim_alert(self, key: str, ttl_seconds: float) -> bool:
-        """Return True if this caller is first to claim *key* within *ttl_seconds*.
+    async def claim_alert(self, key: str, value: str, ttl_seconds: float) -> bool:
+        """Store *value* under *key* for *ttl_seconds*; return False only if the
+        key already held this *value*.
 
-        One ``SET NX PX``, so exactly one of several replicas sharing the prefix
-        wins.  The claim key always expires; ``ttl_seconds <= 0`` claims
-        without storing anything.
+        One Lua script (``GET``, compare, ``SET PX``), so of several replicas
+        sharing the prefix exactly one gets True for each value, and a new
+        value (a probe changing status again) is always claimable.  The claim
+        key always expires; ``ttl_seconds <= 0`` claims without storing anything.
         """
         ttl_ms = math.ceil(ttl_seconds * 1000)
         if ttl_ms <= 0:
             return True
         async with self._slot():
-            return bool(await self._redis.set(f"{self._prefix}:alert-claim:{key}", 1, nx=True, px=ttl_ms))
+            claimed = await self._redis.eval(_CLAIM_SCRIPT, 1, f"{self._prefix}:alert-claim:{key}", value, ttl_ms)
+        return bool(claimed)
 
     # ----------------------------------------------------------------- forget
 

@@ -614,7 +614,7 @@ Built so monitoring never loads the Redis it shares with your app:
 - **Byte cap.** A latest result or history entry over `max_entry_bytes` loses its largest `details` values first (for example a request-metrics probe's per-route table) and gets `details["_truncated"] = true`; scalar values such as `p95_rtt_ms` stay, so dashboard graphs keep working. If that is not enough, `description` and `tags` are dropped and `error` is shortened.
 - **Cleanup.** Keys of probes that stop reporting expire on their own. `forget(names)` deletes the latest result, history and index entry of exactly the named probes; the registry passes only names it wrote and no longer registers, so it never removes another app's or replica's data. With `result_ttl_seconds=0` nothing expires, so a probe renamed or removed across a restart keeps its keys until you delete them (`await storage.forget({"old-name"})`); this includes keys written while the TTL was `0` and never written again after you set one.
 - **Upgrading.** Versions before this one indexed names in a set at `<prefix>:probes`. Each new instance deletes it on its first write; with a non-zero TTL it would also expire on its own.
-- **One alert per state change across replicas.** `claim_alert` is a single `SET <prefix>:alert-claim:<key> 1 NX PX <ttl>`; only the first replica to claim a key gets `True`, and every claim key expires.
+- **One alert per state change across replicas.** `claim_alert(key, value, ttl_seconds)` is one Lua script on `<prefix>:alert-claim:<key>`: it returns `False` if the key already holds `value`, and otherwise stores `value` with a `PX` expiry and returns `True`. So only the first replica to announce a status gets `True`, a probe that changes status again within the window (unhealthy → healthy → unhealthy) is announced again, and every claim key expires.
 
 Upper bound on memory used:
 
@@ -630,7 +630,7 @@ Implement the eight `ProbeStorage` methods: `get_latest`, `get_all_latest`, `set
 
 - `configure(*, max_results, result_ttl_seconds, alert_ttl_seconds, max_alerts)`: receives the registry's retention settings, only when at least one was passed to `HealthRegistry` (see [Retention settings](#retention-settings)).
 - `async forget(names: set[str])`: delete the latest result, history and any index entry of exactly the probes in `names`, and nothing else. The registry passes only names this process wrote and no longer registers.
-- `async claim_alert(key: str, ttl_seconds: float) -> bool`: return `True` only for the first caller to claim `key` within `ttl_seconds`, so one replica sends each alert. `ttl_seconds <= 0` always returns `True`. Claims must expire.
+- `async claim_alert(key: str, value: str, ttl_seconds: float) -> bool`: atomically store `value` under `key` for `ttl_seconds`; return `True` if `key` was absent, expired or held a different value, and `False` if it already held `value` (another replica announced it). `ttl_seconds <= 0` always returns `True`. Claims must expire.
 
 Bound every collection by count and by age, per entry. The `ProbeStorage` docstring has an outline.
 

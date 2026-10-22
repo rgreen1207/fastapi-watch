@@ -108,10 +108,13 @@ class ProbeStorage(Protocol):
         # sharing one namespace never delete each other's data.
         async def forget(self, names: set[str]) -> None: ...
 
-        # Return True if this caller is the first to claim key within
-        # ttl_seconds (and record the claim), False if another caller holds it.
-        # Lets only one replica send each alert.  ttl_seconds <= 0: always True.
-        async def claim_alert(self, key: str, ttl_seconds: float) -> bool: ...
+        # Atomically store value under key for ttl_seconds.  Return True if
+        # key was absent, expired or held a different value; False if it
+        # already held this value (another caller announced it).  The registry
+        # passes (probe name, new status, window), so only one replica sends
+        # each alert, and a probe going back to a status inside the window is
+        # announced again.  ttl_seconds <= 0: always True, nothing stored.
+        async def claim_alert(self, key: str, value: str, ttl_seconds: float) -> bool: ...
 
     For Redis use the bundled :class:`~fastapi_watch.RedisProbeStorage`.  A
     custom backend outline::
@@ -193,8 +196,8 @@ class InMemoryProbeStorage:
         # Alert log (capped at max_alerts; oldest dropped when full, TTL applied on read)
         self._alerts: deque[tuple[float, AlertRecord]] = deque(maxlen=self._max_alerts)
 
-        # Alert claims (claim_alert): key -> monotonic expiry
-        self._claims: dict[str, float] = {}
+        # Alert claims (claim_alert): key -> (value, monotonic expiry)
+        self._claims: dict[str, tuple[str, float]] = {}
 
     def configure(
         self,
@@ -222,17 +225,19 @@ class InMemoryProbeStorage:
             self._history.pop(name, None)
             self._history_times.pop(name, None)
 
-    async def claim_alert(self, key: str, ttl_seconds: float) -> bool:
-        """Return True if *key* is unclaimed (or its claim expired) and claim it
-        for *ttl_seconds*.  Process-local; expired claims are purged on each call."""
+    async def claim_alert(self, key: str, value: str, ttl_seconds: float) -> bool:
+        """Store *value* under *key* for *ttl_seconds*; return False only if the
+        key already held this *value*.  Process-local; expired claims are
+        purged on each call."""
         now = time.monotonic()
-        for stale in [k for k, expires in self._claims.items() if expires <= now]:
+        for stale in [k for k, (_, expires) in self._claims.items() if expires <= now]:
             del self._claims[stale]
         if ttl_seconds <= 0:
             return True
-        if key in self._claims:
+        held = self._claims.get(key)
+        if held is not None and held[0] == value:
             return False
-        self._claims[key] = now + ttl_seconds
+        self._claims[key] = (value, now + ttl_seconds)
         return True
 
     def _result_expired(self, recorded_at: float) -> bool:

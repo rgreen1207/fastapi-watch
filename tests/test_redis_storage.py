@@ -552,19 +552,32 @@ async def test_registry_serves_from_redis(spy, prefix):
 async def test_claim_alert_only_one_replica_wins(client, prefix):
     one = RedisProbeStorage(client, prefix=prefix)
     two = RedisProbeStorage(client, prefix=prefix)
-    results = await asyncio.gather(*(s.claim_alert("db:unhealthy", 30) for s in (one, two, one, two)))
+    results = await asyncio.gather(*(s.claim_alert("db", "unhealthy", 30) for s in (one, two, one, two)))
     assert sorted(results) == [False, False, False, True]
-    assert await two.claim_alert("db:healthy", 30) is True  # different key, own claim
+    assert await two.claim_alert("cache", "unhealthy", 30) is True  # different key, own claim
+
+
+async def test_claim_alert_status_returned_to_within_window_is_claimable(client, spy, prefix):
+    # unhealthy -> healthy -> unhealthy inside the window: the re-failure must be sent.
+    one, two = _store(spy, prefix), _store(spy, prefix)
+    assert await one.claim_alert("db", "unhealthy", 60) is True
+    assert await two.claim_alert("db", "unhealthy", 60) is False
+    assert await two.claim_alert("db", "healthy", 60) is True
+    assert await one.claim_alert("db", "healthy", 60) is False
+    assert await one.claim_alert("db", "unhealthy", 60) is True
+    assert await two.claim_alert("db", "unhealthy", 60) is False
+    assert await _keys(client, prefix) == [f"{prefix}:alert-claim:db"]  # one key per probe
+    assert 0 < await client.pttl(f"{prefix}:alert-claim:db") <= 60_000
 
 
 async def test_claim_alert_expires_and_always_has_ttl(client, spy, prefix):
     store = _store(spy, prefix)
-    assert await store.claim_alert("db:unhealthy", 0.2) is True
-    pttl = await client.pttl(f"{prefix}:alert-claim:db:unhealthy")
+    assert await store.claim_alert("db", "unhealthy", 0.2) is True
+    pttl = await client.pttl(f"{prefix}:alert-claim:db")
     assert 0 < pttl <= 200
-    assert await store.claim_alert("db:unhealthy", 0.2) is False
+    assert await store.claim_alert("db", "unhealthy", 0.2) is False
     await asyncio.sleep(0.3)
-    assert await store.claim_alert("db:unhealthy", 0.2) is True
+    assert await store.claim_alert("db", "unhealthy", 0.2) is True
     for key in await _keys(client, prefix):
         assert await client.pttl(key) > 0, key
 
@@ -572,8 +585,8 @@ async def test_claim_alert_expires_and_always_has_ttl(client, spy, prefix):
 async def test_claim_alert_non_positive_ttl_stores_nothing(client, spy, prefix):
     store = _store(spy, prefix)
     for ttl in (0, -5):
-        assert await store.claim_alert("db:unhealthy", ttl) is True
-        assert await store.claim_alert("db:unhealthy", ttl) is True
+        assert await store.claim_alert("db", "unhealthy", ttl) is True
+        assert await store.claim_alert("db", "unhealthy", ttl) is True
     assert await _keys(client, prefix) == []
 
 
