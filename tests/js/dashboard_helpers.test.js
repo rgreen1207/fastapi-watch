@@ -210,6 +210,16 @@ const tests = {
     assert.strictEqual(h.tokenExpired(null, 0), false);
   },
 
+  renewUrlPointsAtTheStreamUrlEndpoint() {
+    assert.strictEqual(
+      h.renewUrl('/app/health/status/stream?view=dashboard&token=1700000000.abc'),
+      '/app/health/dashboard/stream-url',
+    );
+    assert.strictEqual(h.renewUrl('/health/status/stream?view=dashboard'), null, 'no token: nothing to renew');
+    assert.strictEqual(h.renewUrl(null), null);
+    assert.strictEqual(h.renewUrl('/elsewhere?token=1.a'), null, 'unknown shape: fall back to a reload');
+  },
+
   newestTimeAcrossProbes() {
     assert.strictEqual(h.newestTime({}), -Infinity);
     assert.strictEqual(h.newestTime({ a: [{ t: 1 }, { t: 5 }], b: [], c: [{ t: 9 }] }), 9);

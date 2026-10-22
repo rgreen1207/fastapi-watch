@@ -302,3 +302,20 @@ def test_stream_url_endpoint_needs_credentials_not_a_token():
 
 def test_stream_url_endpoint_absent_without_auth():
     assert TestClient(_app(None)).get("/health/dashboard/stream-url").status_code in (404, 405)
+
+
+@pytest.mark.parametrize("prefix", ["/health", "/ops/health"])
+def test_page_stream_url_maps_to_the_renewal_endpoint(prefix):
+    """dashboard.js renewUrl() swaps ``/status/stream?...`` for
+    ``/dashboard/stream-url``; that must be the endpoint the server mounts."""
+    app = FastAPI()
+    HealthRegistry(app, prefix=prefix, auth=_APIKEY, poll_interval_ms=None)
+    client = TestClient(app)
+    url = _stream_url(client.get(f"{prefix}/dashboard", headers=_HEADER).text)
+    renew = re.match(r"^(.*)/status/stream\?", url).group(1) + "/dashboard/stream-url"
+
+    resp = client.get(renew, headers=_HEADER)
+    assert resp.status_code == 200
+    fresh = resp.json()["stream_url"]
+    assert fresh.startswith(f"{prefix}/status/stream?") and "token=" in fresh
+    assert client.get(fresh).status_code == 200

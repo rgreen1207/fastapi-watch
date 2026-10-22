@@ -263,6 +263,16 @@
     return m !== null && now >= parseInt(m[1], 10) * 1000;
   }
 
+  /**
+   * The endpoint that mints a fresh stream URL for *url*'s dashboard, or null
+   * when *url* carries no token (no auth: nothing to renew).
+   */
+  function renewUrl(url) {
+    if (!/[?&]token=/.test(url || '')) return null;
+    var m = /^(.*)\/status\/stream\?/.exec(url);
+    return m ? m[1] + '/dashboard/stream-url' : null;
+  }
+
   /** The newest point time across *history*, or -Infinity. */
   function newestTime(history) {
     var newest = -Infinity;
@@ -295,7 +305,7 @@
     gapThreshold: gapThreshold, pathD: pathD, areaD: areaD, segments: segments, transitions: transitions,
     nearest: nearest, heldSince: heldSince, fmtDuration: fmtDuration, fmtValue: fmtValue,
     topRoutes: topRoutes, statusSentence: statusSentence, retryDelayMs: retryDelayMs,
-    tokenExpired: tokenExpired, newestTime: newestTime, RANGES: RANGES, MAX_POINTS: MAX_POINTS,
+    tokenExpired: tokenExpired, renewUrl: renewUrl, newestTime: newestTime, RANGES: RANGES, MAX_POINTS: MAX_POINTS,
     TOP_ROUTES: TOP_ROUTES, RETRY_MAX_MS: RETRY_MAX_MS,
   };
   if (typeof module !== 'undefined' && module.exports) { module.exports = api; return; }
@@ -854,6 +864,22 @@
   // ever more slowly instead of re-rendering this page every 30 s.
   var FAILURES_KEY = 'fastapi-watch-stream-failures';
   var hasToken = /[?&]token=/.test(streamUrl || '');
+
+  // Swap an expired stream token for a fresh one without re-rendering the
+  // page; reload only if that fails (credentials gone, an older server).
+  function renewAndConnect(delay) {
+    var url = renewUrl(streamUrl);
+    if (!url || !root.fetch) { reloadPage(delay); return; }
+    root.fetch(url, { credentials: 'same-origin', cache: 'no-store' })
+      .then(function (resp) { return resp.ok ? resp.json() : null; })
+      .then(function (body) {
+        if (!body || typeof body.stream_url !== 'string') throw new Error('no stream_url');
+        streamUrl = body.stream_url;
+        setTimeout(connect, delay);
+      })
+      .catch(function () { reloadPage(delay); });
+  }
+
   function connect() {
     var source = new root.EventSource(streamUrl);
     source.onopen = function () {
@@ -866,16 +892,16 @@
     source.onerror = function () {
       if (liveDot) liveDot.className = 'live-dot';
       // CONNECTING: the browser retries by itself.  CLOSED: it gave up on a
-      // non-200 — an expired stream token, which only a fresh page replaces,
-      // or a refusal that a later retry of the stream alone can get past.
+      // non-200 — an expired stream token, which a fresh one replaces, or a
+      // refusal that a later retry of the stream alone can get past.
       if (source.readyState !== 2) return;
       var failures = stored(FAILURES_KEY) + 1;
       store(FAILURES_KEY, failures);
       var delay = retryDelayMs(failures, Math.random());
       // A token that keeps being refused though unexpired here (this clock
-      // runs behind the server's) is replaced by a reload too.
+      // runs behind the server's) is replaced too.
       var stale = tokenExpired(streamUrl, Date.now()) || (hasToken && failures >= MAX_STREAM_RETRIES);
-      if (stale) reloadPage(delay);
+      if (stale) renewAndConnect(delay);
       else setTimeout(connect, delay);
     };
   }
