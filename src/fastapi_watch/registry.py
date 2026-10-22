@@ -10,6 +10,7 @@ import re
 import secrets
 import signal as _signal
 import time
+from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, AsyncGenerator, Awaitable, Callable, Iterator, Literal
@@ -58,6 +59,11 @@ _SINGLE_FETCH_RETRY_MS = 30_000
 _STORAGE_FAILED: Any = object()
 _STORAGE_LOG_INTERVAL_S = 60.0
 _FORGET_INTERVAL_S = 600.0
+# Background storage writes: alert records held while the backend is behind,
+# the writer key for alerts, and how long shutdown lets pending writes land.
+_MAX_UNWRITTEN_ALERTS = 256
+_ALERT_WRITER: Any = object()
+_WRITE_FLUSH_TIMEOUT_S = 2.0
 # Shutdown: how long each probe's aclose() may take.
 _ACLOSE_TIMEOUT_S = 5.0
 # Retry-After (seconds) sent when max_stream_connections streams are open.
@@ -652,6 +658,13 @@ class HealthRegistry:
         self._last_results: dict[str, ProbeResult] = {}
         # id(probe) -> its in-flight run, shared by concurrent callers
         self._inflight: dict[int, asyncio.Task] = {}
+        # Writes to a backend other than the default in-memory one run in the
+        # background (see _store_result): the newest result per probe and the
+        # alert records not yet written, and one writer task per probe name
+        # (plus _ALERT_WRITER).  Bounded by the number of probes.
+        self._unwritten: dict[str, ProbeResult] = {}
+        self._unwritten_alerts: deque[AlertRecord] = deque(maxlen=_MAX_UNWRITTEN_ALERTS)
+        self._writers: dict[Any, asyncio.Task] = {}
         # Probe names this process has written to storage.  Bounded: only names
         # it registered.  Those it stops registering are forgotten in storage
         # (monotonic time of the last pass).
@@ -1278,9 +1291,10 @@ class HealthRegistry:
         """Check one probe, then record its result, history, and state change exactly once.
 
         The result is kept in-process first, so it is reported even when the
-        storage writes fail.  Those writes and the state-change handling run
-        concurrently: a slow backend delays the check by at most one
-        ``storage_timeout``, not one per write.
+        storage writes fail, and the writes never delay it (see
+        :meth:`_store_result`).  A cached result served while the circuit is
+        open is not written again: it is already the stored latest result, and
+        re-appending it would fill history with copies of one stale entry.
         """
         result, from_cache = await self._check_or_cached(probe, critical)
         checked_at = datetime.now(self._tzinfo)
@@ -1296,16 +1310,73 @@ class HealthRegistry:
             result = result.model_copy(update=updates)
         self._last_results[probe.name] = result
         self._probe_last_run[probe.name] = asyncio.get_running_loop().time()
-        if not from_cache:
-            self._last_checked_at = checked_at
+        if from_cache:
+            await self._fire_state_changes([result])
+            return result
+        self._last_checked_at = checked_at
         if result.name == probe.name:  # only ever forget a name both registered and written here
             self._written_names.add(result.name)
-        await asyncio.gather(
-            self._storage_call("set_latest", result),
-            self._storage_call("append_history", result),
-            self._fire_state_changes([result]),
-        )
+        await asyncio.gather(self._store_result(result), self._fire_state_changes([result]))
         return result
+
+    def _writes_inline(self) -> bool:
+        """True for the default in-memory backend, which cannot block and so is written inline."""
+        return type(self._storage) is InMemoryProbeStorage
+
+    async def _store_result(self, result: ProbeResult) -> None:
+        """Write *result* as its probe's latest result and append it to history.
+
+        Any backend other than the default in-memory one is written in the
+        background: even bounded by ``storage_timeout``, a hung store would
+        otherwise add that timeout to every health check that runs a probe,
+        failing readiness probes with a shorter timeout (Kubernetes defaults
+        to 1 s) because the *monitoring store* is down.  Each probe has at
+        most one writer; while the store is behind, only the newest unwritten
+        result per probe is kept.
+        """
+        if self._writes_inline():
+            await asyncio.gather(
+                self._storage_call("set_latest", result),
+                self._storage_call("append_history", result),
+            )
+            return
+        self._unwritten[result.name] = result
+        self._start_writer(result.name, self._drain_results)
+
+    async def _store_alert(self, alert: AlertRecord) -> None:
+        """Append *alert* to storage: inline in memory, otherwise in the background."""
+        if self._writes_inline():
+            await self._storage_call("append_alert", alert)
+            return
+        self._unwritten_alerts.append(alert)  # the oldest is dropped if the store is far behind
+        self._start_writer(_ALERT_WRITER, self._drain_alerts)
+
+    def _start_writer(self, key: Any, drain: Callable[[Any], Awaitable[None]]) -> None:
+        task = self._writers.get(key)
+        if task is None or task.done():
+            self._writers[key] = asyncio.get_running_loop().create_task(drain(key))
+
+    async def _drain_results(self, name: str) -> None:
+        try:
+            while (result := self._unwritten.pop(name, None)) is not None:
+                await asyncio.gather(
+                    self._storage_call("set_latest", result),
+                    self._storage_call("append_history", result),
+                )
+        finally:
+            self._writers.pop(name, None)
+
+    async def _drain_alerts(self, key: Any) -> None:
+        try:
+            while self._unwritten_alerts:
+                await self._storage_call("append_alert", self._unwritten_alerts.popleft())
+        finally:
+            self._writers.pop(key, None)
+
+    async def _flush_writes(self) -> None:
+        """Wait until every background storage write has finished."""
+        while self._writers:
+            await asyncio.gather(*list(self._writers.values()), return_exceptions=True)
 
     async def _storage_call(self, op: str, *args: Any) -> Any:
         """Await ``storage.<op>(*args)``, bounded by ``storage_timeout``.
@@ -1555,17 +1626,19 @@ class HealthRegistry:
         storage method ``forget(names)``.  Data written by other apps or other
         replicas under the same prefix -- including probes this process never
         registered, as during a rolling deploy -- is never touched.  A name
-        stays tracked until ``forget()`` succeeds, so a failed call is retried.
+        stays tracked until ``forget()`` succeeds, so a failed call is retried,
+        and until any background write of it has landed.
         """
         self._last_forget = time.monotonic()
         registered = {p.name for p, _ in self._probes}
         for state in (
             self._last_results, self._probe_last_run, self._probe_states,
             self._alerted_states, self._alert_last_sent_at, self._alert_pending,
+            self._circuit_open_until, self._circuit_err_count, self._circuit_trips,
         ):
             for name in [n for n in state if n not in registered]:
                 del state[name]
-        stale = self._written_names - registered
+        stale = self._written_names - registered - self._writers.keys()
         if not stale:
             return
         if callable(getattr(self._storage, "forget", None)):
@@ -1702,6 +1775,12 @@ class HealthRegistry:
             except (asyncio.CancelledError, Exception):
                 pass
         self._forget_task = None
+        # Give pending background writes a bounded chance to land; past that
+        # they are cancelled (a hung store must not hold up shutdown).
+        try:
+            await asyncio.wait_for(self._flush_writes(), _WRITE_FLUSH_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            pass
         await self._close_probes()
 
     async def _close_probes(self) -> None:
@@ -1886,7 +1965,7 @@ class HealthRegistry:
                     new_status=result.status,
                     timestamp=datetime.now(self._tzinfo),
                 )
-                await self._storage_call("append_alert", alert_record)
+                await self._store_alert(alert_record)
                 for cb in self._state_change_callbacks:
                     # User code: one broken callback must not fail the health check
                     # that triggered it, nor stop the callbacks and alerts after it.
@@ -1998,7 +2077,9 @@ class HealthRegistry:
         return claimed is _STORAGE_FAILED or bool(claimed)
 
     def _ensure_alert_worker(self) -> None:
-        """Start the alert worker task if not already running."""
+        """Start the alert worker task if not already running (never after shutdown)."""
+        if self._shutting_down:
+            return  # a check finishing during shutdown must not leave a new worker pending
         if self._alert_worker is None or self._alert_worker.done():
             try:
                 self._alert_worker = asyncio.get_running_loop().create_task(

@@ -445,6 +445,8 @@ async def test_registry_forgets_a_probe_it_stopped_registering(spy, prefix):
     other = _redis_app(spy, prefix, "x")
     await one.run_all()
     await other.run_all()
+    await one._flush_writes()  # writes to Redis land in the background
+    await other._flush_writes()
     one._probes = [(p, c) for p, c in one._probes if p.name != "gone"]
     await one._forget_unregistered()
     assert await _stored_names(_store(spy, prefix)) == {"a", "x"}

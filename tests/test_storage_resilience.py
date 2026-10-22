@@ -161,16 +161,105 @@ def test_readiness_still_reports_failures_with_storage_down():
 
 
 @pytest.mark.asyncio
-async def test_hanging_storage_is_bounded_by_storage_timeout():
-    registry = HealthRegistry(FastAPI(), storage=_HangingStorage(), poll_interval_ms=None, storage_timeout=0.1)
+async def test_hanging_storage_does_not_delay_health_checks():
+    # Readiness probes commonly time out after 1 s (the Kubernetes default),
+    # so even one storage_timeout per check would fail them.
+    registry = HealthRegistry(FastAPI(), storage=_HangingStorage(), poll_interval_ms=None, storage_timeout=1.0)
     registry.add(_Failing())  # also writes an alert record
-    started = time.monotonic()
-    results = await registry._get_results()
-    elapsed = time.monotonic() - started
+    try:
+        for _ in range(3):
+            started = time.monotonic()
+            results = await registry._get_results()
+            assert time.monotonic() - started < 0.2
+            assert [r.status for r in results] == [ProbeStatus.UNHEALTHY]
+    finally:
+        await registry._shutdown()
 
-    assert [r.status for r in results] == [ProbeStatus.UNHEALTHY]
-    # Writes run concurrently: one timeout, not one per write.
-    assert elapsed < 0.3
+
+def test_hanging_storage_does_not_delay_readiness_endpoint():
+    app = FastAPI()
+    registry = HealthRegistry(app, storage=_HangingStorage(), poll_interval_ms=None, storage_timeout=1.0)
+    registry.add(NoOpProbe(name="db"))
+    with TestClient(app) as client:
+        started = time.monotonic()
+        assert client.get("/health/ready").status_code == 200
+        assert time.monotonic() - started < 0.5
+
+
+@pytest.mark.asyncio
+async def test_background_writes_stay_bounded_while_storage_is_behind():
+    class _Gated(InMemoryProbeStorage):
+        def __init__(self):
+            super().__init__()
+            self.gate = asyncio.Event()
+
+        async def append_history(self, result):
+            await self.gate.wait()
+            await super().append_history(result)
+
+    storage = _Gated()
+    registry = HealthRegistry(FastAPI(), storage=storage, poll_interval_ms=None, storage_timeout=None)
+    registry.add(NoOpProbe(name="db"))
+    for _ in range(10):
+        await registry.run_all()
+    # One writer per probe, holding only the newest result not yet written.
+    assert set(registry._writers) == {"db"}
+    assert len(registry._unwritten) == 1
+    storage.gate.set()
+    await registry._flush_writes()
+    history = (await storage.get_history())["db"]
+    assert len(history) == 2  # the one in flight, then the newest
+    assert history[-1] == registry._last_results["db"]
+    assert registry._writers == {} and registry._unwritten == {}
+
+
+@pytest.mark.asyncio
+async def test_background_alert_writes_land():
+    storage = _CountingStorage()  # not the exact default type: written in the background
+    registry = HealthRegistry(FastAPI(), storage=storage, poll_interval_ms=None)
+    registry.add(_Failing())
+    await registry.run_all()
+    await registry._flush_writes()
+    assert [(a.probe, a.new_status) for a in await storage.get_alerts()] == [("dep", ProbeStatus.UNHEALTHY)]
+    assert (await storage.get_latest("dep")).status == ProbeStatus.UNHEALTHY
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_writes_stuck_on_a_hung_store(monkeypatch):
+    monkeypatch.setattr(registry_module, "_WRITE_FLUSH_TIMEOUT_S", 0.05)
+    registry = HealthRegistry(FastAPI(), storage=_HangingStorage(), poll_interval_ms=None, storage_timeout=None)
+    registry.add(_Failing())
+    await registry.run_all()
+    assert registry._writers
+    await asyncio.wait_for(registry._shutdown(), timeout=1)
+    assert registry._writers == {}
+
+
+@pytest.mark.asyncio
+async def test_forget_waits_for_a_pending_write():
+    class _Gated(_CountingStorage):
+        def __init__(self):
+            super().__init__()
+            self.gate = asyncio.Event()
+
+        async def set_latest(self, result):
+            await self.gate.wait()
+            await super().set_latest(result)
+
+    storage = _Gated()
+    registry = HealthRegistry(FastAPI(), storage=storage, poll_interval_ms=None, storage_timeout=None)
+    registry.add(NoOpProbe(name="old"))
+    await registry.run_all()
+    _without(registry, "old")
+    await registry._forget_unregistered()
+    # Forgetting now would let the write land afterwards and orphan the key.
+    assert storage.forgotten == []
+    assert registry._written_names == {"old"}
+    storage.gate.set()
+    await registry._flush_writes()
+    await registry._forget_unregistered()
+    assert storage.forgotten == [{"old"}]
+    assert await storage.get_latest("old") is None
 
 
 def test_hanging_storage_history_returns_503_after_timeout():
@@ -190,6 +279,7 @@ async def test_storage_timeout_none_waits_for_slow_storage():
     registry = HealthRegistry(FastAPI(), storage=storage, poll_interval_ms=None, storage_timeout=None)
     registry.add(NoOpProbe(name="db"))
     await registry._get_results()
+    await registry._flush_writes()
     assert await storage.get_latest("db") is not None
 
 
@@ -226,6 +316,7 @@ async def test_timeout_is_logged_without_traceback(caplog):
     registry.add(NoOpProbe(name="db"))
     with caplog.at_level(logging.WARNING, logger="fastapi_watch"):
         await registry._get_results()
+        await registry._flush_writes()
     records = [r for r in caplog.records if "storage set_latest timed out after 0.05 s" in r.getMessage()]
     assert len(records) == 1 and records[0].exc_info is None
 
@@ -387,6 +478,23 @@ async def test_circuit_open_cached_result_keeps_its_checked_at():
 
 
 @pytest.mark.asyncio
+async def test_circuit_open_cached_result_is_not_written_again():
+    registry = HealthRegistry(
+        FastAPI(), poll_interval_ms=None, circuit_breaker_threshold=2, circuit_breaker_cooldown_ms=60_000
+    )
+    probe = _Failing()
+    registry.add(probe)
+    for _ in range(10):
+        await registry.run_all()
+    assert probe.calls == 2
+    # Only the two real checks: copies of the stale result would push real
+    # history (e.g. the healthy period before the outage) out of the window.
+    history = (await registry._storage.get_history())["dep"]
+    assert len(history) == 2
+    assert len({r.checked_at for r in history}) == 2
+
+
+@pytest.mark.asyncio
 async def test_fresh_results_still_get_a_new_checked_at():
     registry = HealthRegistry(FastAPI(), poll_interval_ms=None)
     registry.add(NoOpProbe(name="db"))
@@ -525,6 +633,19 @@ async def test_forget_drops_local_state_of_removed_probes():
     assert set(registry._last_results) == {"db"}
     assert set(registry._probe_last_run) == {"db"}
     assert await registry._storage.get_latest("old") is None
+
+
+@pytest.mark.asyncio
+async def test_forget_drops_circuit_breaker_state_of_removed_probes():
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=None, circuit_breaker_threshold=1)
+    old = _Failing(name="old")
+    registry.add(old).add(_Failing(name="db"))
+    await registry.run_all()
+    assert set(registry._circuit_trips) == {"old", "db"}
+    registry._probes = [(p, c) for p, c in registry._probes if p is not old]
+    await registry._forget_unregistered()
+    for state in (registry._circuit_open_until, registry._circuit_err_count, registry._circuit_trips):
+        assert set(state) == {"db"}
 
 
 @pytest.mark.asyncio

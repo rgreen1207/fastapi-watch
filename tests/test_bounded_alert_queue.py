@@ -301,3 +301,12 @@ async def test_state_change_dispatches_via_queue():
             await registry._alert_worker
         except (asyncio.CancelledError, Exception):
             pass
+
+
+@pytest.mark.asyncio
+async def test_alert_worker_not_restarted_after_shutdown():
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=None, alerters=[_RecordingAlerter()])
+    await registry._shutdown()
+    # A check that finishes during shutdown must not leave a new worker task pending.
+    await registry._fire_state_changes([ProbeResult(name="db", status=ProbeStatus.UNHEALTHY)])
+    assert registry._alert_worker is None
