@@ -1255,6 +1255,8 @@ Details: `host`, `port`, `resolved_ips`, `connect_ms`.
 
 The name is resolved once per check, then the probe connects to the resolved addresses in order until one accepts. The lookup is a blocking call, so it runs in fastapi-watch's own small thread pool (see [Blocking checks](#blocking-checks-and-the-thread-pool)); if a DNS server hangs past the probe's deadline, later checks report `"previous check still running"` until that lookup returns.
 
+The probe closes each connection without speaking the server's protocol, and some servers count that as a failed client. PostgreSQL logs `incomplete startup packet` on every check. MySQL and MariaDB count it toward `max_connect_errors` (default 100) and then **block the host**, including your application's new connections from it, until `FLUSH HOSTS`. Don't point `TCPProbe` at a MySQL port; observe real queries with `MySQLProbe` instead.
+
 ---
 
 ### SMTP
@@ -1399,7 +1401,7 @@ registry.add(RabbitMQProbe(
 ))
 ```
 
-If `management_url` is unreachable, the probe still reports AMQP connectivity.
+If `management_url` is unreachable, the probe still reports AMQP connectivity. `queues` lists at most the 50 queues holding the most messages (the API pages and sorts them, so the broker does not serialize every queue on each check); `server.queues` is the total. Percent-encoded credentials in `url` are decoded before they are sent to the Management API, as aio-pika does for AMQP.
 
 ---
 
@@ -1416,7 +1418,7 @@ registry.add(KafkaProbe(bootstrap_servers="localhost:9092"))
 registry.add(KafkaProbe(bootstrap_servers=["b1:9092", "b2:9092", "b3:9092"]))
 ```
 
-Details: `broker_count`, `controller_id`, `topics`, `internal_topics`.
+Details: `broker_count`, `controller_id`, `topic_count`, `topics`, `internal_topics`. At most 100 topic names are listed; `topic_count` is the full number of non-internal topics.
 
 ---
 
@@ -1484,7 +1486,7 @@ The inspect calls are blocking, so they run in fastapi-watch's own thread pool (
 
 #### Blocking checks and the thread pool
 
-`CeleryProbe`, `TCPProbe` (DNS lookup), and the built-in alerters make blocking calls. They run in a private pool of at most 4 daemon threads named `fastapi-watch_N`, never in the event loop's default executor, which your application's own `run_in_executor` calls use. The registry's timeout cancels a check but cannot stop a thread that is already blocked, so each probe has at most one blocking call in flight: while it is still running, the probe reports UNHEALTHY with `"previous check still running"` and submits nothing new. A hung dependency therefore holds one thread, not one per poll, and the threads never delay interpreter exit.
+`CeleryProbe`, `TCPProbe` (DNS lookup), and the built-in alerters make blocking calls. The probes run them in a private pool of at most 4 daemon threads named `fastapi-watch_N`, and the alerters in a second one of the same size named `fastapi-watch-alert_N`, so a burst of alerts to a slow endpoint cannot hold up the checks. Neither is the event loop's default executor, which your application's own `run_in_executor` calls use. The registry's timeout cancels a check but cannot stop a thread that is already blocked, so each probe has at most one blocking call in flight: while it is still running, the probe reports UNHEALTHY with `"previous check still running"` and submits nothing new. A hung dependency therefore holds one thread, not one per poll, and the threads never delay interpreter exit.
 
 **Known limit: DNS for Kafka, RabbitMQ and Memcached.** `KafkaProbe`, `RabbitMQProbe` and `MemcachedProbe` connect by hostname through their async client libraries (aiokafka, aio-pika, aiomcache). Those libraries resolve the name with the event loop's `getaddrinfo`, which runs in the loop's default executor, the one your application shares, not in fastapi-watch's private pool. fastapi-watch can't resolve the name first and pass an IP, because that would break TLS hostname verification. The probe's `timeout` still bounds each check, but a resolver that hangs can hold a default-executor thread until the system resolver gives up. If that matters, point these probes at hosts that resolve locally (`/etc/hosts`, a node-local DNS cache), or size the default executor with `loop.set_default_executor()`.
 
@@ -1545,7 +1547,7 @@ registry.add(db_probe)
 | Probe | Extra | Key args | Details |
 |-------|-------|----------|---------|
 | `RabbitMQProbe` | `rabbitmq` | `url`, `management_url` | `connected`; + `server`, `totals`, `queues` when `management_url` set |
-| `KafkaProbe` | `kafka` | `bootstrap_servers` | `broker_count`, `controller_id`, `topics` |
+| `KafkaProbe` | `kafka` | `bootstrap_servers` | `broker_count`, `controller_id`, `topic_count`, `topics` (first 100) |
 | `CeleryProbe` | `celery` | `app`, `min_workers`, `detailed`, `include_task_args` | `workers_online`, `workers` |
 
 #### HTTP / document stores
@@ -1584,7 +1586,7 @@ registry = HealthRegistry(
 
 Alerters are called concurrently from a background worker queue. A failed alerter never blocks health checks or silences other alerters.
 
-The built-in alerters post from fastapi-watch's own thread pool (see [Blocking checks](#blocking-checks-and-the-thread-pool)), and `timeout` bounds the whole request — connecting, sending, and waiting for the response status — not just each socket read, so an endpoint that answers slowly cannot hold a thread past it. The request then fails with `TimeoutError`, which is logged like any other alerter failure. Resolving the webhook's hostname is bounded only by the system resolver's own timeouts.
+The built-in alerters post from fastapi-watch's own alert thread pool (see [Blocking checks](#blocking-checks-and-the-thread-pool)), and `timeout` bounds the whole request — connecting, sending, and waiting for the response status — not just each socket read, so an endpoint that answers slowly cannot hold a thread past it. A host that resolves to several unreachable addresses shares that one budget across them. The request then fails with `TimeoutError`, which is logged like any other alerter failure. Resolving the webhook's hostname is bounded only by the system resolver's own timeouts.
 
 ### Flap limiting and multi-replica dedupe
 

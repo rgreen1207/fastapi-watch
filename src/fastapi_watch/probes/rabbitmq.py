@@ -1,10 +1,16 @@
 import asyncio
 import base64
 import time
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from ..models import ProbeResult, ProbeStatus
 from .base import BaseProbe, _failure_message
+
+# Most queues listed in details, deepest first.  Brokers can have thousands,
+# and the history keeps many copies of every result, so details must stay
+# bounded; the management API pages and sorts them server-side.
+_MAX_QUEUES_LISTED = 50
+_QUEUES_PATH = f"queues?page=1&page_size={_MAX_QUEUES_LISTED}&sort=messages&sort_reverse=true"
 
 
 class RabbitMQProbe(BaseProbe):
@@ -22,7 +28,8 @@ class RabbitMQProbe(BaseProbe):
         name: Probe name shown in health reports.
         management_url: Base URL of the Management API
             (e.g. ``http://localhost:15672``). Credentials are taken from *url*.
-            If omitted, no queue-level details are collected.
+            If omitted, no queue-level details are collected.  At most the 50
+            queues holding the most messages are listed.
 
     Example::
 
@@ -50,8 +57,9 @@ class RabbitMQProbe(BaseProbe):
         self.poll_interval_ms = poll_interval_ms
 
         parsed = urlparse(url)
-        self._mgmt_user = parsed.username or "guest"
-        self._mgmt_password = parsed.password or "guest"
+        # urlparse leaves userinfo percent-encoded; AMQP clients decode it.
+        self._mgmt_user = unquote(parsed.username) if parsed.username else "guest"
+        self._mgmt_password = unquote(parsed.password) if parsed.password else "guest"
         # Store a redacted URL for repr — never expose credentials
         self._safe_url = parsed._replace(netloc=parsed.hostname if not parsed.username else f"{parsed.username}:<redacted>@{parsed.hostname}").geturl() if parsed.hostname else "<url>"
 
@@ -123,8 +131,14 @@ class RabbitMQProbe(BaseProbe):
                 # Fetch overview and queues in parallel.
                 overview, queues_data = await asyncio.gather(
                     _get_json("overview"),
-                    _get_json("queues"),
+                    _get_json(_QUEUES_PATH),
                 )
+                # A paged request answers {"items": [...], ...}; a broker too
+                # old to page ignores the parameters and returns every queue.
+                if isinstance(queues_data, dict):
+                    queues_data = queues_data.get("items") or []
+                else:
+                    queues_data = sorted(queues_data, key=lambda q: q.get("messages") or 0, reverse=True)
 
                 totals = overview.get("queue_totals", {})
                 stats = overview.get("message_stats", {})
@@ -151,7 +165,7 @@ class RabbitMQProbe(BaseProbe):
                 }
 
                 queues = {}
-                for q in queues_data:
+                for q in queues_data[:_MAX_QUEUES_LISTED]:
                     qstats = q.get("message_stats", {})
                     queues[q["name"]] = {
                         "state": q.get("state"),

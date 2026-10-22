@@ -54,7 +54,7 @@ async def test_run_blocking_uses_a_bounded_pool_of_named_daemon_threads():
     await asyncio.sleep(0.05)
     try:
         assert len(names) == _MAX_WORKERS  # the rest wait their turn
-        pool_threads = _threads("fastapi-watch")
+        pool_threads = _threads("fastapi-watch_")  # not the alerters' own pool
         assert len(pool_threads) <= _MAX_WORKERS
         assert all(t.daemon for t in pool_threads)
     finally:
@@ -326,3 +326,51 @@ def test_fast_webhook_is_not_affected_by_the_deadline(real_opener):
 
     threading.Thread(target=serve, daemon=True).start()
     alerts._post_json(f"http://127.0.0.1:{listener.getsockname()[1]}/hook", b"{}", timeout=2)
+
+
+def test_unreachable_addresses_share_the_webhook_deadline(real_opener, monkeypatch):
+    # socket.create_connection gives every resolved address the full timeout,
+    # so a host with several blackholed addresses took N x timeout.
+    addresses = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"192.0.2.{i}", 80)) for i in range(1, 5)]
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: addresses)
+    attempts: list[float] = []
+
+    def blackholed_connect(sock, address):
+        attempts.append(sock.gettimeout())
+        time.sleep(sock.gettimeout())
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(socket.socket, "connect", blackholed_connect)
+    start = time.monotonic()
+    with pytest.raises(TimeoutError, match="within 0.5 s"):
+        alerts._post_json("http://hooks.example.com/hook", b"{}", timeout=0.5)
+    assert time.monotonic() - start < 1.0  # was 4 x 0.5 s
+    assert attempts and attempts[0] <= 0.5
+
+
+def test_webhook_timeout_none_still_posts(real_opener):
+    listener = socket.create_server(("127.0.0.1", 0))
+
+    def serve():
+        conn, _ = listener.accept()
+        with conn, listener:
+            conn.recv(65536)
+            conn.sendall(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+
+    threading.Thread(target=serve, daemon=True).start()
+    alerts._post_json(f"http://127.0.0.1:{listener.getsockname()[1]}/hook", b"{}", timeout=None)
+
+
+async def test_slow_webhooks_do_not_starve_blocking_probe_checks(monkeypatch):
+    # Alert posts shared the 4-thread pool with CeleryProbe / TCPProbe, so four
+    # slow posts left those checks queued until they timed out.
+    release = threading.Event()
+    monkeypatch.setattr(alerts, "_post_json", lambda *a, **k: release.wait(5))
+    posts = [asyncio.ensure_future(WebhookAlerter("https://example.com/hook").notify(_alert()))
+             for _ in range(_MAX_WORKERS)]
+    try:
+        await asyncio.sleep(0.05)
+        await asyncio.wait_for(run_blocking(lambda: None), 1.0)
+    finally:
+        release.set()
+        await asyncio.gather(*posts)
