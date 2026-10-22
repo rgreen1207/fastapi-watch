@@ -179,3 +179,21 @@ def test_documented_dashboard_policy_is_the_one_sent():
             assert f"`{directive}`" in docs, f"DOCS.md does not mention {directive!r}"
     for header in ("Cache-Control", "X-Content-Type-Options", "X-Frame-Options"):
         assert f"`{header}: {resp.headers[header]}`" in docs
+
+
+def test_readme_endpoint_table_lists_every_health_route():
+    from fastapi import FastAPI
+    from fastapi.routing import APIRoute
+
+    from fastapi_watch import HealthRegistry
+
+    app = FastAPI()
+    HealthRegistry(app, auth={"type": "apikey", "key": "k"})  # with auth, every route is mounted
+    served = {
+        f"{method} {route.path}"
+        for route in app.routes if isinstance(route, APIRoute) and route.path.startswith("/health")
+        for method in route.methods - {"HEAD"}
+    }
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    documented = set(re.findall(r"^\| `((?:GET|POST|DELETE) /health[^`]*)` \|", readme, re.M))
+    assert documented == served
