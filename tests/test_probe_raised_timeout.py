@@ -1,0 +1,63 @@
+"""A probe raising TimeoutError itself is a failure, not the registry's deadline.
+
+Since Python 3.11 ``asyncio.TimeoutError`` is the builtin ``TimeoutError``
+that socket and client libraries raise.  With ``probe_timeout=None`` the
+registry formatted the missing deadline and every health endpoint answered
+500; with a deadline the error claimed the probe ran for its full timeout.
+"""
+import asyncio
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from fastapi_watch import HealthRegistry
+from fastapi_watch.models import ProbeResult
+from fastapi_watch.probes.base import BaseProbe
+
+
+class _RaisesTimeout(BaseProbe):
+    name = "raises_timeout"
+
+    async def check(self) -> ProbeResult:
+        raise TimeoutError("connect timed out")
+
+
+class _Hangs(BaseProbe):
+    name = "hangs"
+
+    async def check(self) -> ProbeResult:
+        await asyncio.sleep(10)
+
+
+@pytest.mark.parametrize("probe_timeout", [None, 30.0])
+@pytest.mark.parametrize("path", ["/health/ready", "/health/status", "/health/metrics", "/health/dashboard"])
+def test_endpoints_report_the_failure(probe_timeout, path):
+    app = FastAPI()
+    HealthRegistry(app, probe_timeout=probe_timeout).add(_RaisesTimeout())
+    response = TestClient(app, raise_server_exceptions=False).get(path)
+    assert response.status_code in (200, 207, 503)
+
+
+@pytest.mark.parametrize("probe_timeout", [None, 30.0])
+async def test_error_names_the_exception_not_the_deadline(probe_timeout):
+    registry = HealthRegistry(FastAPI(), probe_timeout=probe_timeout)
+    registry.add(_RaisesTimeout())
+    [result] = await registry.run_all()
+    assert result.status == "unhealthy"
+    assert result.error == "probe check failed: TimeoutError"
+
+
+async def test_a_real_deadline_is_still_reported_as_one():
+    registry = HealthRegistry(FastAPI(), probe_timeout=0.05)
+    registry.add(_Hangs())
+    [result] = await registry.run_all()
+    assert result.error == "probe timed out after 0.05 s"
+
+
+async def test_startup_probe_raising_timeout_answers_503():
+    app = FastAPI()
+    registry = HealthRegistry(app, probe_timeout=None, startup_probes=[_RaisesTimeout()])
+    registry.set_started()
+    response = TestClient(app, raise_server_exceptions=False).get("/health/startup")
+    assert response.status_code == 503
