@@ -102,6 +102,23 @@ def test_counts_messages_in_both_directions_but_not_the_handshake():
     assert (probe._messages_received, probe._messages_sent) == (3, 3)
 
 
+def test_counts_messages_with_a_string_annotation_and_any_param_name():
+    """``from __future__ import annotations`` makes every annotation a string,
+    so the socket must be found by type among the (keyword) arguments."""
+    probe = FastAPIWebSocketProbe(name="chat")
+
+    async def handler(sock: "WebSocket"):
+        await sock.accept()
+        await sock.send_text(await sock.receive_text())
+        await sock.close()
+
+    with _echo_app(probe, handler).websocket_connect("/ws") as ws:
+        ws.send_text("hi")
+        assert ws.receive_text() == "hi"
+
+    assert (probe._messages_received, probe._messages_sent) == (1, 1)
+
+
 def test_counts_messages_read_through_iter_text():
     probe = FastAPIWebSocketProbe(name="chat")
 

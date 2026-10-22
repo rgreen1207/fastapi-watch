@@ -1,7 +1,7 @@
-"""A small, private thread pool for the blocking calls fastapi-watch makes.
+"""A small, private thread pool for the blocking calls fastapi-watch's probes make.
 
-Some checks can only be made with blocking calls (Celery's inspect API, DNS
-resolution, ``urllib`` webhook posts).  They must not run in the event loop's
+Some checks can only be made with blocking calls (Celery's inspect API, the
+TCP probe's DNS resolution).  They must not run in the event loop's
 default executor: the application's own ``run_in_executor`` calls share it,
 and a check that times out keeps its thread busy after the registry has given
 up on it, so a hung broker or DNS server would slowly take the app's threads.

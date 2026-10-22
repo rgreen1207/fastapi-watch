@@ -29,7 +29,11 @@ class EventLoopProbe(BaseProbe):
         poll_interval_ms: Per-probe poll interval override.
         sample_interval_ms: How often the background sampler measures lag
             (default ``100``).  Lower values catch shorter stalls at slightly
-            higher (still negligible) cost.
+            higher (still negligible) cost.  Must be at least ``1``: a
+            shorter sleep would keep the loop spinning.
+
+    Raises:
+        ValueError: If ``sample_interval_ms`` is below ``1``.
 
     Example::
 
@@ -44,6 +48,8 @@ class EventLoopProbe(BaseProbe):
         poll_interval_ms: int | None = None,
         sample_interval_ms: float = 100.0,
     ) -> None:
+        if not sample_interval_ms >= 1:
+            raise ValueError(f"sample_interval_ms must be at least 1, got {sample_interval_ms!r}")
         self.name = name
         self.warn_ms = warn_ms
         self.fail_ms = fail_ms

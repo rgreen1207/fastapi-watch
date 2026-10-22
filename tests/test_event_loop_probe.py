@@ -161,3 +161,10 @@ async def test_base_probe_aclose_defaults_to_a_no_op():
     from fastapi_watch.probes import NoOpProbe
 
     assert await NoOpProbe().aclose() is None
+
+
+@pytest.mark.parametrize("interval", [0, -5, 0.5, float("nan")])
+def test_sample_interval_below_one_ms_rejected(interval):
+    # asyncio.sleep(0) returns at once: the sampler would spin the loop forever.
+    with pytest.raises(ValueError, match="sample_interval_ms"):
+        EventLoopProbe(sample_interval_ms=interval)

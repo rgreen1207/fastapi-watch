@@ -50,6 +50,36 @@ def _update_ema(current: float | None, value: float, alpha: float) -> float:
     return value if current is None else alpha * value + (1 - alpha) * current
 
 
+def _status_family(status: int) -> str:
+    """``"2xx"``-style family of an HTTP status code."""
+    family = status // 100
+    return _STATUS_FAMILIES[family] if 1 <= family <= 5 else f"{family}xx"
+
+
+_STATUS_FAMILIES = {family: f"{family}xx" for family in range(1, 6)}
+
+
+def _is_async_callable(func: Any) -> bool:
+    """True if calling *func* returns an awaitable coroutine.
+
+    Covers ``partial`` objects and callable instances with an ``async def
+    __call__`` (``alru_cache`` wrappers, for one), which
+    ``inspect.iscoroutinefunction`` alone reports as plain functions.
+    """
+    while isinstance(func, functools.partial):
+        func = func.func
+    return inspect.iscoroutinefunction(func) or inspect.iscoroutinefunction(getattr(type(func), "__call__", None))
+
+
+def _round_ms(value: float | None) -> float | None:
+    return None if value is None else round(value, 2)
+
+
+def _iso_utc(timestamp: float | None) -> str | None:
+    """ISO-8601 UTC text for a ``time.time()`` value, or ``None``."""
+    return None if timestamp is None else datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+
+
 def _calc_percentile(window: Sequence[float], p: float) -> float | None:
     """Return a single percentile from *window*, or ``None`` if empty."""
     if not window:
@@ -273,8 +303,9 @@ class PassiveProbe(BaseProbe):
         self._error_type_counts: dict[str, int] = {}
         self._slow_call_count: int = 0
         self._last_error: str | None = None
-        self._last_error_at: datetime | None = None
-        self._last_success_at: datetime | None = None
+        # time.time() values, formatted only when reported.
+        self._last_error_at: float | None = None
+        self._last_success_at: float | None = None
 
     def record_cache_hit(self) -> None:
         """Record a cache hit manually.
@@ -316,20 +347,23 @@ class PassiveProbe(BaseProbe):
         error_msg: str | None = None,
         error_type: str | None = None,
     ) -> None:
-        now = datetime.now(timezone.utc)
+        # Throughput uses a monotonic clock, so a wall-clock step cannot skew it;
+        # the wall clock is only kept for the last-error/last-success times.
+        ticks = time.perf_counter()
+        now = time.time()
         with self._lock:
             self._call_count += 1
             self._last_rtt_ms = rtt_ms
-            self._request_timestamps.append(now.timestamp())
+            self._request_timestamps.append(ticks)
             if status is not None:
                 self._last_status_code = status
                 if len(self._status_window) == self._status_window.maxlen:
-                    evicted_family = f"{self._status_window[0] // 100}xx"
+                    evicted_family = _status_family(self._status_window[0])
                     self._status_counts[evicted_family] -= 1
                     if not self._status_counts[evicted_family]:
                         del self._status_counts[evicted_family]
                 self._status_window.append(status)
-                family = f"{status // 100}xx"
+                family = _status_family(status)
                 self._status_counts[family] = self._status_counts.get(family, 0) + 1
             # outcome window — track failures incrementally
             if len(self._outcome_window) == self._outcome_window.maxlen:
@@ -454,7 +488,8 @@ class PassiveProbe(BaseProbe):
         # and the original result or exception passes through unchanged.
         def _on_success(result: Any, started: tuple[Any, float]) -> None:
             cache_before, start = started
-            rtt_ms = round((time.perf_counter() - start) * 1000, 2)
+            # Unrounded: check() rounds what it reports, so recording need not.
+            rtt_ms = (time.perf_counter() - start) * 1000
             try:
                 if cache_before is not None:
                     self._record_cache_delta(cache_before, func.cache_info())
@@ -464,7 +499,7 @@ class PassiveProbe(BaseProbe):
                 _LOGGER.debug("fastapi-watch: failed to record a call for probe %r", self.name, exc_info=True)
 
         def _on_error(exc: Exception, started: tuple[Any, float]) -> None:
-            rtt_ms = round((time.perf_counter() - started[1]) * 1000, 2)
+            rtt_ms = (time.perf_counter() - started[1]) * 1000
             try:
                 is_error, status = self._classify_exception(exc)
                 self._record(
@@ -477,7 +512,7 @@ class PassiveProbe(BaseProbe):
             except Exception:
                 _LOGGER.debug("fastapi-watch: failed to record a call for probe %r", self.name, exc_info=True)
 
-        if inspect.iscoroutinefunction(func):
+        if _is_async_callable(func):
             @functools.wraps(func)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
                 started = _start()
@@ -558,13 +593,13 @@ class PassiveProbe(BaseProbe):
         if last_status_code is not None:
             details["last_status_code"] = last_status_code
         details.update({
-            "last_rtt_ms": last_rtt_ms,
+            "last_rtt_ms": _round_ms(last_rtt_ms),
             "avg_rtt_ms": round(avg_rtt, 2),
             "p50_rtt_ms": p50,
             "p95_rtt_ms": p95,
             "p99_rtt_ms": p99,
-            "min_rtt_ms": min_rtt_ms,
-            "max_rtt_ms": max_rtt_ms,
+            "min_rtt_ms": _round_ms(min_rtt_ms),
+            "max_rtt_ms": _round_ms(max_rtt_ms),
         })
         if requests_per_minute is not None:
             details["requests_per_minute"] = requests_per_minute
@@ -591,9 +626,9 @@ class PassiveProbe(BaseProbe):
                 if cache_currsize is not None:
                     details["cache_currsize"] = cache_currsize
         if last_error_at is not None:
-            details["last_error_at"] = last_error_at.isoformat()
+            details["last_error_at"] = _iso_utc(last_error_at)
         if error_rate >= 0.99 and last_success_at is not None:
-            details["last_success_at"] = last_success_at.isoformat()
+            details["last_success_at"] = _iso_utc(last_success_at)
 
         return ProbeResult(
             name=self.name,

@@ -1060,7 +1060,7 @@ registry.add(RequestMetricsProbe(app, max_error_rate=0.05, max_avg_rtt_ms=500))
 
 Pass the **app** to `RequestMetricsProbe`. Starlette builds middleware instances lazily (on the first request or lifespan event), so the probe looks up the live `RequestMetricsMiddleware` in `app.middleware_stack` on its first check. Until then it reports `"no requests observed yet"`; if the stack is built without the middleware it reports UNHEALTHY with a configuration error. Passing a `RequestMetricsMiddleware` instance you serve yourself still works.
 
-`per_route=True` breaks stats down by route template (e.g. `/users/{user_id}`, including any `include_router` or `Mount` prefix). Requests that match no route share one `"<unmatched>"` entry and a `Mount` without inner routes (static files, raw ASGI apps) shares one `"/static/{path:path}"`-style entry, so the table stays bounded however many distinct URLs arrive. Route keys can still multiply when a `Mount` has a path parameter (`app.mount("/t/{tenant}", sub)` makes one key per tenant), so the table also holds at most `max_routes` entries; requests for further routes share one `"<other>"` entry. `per_route=False` collects aggregates only.
+`per_route=True` breaks stats down by route template (e.g. `/users/{user_id}`, including any `include_router` or `Mount` prefix). Requests that match no route share one `"<unmatched>"` entry and a `Mount` without inner routes (static files, raw ASGI apps) shares one `"/static/{path:path}"`-style entry, so the table stays bounded however many distinct URLs arrive. A `Mount`'s path parameters are keyed by name as well (`app.mount("/t/{tenant}", sub)` gives `/t/{tenant}/items`, not one key per tenant), so tenant IDs never appear in the metrics. As a backstop the table holds at most `max_routes` entries; requests for further routes share one `"<other>"` entry. `per_route=False` collects aggregates only.
 
 **`RequestMetricsMiddleware` args:**
 
@@ -1226,7 +1226,7 @@ registry.add(chat_probe)
 
 ### Event loop lag
 
-`EventLoopProbe` measures asyncio event loop blocking. Its first check starts a lightweight background sampler that sleeps for `sample_interval_ms` (default 100) and records how late it wakes up, so stalls that happen *between* checks are caught — a single measurement at check time only runs once the loop is free again.
+`EventLoopProbe` measures asyncio event loop blocking. Its first check starts a lightweight background sampler that sleeps for `sample_interval_ms` (default 100, at least 1) and records how late it wakes up, so stalls that happen *between* checks are caught — a single measurement at check time only runs once the loop is free again.
 
 ```python
 from fastapi_watch.probes import EventLoopProbe

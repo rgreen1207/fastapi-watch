@@ -56,10 +56,13 @@ class _RouteStats:
         self._ema_alpha = ema_alpha
         self._min_error_status = min_error_status
 
-    def record(self, status_code: int, rtt_ms: float) -> None:
+    def record(self, status_code: int, rtt_ms: float, now: float | None = None) -> None:
+        """Record one request; *now* is any monotonic timestamp in seconds."""
+        if now is None:
+            now = time.perf_counter()
         with self._lock:
             self._request_count += 1
-            self._request_timestamps.append(time.monotonic())
+            self._request_timestamps.append(now)
             is_error = status_code >= self._min_error_status
             if len(self._error_window) == self._error_window.maxlen and self._error_window[0]:
                 self._window_error_count -= 1
@@ -106,6 +109,25 @@ class _RouteStats:
 UNMATCHED_ROUTE = "<unmatched>"
 
 
+def _mount_template(mount_prefix: str, path_params: dict, template: str | None) -> str:
+    """Put a Mount's parameter names back in place of their values.
+
+    Routing records only the concrete prefix (``/t/acme``), but the Mount's
+    parameters are in ``path_params``: each prefix segment equal to one of
+    them becomes ``{name}`` (``/t/{tenant}``), so a tenant ID neither makes a
+    key of its own nor shows up in the metrics.  The inner route's own
+    parameters (those named in *template*) are not the Mount's and are skipped.
+    """
+    values: dict[str, str] = {}
+    for name, value in path_params.items():
+        if template is not None and ("{" + name + "}" in template or "{" + name + ":" in template):
+            continue
+        values.setdefault(str(value), name)
+    if not values:
+        return mount_prefix
+    return "/".join("{" + values[segment] + "}" if segment in values else segment for segment in mount_prefix.split("/"))
+
+
 def _route_key(scope: dict, entry_root_path: str) -> str:
     """Return the per-route bucket for a finished request.
 
@@ -114,15 +136,23 @@ def _route_key(scope: dict, entry_root_path: str) -> str:
 
     * A matched route keys on its full template, including any router prefix
       and Mount prefix.  FastAPI 0.137+ keeps included routes' short paths on
-      ``route.path`` and the full one on the effective route context.
+      ``route.path`` and the full one on the effective route context.  A
+      Mount's path parameters are restored to ``{name}`` form.
     * A Mount that matched no inner route (static files, raw ASGI apps, or a
       404 inside a mounted app) shares one ``<mount>/{path:path}`` bucket.
     * Anything else shares the single ``<unmatched>`` bucket.
     """
     root_path = scope.get("root_path", "")
-    mount_prefix = root_path[len(entry_root_path):] if root_path.startswith(entry_root_path) else ""
+    if root_path == entry_root_path:
+        mount_prefix = ""
+    else:
+        mount_prefix = root_path[len(entry_root_path):] if root_path.startswith(entry_root_path) else ""
     effective = (scope.get("fastapi") or {}).get("effective_route_context")
     template = getattr(effective, "path", None) or getattr(scope.get("route"), "path", None)
+    if mount_prefix:
+        path_params = scope.get("path_params")
+        if path_params:
+            mount_prefix = _mount_template(mount_prefix, path_params, template)
     if template:
         return mount_prefix + template
     if mount_prefix:
@@ -141,16 +171,37 @@ OTHER_ROUTE = "<other>"
 _is_health_handler: "Callable[[Any], bool] | None" = None
 
 
-def _is_health_route(scope: Scope) -> bool:
-    """True when routing sent the request to a HealthRegistry's own handler."""
+# Most endpoints whose health-handler verdict a middleware caches.  Endpoints
+# are the app's route handlers, a fixed set; the cap only guards odd apps.
+_MAX_CACHED_ENDPOINTS = 1024
+
+
+def _is_health_route(scope: Scope, cache: "dict[Any, bool] | None" = None) -> bool:
+    """True when routing sent the request to a HealthRegistry's own handler.
+
+    *cache* maps endpoints to the verdict, so a request costs a dict lookup
+    rather than an unwrap-and-compare of the handler's qualified name.
+    """
     global _is_health_handler
+    effective = (scope.get("fastapi") or {}).get("effective_route_context")
+    endpoint = getattr(effective, "endpoint", None) or getattr(scope.get("route"), "endpoint", None)
+    if endpoint is None:
+        return False
+    if cache is not None:
+        try:
+            cached = cache.get(endpoint)
+        except TypeError:  # an unhashable callable endpoint
+            cache = cached = None
+        if cached is not None:
+            return cached
     if _is_health_handler is None:
         from .registry import _is_health_handler as is_health_handler
 
         _is_health_handler = is_health_handler
-    effective = (scope.get("fastapi") or {}).get("effective_route_context")
-    endpoint = getattr(effective, "endpoint", None) or getattr(scope.get("route"), "endpoint", None)
-    return endpoint is not None and _is_health_handler(endpoint)
+    is_health = _is_health_handler(endpoint)
+    if cache is not None and len(cache) < _MAX_CACHED_ENDPOINTS:
+        cache[endpoint] = is_health
+    return is_health
 
 
 class RequestMetricsMiddleware:
@@ -177,8 +228,10 @@ class RequestMetricsMiddleware:
             ``details["routes"]``.  Requests that match no route share a single
             ``"<unmatched>"`` entry, and a Mount without inner routes (e.g.
             static files) shares one ``"/static/{path:path}"``-style entry, so
-            the table stays bounded however many distinct URLs arrive.  When
-            ``False``, only aggregate stats are tracked.
+            the table stays bounded however many distinct URLs arrive.  A
+            Mount's path parameters are keyed by name too
+            (``app.mount("/t/{tenant}", sub)`` gives ``/t/{tenant}/...``).
+            When ``False``, only aggregate stats are tracked.
         window_size: Number of recent requests used for the error rate,
             percentiles, and requests-per-minute (default ``200``).
         ema_alpha: Smoothing factor for the exponential moving average RTT
@@ -188,10 +241,8 @@ class RequestMetricsMiddleware:
             as errors (default ``500``).  4xx client errors such as 404 are not
             counted as errors by default; set to ``400`` to include them.
         max_routes: Most per-route entries kept (default ``500``).  Requests
-            for further routes share one ``"<other>"`` entry — this caps the
-            table when route keys are not a fixed set, e.g. a Mount with a path
-            parameter (``app.mount("/t/{tenant}", sub)``) yields a key per
-            tenant.
+            for further routes share one ``"<other>"`` entry — a backstop for
+            apps whose route keys are not a fixed set.
 
     Raises:
         ValueError: If ``window_size`` or ``max_routes`` is not positive, or
@@ -233,6 +284,7 @@ class RequestMetricsMiddleware:
         self._aggregate = _RouteStats(window_size, ema_alpha, min_error_status)
         self._routes: dict[str, _RouteStats] = {}
         self._routes_lock = threading.Lock()
+        self._health_endpoints: dict[Any, bool] = {}
 
     def _get_or_create(self, path: str) -> _RouteStats:
         # Lock-free hit for known routes — the common case; dict reads are atomic.
@@ -292,13 +344,15 @@ class RequestMetricsMiddleware:
 
     def _record(self, scope: Scope, status_code: int, start: float, entry_root_path: str) -> None:
         """Record one finished request in the aggregate and its per-route bucket."""
-        if _is_health_route(scope):
+        end = time.perf_counter()
+        if _is_health_route(scope, self._health_endpoints):
             return
-        rtt_ms = round((time.perf_counter() - start) * 1000, 2)
-        self._aggregate.record(status_code, rtt_ms)
+        # Unrounded: snapshots round what they report, so recording need not.
+        rtt_ms = (end - start) * 1000
+        self._aggregate.record(status_code, rtt_ms, end)
 
         if self.per_route:
-            self._get_or_create(_route_key(scope, entry_root_path)).record(status_code, rtt_ms)
+            self._get_or_create(_route_key(scope, entry_root_path)).record(status_code, rtt_ms, end)
 
 
 # ---------------------------------------------------------------------------

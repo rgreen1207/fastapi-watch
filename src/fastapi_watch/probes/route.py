@@ -1,5 +1,7 @@
 from typing import Any, Callable
 
+from starlette.responses import Response
+
 from .base import PassiveProbe
 
 
@@ -157,8 +159,12 @@ class FastAPIRouteProbe(PassiveProbe):
         return wrapper
 
     def _classify_result(self, result: Any) -> tuple[bool, int | None]:
-        """Honour an explicit status code on a returned Response; default 200."""
-        status = _status_code(getattr(result, "status_code", 200), 200)
+        """Honour an explicit status code on a returned Response; default 200.
+
+        Only a ``Response`` sets the status: FastAPI serialises anything else
+        (a model with its own ``status_code`` field, say) with the route's.
+        """
+        status = _status_code(result.status_code, 200) if isinstance(result, Response) else 200
         return status >= self.min_error_status, status
 
     def _classify_exception(self, exc: Exception) -> tuple[bool, int | None]:

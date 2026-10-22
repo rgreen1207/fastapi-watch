@@ -41,6 +41,27 @@ async def test_passive_probe_reports_requests_per_minute():
     assert (await probe.check()).details["requests_per_minute"] > 0
 
 
+@pytest.mark.asyncio
+async def test_requests_per_minute_ignores_wall_clock_steps(monkeypatch):
+    """Throughput runs on a monotonic clock; an NTP step of the wall clock
+    (here: back an hour between two calls) must not skew it or hide it."""
+    clock = SimpleNamespace(ticks=100.0, wall=1_700_000_000.0)
+    monkeypatch.setattr(base_module, "time", SimpleNamespace(
+        perf_counter=lambda: clock.ticks, time=lambda: clock.wall, monotonic=lambda: clock.ticks,
+    ))
+    probe = PassiveProbe("p")
+    call = probe.watch(lambda: None)
+
+    call()
+    clock.ticks += 30.0
+    clock.wall -= 3600.0
+    call()
+
+    details = (await probe.check()).details
+    assert details["requests_per_minute"] == 2.0  # 1 interval in 30 s
+    assert details["min_rtt_ms"] == details["max_rtt_ms"] == 0.0
+
+
 def test_no_deprecated_coroutine_check_in_source():
     """asyncio.iscoroutinefunction warns on 3.14+ and is removed in 3.16."""
     src = pathlib.Path(__file__).resolve().parent.parent / "src"
@@ -181,6 +202,31 @@ async def test_non_int_status_code_on_result_still_records(value):
 
 
 @pytest.mark.asyncio
+async def test_status_code_field_on_a_returned_model_is_not_the_http_status():
+    """FastAPI serialises a non-Response result with the route's status code,
+    so a domain model's own ``status_code`` field must not count as a 503."""
+    from pydantic import BaseModel
+    from starlette.responses import JSONResponse
+
+    class UpstreamCall(BaseModel):
+        status_code: int
+
+    probe = FastAPIRouteProbe("r")
+
+    @probe.watch
+    async def handler(response_cls=None):
+        return response_cls(None, status_code=503) if response_cls else UpstreamCall(status_code=503)
+
+    await handler()
+    details = (await probe.check()).details
+    assert (details["last_status_code"], details["error_count"]) == (200, 0)
+
+    await handler(JSONResponse)
+    details = (await probe.check()).details
+    assert (details["last_status_code"], details["error_count"]) == (503, 1)
+
+
+@pytest.mark.asyncio
 async def test_non_int_status_code_on_exception_counts_as_500():
     probe = FastAPIRouteProbe("r")
 
@@ -274,3 +320,41 @@ async def test_concurrent_recording_from_threads_gives_consistent_checks():
     details = (await probe.check()).details
     assert details["call_count"] == 8000
     assert details["error_count"] == 2000
+
+
+class _AsyncCallable:
+    """Like an ``alru_cache`` wrapper: an instance with an ``async def __call__``."""
+
+    def __init__(self, fail: bool = False):
+        self.fail = fail
+        self.__name__ = self.__qualname__ = "async_callable"
+
+    async def __call__(self, x: int = 0):
+        await asyncio.sleep(0.02)
+        if self.fail:
+            raise RuntimeError("down")
+        return {"ok": True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wrap", [lambda f: f, lambda f: functools.partial(f, 1)])
+async def test_async_callable_object_is_timed_and_its_errors_counted(wrap):
+    probe = PassiveProbe("p")
+    watched = probe.watch(wrap(_AsyncCallable(fail=True)))
+
+    with pytest.raises(RuntimeError):
+        await watched()
+
+    details = (await probe.check()).details
+    assert details["error_count"] == 1
+    assert details["last_rtt_ms"] >= 15
+
+
+def test_async_callable_route_endpoint_still_served():
+    from fastapi.testclient import TestClient
+
+    probe = FastAPIRouteProbe("r")
+    app = FastAPI()
+    app.add_api_route("/x", probe.watch(_AsyncCallable()))
+    assert TestClient(app).get("/x").json() == {"ok": True}
+    assert probe._call_count == 1 and probe._rtt_window[0] >= 15

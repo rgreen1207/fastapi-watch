@@ -85,6 +85,9 @@ class ThresholdProbe(BaseProbe):
         self.timeout = inner_probe.timeout
         # A passive inner probe keeps its breaker off; wrapping must not re-enable it.
         self.circuit_breaker_enabled = inner_probe.circuit_breaker_enabled
+        # The registry reads these from the probe it was given: this one.
+        self.circuit_breaker_threshold = inner_probe.circuit_breaker_threshold
+        self.circuit_breaker_cooldown_ms = inner_probe.circuit_breaker_cooldown_ms
         self.poll_interval_ms = (
             poll_interval_ms
             if poll_interval_ms is not None
