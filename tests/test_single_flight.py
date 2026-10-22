@@ -118,3 +118,37 @@ async def test_storage_failure_does_not_fail_the_shared_run():
 
     assert [[r.status for r in o] for o in outcomes] == [[ProbeStatus.HEALTHY]] * 2
     assert registry._inflight == {}
+
+
+@pytest.mark.asyncio
+async def test_concurrent_startup_requests_share_one_check():
+    """Each /startup request ran every startup probe: a burst became that many checks."""
+    app = FastAPI()
+    probe = _Slow(delay=0.1)
+    registry = HealthRegistry(app, poll_interval_ms=None, startup_probes=[probe])
+    registry.set_started()
+    async with _client(app) as client:
+        responses = await asyncio.gather(*(client.get("/health/startup") for _ in range(20)))
+
+    assert {r.status_code for r in responses} == {200}
+    assert probe.calls == 1
+    assert registry._startup_inflight is None
+
+    async with _client(app) as client:
+        assert (await client.get("/health/startup")).status_code == 200
+    assert probe.calls == 2  # a later request checks again: nothing is cached
+
+
+@pytest.mark.asyncio
+async def test_startup_check_survives_a_cancelled_caller():
+    probe = _Slow(delay=0.1)
+    registry = HealthRegistry(FastAPI(), poll_interval_ms=None, startup_probes=[probe])
+    first = asyncio.ensure_future(registry._check_startup_probes())
+    await asyncio.sleep(0.01)
+    second = asyncio.ensure_future(registry._check_startup_probes())
+    await asyncio.sleep(0.01)
+    first.cancel()
+
+    results = await second
+    assert [r.status for r in results] == [ProbeStatus.HEALTHY]
+    assert probe.calls == 1

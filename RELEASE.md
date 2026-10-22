@@ -32,6 +32,8 @@ Most fixes need no action. These change what you see or what is accepted:
 - **The built-in dashboard sends a strict `Content-Security-Policy`**: only its own script runs (by a per-page nonce), and it connects only to its own origin. A proxy that injects scripts into HTML pages will find them blocked there. Custom dashboards keep `frame-ancestors 'none'` only.
 - **`/health/metrics` writes non-finite values as `NaN`, `+Inf`, `-Inf`**, as the Prometheus text format spells them, and a non-numeric value as `NaN`.
 - **Alerters reject settings that failed every alert, at construction (`ValueError`)**: credentials in a webhook URL (`https://user:pw@host/`), a header value or OpsGenie `api_key` containing a line break or NUL (often a trailing newline from a secrets file), and a `timeout` that is zero, negative, NaN or infinite (`None` still means unbounded).
+- **`POST`/`DELETE /health/maintenance` read the body only after authentication** and refuse one over 4 KiB with `413`. An unauthenticated request now gets `401`/`403` whatever its body (a malformed one used to get `422`); non-JSON bodies from authenticated clients still get `415`.
+- **`auth={"type": "apikey", "header": ...}`** must be a non-empty string; a blank or non-string header name raises `ValueError` at startup.
 
 ### Bug Fixes
 
@@ -41,6 +43,12 @@ Most fixes need no action. These change what you see or what is accepted:
 - **A probe named `constructor`, `toString` or `__proto__` no longer breaks the dashboard.** With no history stored for it yet, the page script found `Object.prototype` members instead and threw on its first render: no charts and no live updates for any probe.
 - **One probe can no longer fail the whole Prometheus scrape.** A custom probe's own `circuit_breaker` detail that is not a dict (with the breaker off, the registry leaves it alone) turned `/health/metrics` into a `500`; a boolean there was written as `True`, which Prometheus rejects along with every other sample in the scrape.
 - **Free-form route breakdowns no longer `500` the dashboard.** Mixed-type route keys or a non-numeric `request_count` in a custom probe's `routes` detail failed the page; the latter also failed every live update.
+
+#### Registry review round
+
+- **Shutdown never ran for apps with a `lifespan=`.** Starlette skips `on_shutdown` handlers once an app has its own lifespan, which is how every documented example is set up, so queued alerts were dropped, background storage writes abandoned, and probe `aclose()` never called. The registry now wraps the app's lifespan and shuts down before the app's own teardown. Each lifespan also starts it afresh: after one shutdown, streams of a second run in the same process (`with TestClient(app)` per test) returned nothing and alerts stopped.
+- **Unauthenticated clients could make the app parse arbitrary JSON.** FastAPI reads and parses a declared request body before any dependency runs, so `POST /health/maintenance` parsed bodies of any size on the event loop before checking credentials (40 MB took 0.6 s). The body is now read after authentication and capped at 4 KiB.
+- **Concurrent `/health/startup` requests share one check.** Each request ran every startup probe, so a burst of requests (from anyone, with `auth=None`) became that many concurrent checks of each startup dependency.
 
 #### Second review round
 

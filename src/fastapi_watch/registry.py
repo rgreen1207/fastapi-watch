@@ -15,13 +15,14 @@ import time
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator, Literal
+from typing import Any, AsyncGenerator, Awaitable, Callable, Iterator, Literal
 from urllib.parse import urlencode, urlsplit
 from zoneinfo import ZoneInfo
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from pydantic_core import to_json
 
 from ._executor import run_blocking
@@ -87,6 +88,8 @@ _BUILTIN_DASHBOARD_CSP = (
 )
 # Retry-After (seconds) sent when max_stream_connections streams are open.
 _STREAM_RETRY_AFTER_S = 30
+# Largest body POST/DELETE /maintenance read; a valid one is under 100 bytes.
+_MAX_CHANGE_BODY_BYTES = 4096
 
 
 class _SlotStreamingResponse(StreamingResponse):
@@ -358,6 +361,12 @@ def _validate_auth(auth) -> None:
             raise ValueError(f"auth {field!r} must be a non-empty string, got {type(value).__name__}")
         if not value.strip():
             raise ValueError(f"auth {field!r} must not be empty or whitespace")
+    # A blank header name refused every request (403) and a non-string one
+    # failed every request (500), both only once traffic arrived.
+    if auth["type"] == "apikey":
+        header = auth.get("header", "X-API-Key")
+        if not isinstance(header, str) or not header.strip():
+            raise ValueError(f"auth 'header' must be a non-empty header name, got {header!r}")
 
 
 def _origin_matches(origin: str, hosts: list[str]) -> bool:
@@ -393,10 +402,10 @@ async def _reject_cross_site(request: Request) -> None:
     the site, so without this a page elsewhere could ``<form method=post>`` to
     ``/health/maintenance`` and switch on indefinite maintenance.  Refused with
     403: ``Sec-Fetch-Site: cross-site``, or an ``Origin`` that does not match
-    the request's ``Host`` (or ``X-Forwarded-Host``).  A non-empty body that is
-    not ``application/json`` is refused with 415, which also rules out every
-    body a form or no-cors fetch can send.  Requests from non-browser clients
-    (curl, scripts) carry neither header and are unaffected.
+    the request's ``Host`` (or ``X-Forwarded-Host``).  Requests from
+    non-browser clients (curl, scripts) carry neither header and are
+    unaffected.  Only headers are read: the body waits for authentication
+    (see :func:`_json_body`).
     """
     if request.headers.get("sec-fetch-site", "").lower() == "cross-site":
         raise HTTPException(status_code=403, detail="cross-site request refused")
@@ -408,10 +417,32 @@ async def _reject_cross_site(request: Request) -> None:
             hosts.append(forwarded.split(",")[0])
         if not _origin_matches(origin, hosts):
             raise HTTPException(status_code=403, detail="cross-origin request refused")
-    if await request.body():
+
+
+async def _json_body(request: Request) -> bytes:
+    """Dependency for state-changing routes, after auth: return the (small) JSON body.
+
+    A non-empty body that is not ``application/json`` is refused with 415,
+    which also rules out every body a form or no-cors fetch can send.  A body
+    over ``_MAX_CHANGE_BODY_BYTES`` is refused with 413 as soon as it is
+    known to be too large.  Reading the body here rather than through a
+    ``Body()`` parameter matters: FastAPI reads and parses a declared body
+    before any dependency runs, so anyone could make the app's event loop
+    parse megabytes of JSON before the credentials were checked.
+    """
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > _MAX_CHANGE_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="request body too large")
+    body = b""
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > _MAX_CHANGE_BODY_BYTES:
+            raise HTTPException(status_code=413, detail="request body too large")
+    if body:
         media_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
         if media_type != "application/json":
             raise HTTPException(status_code=415, detail="request body must be application/json")
+    return body
 
 
 def _make_auth_checker(auth) -> Callable | None:
@@ -742,6 +773,7 @@ class HealthRegistry:
         # Startup
         self._started: bool = False
         self._startup_probes: list[BaseProbe] = list(startup_probes or [])
+        self._startup_inflight: asyncio.Future | None = None
 
         # State-change callbacks and streaming
         self._probe_states: dict[str, ProbeStatus] = {}
@@ -788,7 +820,8 @@ class HealthRegistry:
 
         if serve_routes:
             self._register_routes(tags or ["health"], dashboard=dashboard)
-        self._hook_lifespan()
+        self._shut_down: bool = False
+        self._hook_shutdown()
         for group in groups or []:
             self.include(group)
 
@@ -802,26 +835,35 @@ class HealthRegistry:
                 prefix,
             )
 
-    def _hook_lifespan(self) -> None:
-        """Run :meth:`_shutdown` when the app's lifespan ends.
+    def _hook_shutdown(self) -> None:
+        """Run :meth:`_shutdown` when the application's lifespan ends.
 
-        ``router.on_shutdown`` is skipped whenever the app has a ``lifespan=``,
-        so queued alerts, pending storage writes and probe ``aclose()`` were
-        dropped there.  Wrapping the lifespan context covers both forms, and
-        runs before the application's own teardown, while the clients it
-        closes (a shared Redis, say) are still open for the final writes.
+        ``on_shutdown`` handlers only run without a ``lifespan=``: Starlette
+        skips them once the app has its own lifespan, which is how the docs set
+        up every app — so queued alerts were dropped, background storage
+        writes abandoned, and probes never closed.  The app's lifespan context
+        is wrapped instead, and the registry shuts down before the app's own
+        teardown runs (which may close clients that alerters and storage use).
+        The ``on_shutdown`` entry stays for code that runs those handlers itself.
+
+        Each lifespan starts the registry afresh: after a shutdown, streams
+        ended at once and alerts stopped, so an app run twice in one process
+        (``with TestClient(app)`` per test) was left without either.
         """
-        original = self.app.router.lifespan_context
+        router = self.app.router
+        router.on_shutdown.append(self._shutdown)
+        inner = router.lifespan_context
 
         @contextlib.asynccontextmanager
-        async def _lifespan(app: Any) -> AsyncIterator[Any]:
-            async with original(app) as state:
+        async def _lifespan(app: Any) -> AsyncGenerator[Any, None]:
+            self._shut_down = self._shutting_down = False
+            async with inner(app) as state:
                 try:
                     yield state
                 finally:
                     await self._shutdown()
 
-        self.app.router.lifespan_context = _lifespan
+        router.lifespan_context = _lifespan
 
     def _configure_storage(self, retention: dict, passed: dict) -> None:
         """Apply explicitly passed retention arguments to a caller-supplied *storage*.
@@ -1536,6 +1578,28 @@ class HealthRegistry:
             )
         return result if result.critical == critical else result.model_copy(update={"critical": critical})
 
+    async def _check_startup_probes(self) -> list[ProbeResult]:
+        """Check every startup probe, joining a check already in flight.
+
+        Same timeout and error handling as regular probes, so a hung or raising
+        startup probe answers 503 rather than hanging or 500ing.  Concurrent
+        ``/startup`` requests share one run: each used to start its own, so a
+        burst of requests (anyone's, with ``auth=None``) became that many
+        concurrent checks of every startup dependency.  ``shield`` keeps a
+        disconnecting client from cancelling the run others are waiting on.
+        """
+        run = self._startup_inflight
+        if run is None:
+            run = asyncio.gather(*(self._guarded_check(p, True) for p in self._startup_probes))
+            self._startup_inflight = run
+
+            def _forget(done: asyncio.Future) -> None:
+                if self._startup_inflight is done:
+                    self._startup_inflight = None
+
+            run.add_done_callback(_forget)
+        return list(await asyncio.shield(run))
+
     async def _safe_check(self, probe: BaseProbe, critical: bool) -> ProbeResult:
         """Run one probe with circuit-breaker and timeout handling."""
         return (await self._check_or_cached(probe, critical))[0]
@@ -1852,7 +1916,11 @@ class HealthRegistry:
         handler installed by _install_early_shutdown_hook fires first (before
         connection draining), so this is usually a no-op by the time it runs.
         It also handles non-signal shutdowns (e.g. programmatic server stop).
+        Runs once: both the lifespan wrapper and ``on_shutdown`` may call it.
         """
+        if self._shut_down:
+            return
+        self._shut_down = True
         self._shutting_down = True
         for task in list(self._sse_tasks):
             task.cancel()
@@ -2491,11 +2559,7 @@ class HealthRegistry:
             if not registry._started:
                 return JSONResponse({"status": "starting"}, status_code=503)
             if registry._startup_probes:
-                # Same timeout and error handling as regular probes, so a hung or
-                # raising startup probe answers 503 rather than hanging or 500ing.
-                results = list(
-                    await asyncio.gather(*(registry._guarded_check(p, True) for p in registry._startup_probes))
-                )
+                results = await registry._check_startup_probes()
                 if not all(r.is_passing for r in results):
                     report = HealthReport.from_results(results)
                     return Response(
@@ -2606,9 +2670,10 @@ class HealthRegistry:
         # State-changing routes are mounted only behind auth: an open POST would
         # let anyone pin /ready at 200 and silence alerts.  set_maintenance() and
         # clear_maintenance() remain available to the application either way.
-        # The cross-site check runs first, before credentials are even looked at.
+        # The cross-site check runs first, before credentials are even looked at;
+        # the body is read only once they have passed.
         if auth_checker is not None:
-            change_deps = [Depends(_reject_cross_site), *auth_deps]
+            change_deps = [Depends(_reject_cross_site), *auth_deps, Depends(_json_body)]
 
             @self.app.post(
                 f"{prefix}/maintenance",
@@ -2619,11 +2684,25 @@ class HealthRegistry:
                     "``{\"until\": \"<ISO datetime>\"}``."
                     " Omit body (or send ``{}``) for indefinite maintenance."
                     " A naive ``until`` is read in the registry timezone; a past one is rejected with 422."
-                    " A body must be ``application/json`` (415 otherwise); browser cross-site requests get 403."
+                    " A body must be ``application/json`` (415 otherwise) and at most 4 KiB (413);"
+                    " browser cross-site requests get 403."
                 ),
                 dependencies=change_deps,
+                openapi_extra={
+                    "requestBody": {
+                        "required": False,
+                        "content": {"application/json": {"schema": _MaintenanceRequest.model_json_schema()}},
+                    },
+                },
             )
-            async def enable_maintenance(body: _MaintenanceRequest = Body(default=_MaintenanceRequest())) -> Response:
+            async def enable_maintenance(raw: bytes = Depends(_json_body)) -> Response:
+                # The same per-request call as in change_deps: FastAPI returns its cached result.
+                try:
+                    body = _MaintenanceRequest.model_validate_json(raw) if raw else _MaintenanceRequest()
+                except ValidationError as exc:
+                    raise RequestValidationError(
+                        [{**err, "loc": ("body", *err["loc"])} for err in exc.errors(include_url=False)]
+                    ) from None
                 now = datetime.now(registry._tzinfo)
                 if body.until is not None:
                     until = registry._aware(body.until)
