@@ -1576,7 +1576,7 @@ registry = HealthRegistry(
 )
 ```
 
-Alerters are called concurrently from a background worker queue. A failed alerter never blocks health checks or silences other alerters.
+Alerters are called concurrently from a background worker queue. A failed alerter never blocks health checks or silences other alerters. At shutdown, alerts already queued are still sent (for up to 5 s) before the worker stops.
 
 The built-in alerters post from fastapi-watch's own thread pool (see [Blocking checks](#blocking-checks-and-the-thread-pool)), and `timeout` bounds the whole request — connecting, sending, and waiting for the response status — not just each socket read, so an endpoint that answers slowly cannot hold a thread past it. The request then fails with `TimeoutError`, which is logged like any other alerter failure. Resolving the webhook's hostname is bounded only by the system resolver's own timeouts.
 
@@ -1596,7 +1596,7 @@ registry = HealthRegistry(
 
 **`alert_min_interval_s`** limits each probe to one alert per interval. The first change after a quiet interval alerts immediately. Changes within the interval are coalesced; when it ends, the probe's latest status is sent if it differs from the last status alerters received. The final state is never lost (it is sent even if the probe is not checked again), and a flap that ends where it started (`healthy -> unhealthy -> healthy`) sends nothing.
 
-**`alert_dedupe_window_s`** stops every replica from sending the same alert. Before sending, a replica calls the storage backend's `claim_alert(key, ttl_seconds)` with key `"<probe>:<new_status>"`; only the replica that wins the claim sends, and the others treat the alert as sent. Set the window to roughly how far apart replicas notice the same change (about one poll interval): the same probe moving to the same status again within the window is not re-sent by anyone. If the claim fails or exceeds `storage_timeout`, the replica sends anyway, since a duplicate alert is better than none. With a backend that lacks `claim_alert` (including the default in-process storage), a warning is logged at startup and alerts are not deduplicated.
+**`alert_dedupe_window_s`** stops every replica from sending the same alert. Before sending, a replica calls the storage backend's `claim_alert(key, value, ttl_seconds)` with the probe name as key and the new status as value. The backend records the last status announced for that probe and refuses the claim only when it already holds the same status, so the first replica to see each change sends it and the others treat the alert as sent. A probe that fails, recovers and fails again inside the window alerts each time. Set the window to roughly how far apart replicas notice the same change (about one poll interval). If the claim fails or exceeds `storage_timeout`, the replica sends anyway, since a duplicate alert is better than none. With a backend that lacks `claim_alert` (including the default in-process storage), a warning is logged at startup and alerts are not deduplicated.
 
 `on_state_change` callbacks and `/health/alerts` records are unaffected by both settings and still see every transition.
 

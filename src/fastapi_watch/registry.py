@@ -64,8 +64,10 @@ _FORGET_INTERVAL_S = 600.0
 _MAX_UNWRITTEN_ALERTS = 256
 _ALERT_WRITER: Any = object()
 _WRITE_FLUSH_TIMEOUT_S = 2.0
-# Shutdown: how long each probe's aclose() may take.
+# Shutdown: how long each probe's aclose() may take, and how long queued
+# alerts may take to send.
 _ACLOSE_TIMEOUT_S = 5.0
+_ALERT_DRAIN_TIMEOUT_S = 5.0
 # Retry-After (seconds) sent when max_stream_connections streams are open.
 _STREAM_RETRY_AFTER_S = 30
 
@@ -550,9 +552,9 @@ class HealthRegistry:
             records still see every transition.
         alert_dedupe_window_s: Cross-replica alert dedupe (keyword-only,
             default ``None`` = off).  With a shared storage backend that
-            implements ``claim_alert(key, ttl_seconds)``, replicas claim each
-            ``"<probe>:<new_status>"`` alert for this many seconds and only
-            the winner sends it.  A failing claim sends anyway.  Without
+            implements ``claim_alert(key, value, ttl_seconds)``, replicas
+            record the last status announced per probe for this many seconds
+            and only the first to announce each change sends it.  A failing claim sends anyway.  Without
             ``claim_alert`` a warning is logged at init and alerts are not
             deduplicated.
         stream_token_secret: Key that signs the dashboard's short-lived stream
@@ -1753,12 +1755,14 @@ class HealthRegistry:
                 )
 
     def _cancel_background_tasks(self) -> None:
-        """Cancel SSE streams, the poll loop, and the alert worker (on the loop thread)."""
+        """Cancel SSE streams and the poll loop (on the loop thread).
+
+        The alert worker keeps running: :meth:`_shutdown` lets it send what is
+        already queued before stopping it.
+        """
         for task in list(self._sse_tasks):
             task.cancel()
         self._cancel_poll_task()
-        if self._alert_worker is not None and not self._alert_worker.done():
-            self._alert_worker.cancel()
 
     async def _shutdown(self) -> None:
         """Signal SSE streams to stop and cancel the poll task.
@@ -1778,13 +1782,7 @@ class HealthRegistry:
             except (asyncio.CancelledError, Exception):
                 pass
             self._poll_task = None
-        if self._alert_worker is not None and not self._alert_worker.done():
-            self._alert_worker.cancel()
-            try:
-                await self._alert_worker
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._alert_worker = None
+        await self._drain_alerts_for_shutdown()
         if self._forget_task is not None and not self._forget_task.done():
             self._forget_task.cancel()
             try:
@@ -1799,6 +1797,33 @@ class HealthRegistry:
         except asyncio.TimeoutError:
             pass
         await self._close_probes()
+
+    async def _drain_alerts_for_shutdown(self) -> None:
+        """Send already-queued alerts (bounded by ``_ALERT_DRAIN_TIMEOUT_S``), then stop the worker.
+
+        Cancelling the worker outright dropped every queued alert, including
+        the ones a deploy's last checks produced.
+        """
+        if not self._alert_queue.empty() and (self._alert_worker is None or self._alert_worker.done()):
+            # Queued with no worker to send them (it is not started once shutting down).
+            self._alert_worker = asyncio.get_running_loop().create_task(
+                self._alert_loop(), name="fastapi-watch-alert-worker"
+            )
+        if self._alert_worker is None:
+            return
+        try:
+            await asyncio.wait_for(self._alert_queue.join(), _ALERT_DRAIN_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            (self._logger or _LIB_LOGGER).warning(
+                "fastapi-watch: %d alert(s) still queued at shutdown were dropped", self._alert_queue.qsize()
+            )
+        if not self._alert_worker.done():
+            self._alert_worker.cancel()
+        try:
+            await self._alert_worker
+        except (asyncio.CancelledError, Exception):
+            pass
+        self._alert_worker = None
 
     async def _close_probes(self) -> None:
         """Await ``aclose()`` on every registered and startup probe that has one.
@@ -2090,14 +2115,19 @@ class HealthRegistry:
     async def _claim_alert(self, alert: AlertRecord) -> bool:
         """True if this replica should send *alert* (always, without dedupe).
 
-        With ``alert_dedupe_window_s``, replicas sharing a storage backend race
-        to claim ``"<probe>:<new_status>"`` for that window and only the winner
-        sends.  A failing claim sends anyway: a duplicate alert beats none.
+        With ``alert_dedupe_window_s``, replicas sharing a storage backend
+        record the last status announced for each probe: ``claim_alert`` sets
+        it to the new status and returns False only when it already held that
+        status, so one replica sends each change.  (A claim on
+        ``"<probe>:<status>"`` alone refused a re-failure inside the window,
+        unhealthy -> healthy -> unhealthy, on every replica.)  A failing claim
+        sends anyway: a duplicate alert beats none.
         """
         if self._alert_dedupe_window_s is None:
             return True
-        key = f"{alert.probe}:{alert.new_status.value}"
-        claimed = await self._storage_call("claim_alert", key, self._alert_dedupe_window_s)
+        claimed = await self._storage_call(
+            "claim_alert", alert.probe, alert.new_status.value, self._alert_dedupe_window_s
+        )
         return claimed is _STORAGE_FAILED or bool(claimed)
 
     def _ensure_alert_worker(self) -> None:
@@ -2128,13 +2158,9 @@ class HealthRegistry:
                     alert = await asyncio.wait_for(self._alert_queue.get(), delay)
             except asyncio.TimeoutError:
                 continue  # a coalesced alert is due
-            except asyncio.CancelledError:
-                return
             try:
                 if alert is not None and await self._claim_alert(alert):
                     await self._dispatch_alert(alert)
-            except asyncio.CancelledError:
-                return
             except Exception:
                 # The worker must outlive any one bad alert, but not silently.
                 (self._logger or _LIB_LOGGER).exception(

@@ -35,29 +35,33 @@ class _Scripted(BaseProbe):
 
 
 class _ClaimStorage(InMemoryProbeStorage):
-    """A stand-in for a shared backend: claims are first-come for ttl_seconds."""
+    """A stand-in for a shared backend: the last status announced per key, for ttl_seconds.
+
+    A claim fails only when the key already holds the same value (compare-and-set).
+    """
 
     def __init__(self):
         super().__init__()
-        self.claims: dict[str, float] = {}
-        self.calls: list[tuple[str, float]] = []
+        self.claims: dict[str, tuple[str, float]] = {}
+        self.calls: list[tuple[str, str, float]] = []
 
-    async def claim_alert(self, key: str, ttl_seconds: float) -> bool:
-        self.calls.append((key, ttl_seconds))
+    async def claim_alert(self, key: str, value: str, ttl_seconds: float) -> bool:
+        self.calls.append((key, value, ttl_seconds))
         now = time.monotonic()
-        if self.claims.get(key, 0.0) > now:
+        held, expires = self.claims.get(key, (None, 0.0))
+        if held == value and expires > now:
             return False
-        self.claims[key] = now + ttl_seconds
+        self.claims[key] = (value, now + ttl_seconds)
         return True
 
 
 class _BrokenClaimStorage(InMemoryProbeStorage):
-    async def claim_alert(self, key, ttl_seconds):
+    async def claim_alert(self, key, value, ttl_seconds):
         raise ConnectionError("storage down")
 
 
 class _HangingClaimStorage(InMemoryProbeStorage):
-    async def claim_alert(self, key, ttl_seconds):
+    async def claim_alert(self, key, value, ttl_seconds):
         await asyncio.sleep(30)
 
 
@@ -194,7 +198,7 @@ async def test_replicas_sharing_storage_send_one_alert_total():
         for registry, probe, _, _ in replicas:
             await _check(registry, probe, U)
         assert sum(len(alerter.sent) for _, _, alerter, _ in replicas) == 1
-        assert storage.calls == [("db:unhealthy", 60), ("db:unhealthy", 60)]
+        assert storage.calls == [("db", "unhealthy", 60), ("db", "unhealthy", 60)]
 
         # The losers count the state as sent: no repeat on later checks.
         for registry, probe, _, _ in replicas:
@@ -207,6 +211,23 @@ async def test_replicas_sharing_storage_send_one_alert_total():
         assert sum(len(alerter.sent) for _, _, alerter, _ in replicas) == 2
         # Every replica still records the transitions.
         assert all(changes == [(H, U), (U, H)] for _, _, _, changes in replicas)
+    finally:
+        for registry, *_ in replicas:
+            await registry._shutdown()
+
+
+@pytest.mark.asyncio
+async def test_refailure_inside_the_dedupe_window_is_alerted_once():
+    # unhealthy -> healthy -> unhealthy within the window: a claim keyed on
+    # "<probe>:<status>" refused the second failure on every replica.
+    storage = _ClaimStorage()
+    replicas = _replicas(storage)
+    try:
+        for status in (U, H, U):
+            for registry, probe, _, _ in replicas:
+                await _check(registry, probe, status)
+        sent = [t for _, _, alerter, _ in replicas for t in alerter.sent]
+        assert sorted(sent) == sorted([(H, U), (U, H), (H, U)])
     finally:
         for registry, *_ in replicas:
             await registry._shutdown()
