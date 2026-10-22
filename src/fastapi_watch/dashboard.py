@@ -79,7 +79,8 @@ _FIELD_GLOSSARY: list[tuple[str, str]] = [
     # Kafka
     ("broker_count",         "Number of Kafka brokers in the cluster."),
     ("controller_id",        "Node ID of the current Kafka cluster controller."),
-    ("topics",               "User-defined Kafka topics visible to the admin client."),
+    ("topic_count",          "Number of user-defined Kafka topics (the list below shows at most 100)."),
+    ("topics",               "User-defined Kafka topics visible to the admin client (at most 100)."),
     ("internal_topics",      "Kafka-managed internal topics (e.g. __consumer_offsets)."),
     # RabbitMQ
     ("connected",            "Whether an AMQP connection to RabbitMQ succeeded."),
