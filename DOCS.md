@@ -86,7 +86,7 @@ Each multi-series graph has a legend and labels every line at its right end, and
 
 **Crosshair** — hovering any graph shows the same moment on every graph, with that graph's values in a tooltip.
 
-**Live updates** — the page opens an `EventSource` to `/health/status/stream?view=dashboard` (see [Dashboard view](#dashboard-view)), appends each new result to the graphs, and updates the rows in place. If the set of probes changes it reloads once to pick up the new rows.
+**Live updates** — the page opens an `EventSource` to `/health/status/stream?view=dashboard` (see [Dashboard view](#dashboard-view)), appends each new result to the graphs, and updates the rows in place. If the set of probes changes it reloads once to pick up the new rows. If the server refuses the stream (for example `503` once `max_stream_connections` streams are open), the page retries the stream alone with jittered exponential backoff, up to 5 minutes apart, rather than reloading.
 
 ---
 
