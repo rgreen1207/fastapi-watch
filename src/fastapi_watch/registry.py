@@ -25,7 +25,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel, Field, ValidationError
 from pydantic_core import to_json
 
-from ._executor import run_blocking
+from ._executor import run_render
 from .alerts import BaseAlerter, WebhookAlerter
 from .dashboard import _current_probe, render_dashboard
 from .models import AlertRecord, HealthReport, ProbeResult, ProbeStatus
@@ -2777,10 +2777,10 @@ class HealthRegistry:
                         expires_at = int(token.partition(".")[0])
                     return f"{root_path}{prefix}/status/stream?{urlencode(params)}", expires_at
 
-                # One render at a time, in fastapi-watch's own thread pool: a page
+                # One render at a time, on fastapi-watch's render thread: a page
                 # with long history is CPU work (tens of ms, megabytes of HTML)
-                # that would otherwise block the app's event loop, and one
-                # thread keeps the pool free for blocking probe checks.
+                # that would otherwise block the app's event loop, and its own
+                # thread never waits behind hung blocking probe checks.
                 render_lock = asyncio.Lock()
 
                 async def _renderer(report: HealthReport, maintenance: bool, request: Request, history: dict | None, nonce: str | None) -> str:
@@ -2790,7 +2790,7 @@ class HealthRegistry:
                         nonce=nonce,
                     )
                     async with render_lock:
-                        return await run_blocking(render)
+                        return await run_render(render)
 
                 if token_key is not None:
 

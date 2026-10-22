@@ -111,6 +111,24 @@ def _get_pool() -> _DaemonThreadPool:
     return _pool
 
 
+_render_pool: _DaemonThreadPool | None = None
+
+
+async def run_render(fn: Callable[..., Any], *args: Any) -> Any:
+    """Run CPU-bound page rendering in its own single thread and await the result.
+
+    Not in the probe pool: a DNS outage can hold every probe thread at once
+    (one per TCP probe) for tens of seconds, and the dashboard would wait
+    behind them.  One thread suffices, as renders are serialized anyway.
+    """
+    global _render_pool
+    if _render_pool is None:
+        with _pool_lock:
+            if _render_pool is None:
+                _render_pool = _DaemonThreadPool(1, f"{_THREAD_NAME_PREFIX}-render")
+    return await asyncio.get_running_loop().run_in_executor(_render_pool, fn, *args)
+
+
 async def run_blocking(fn: Callable[..., Any], *args: Any) -> Any:
     """Run ``fn(*args)`` in fastapi-watch's own thread pool and await the result.
 

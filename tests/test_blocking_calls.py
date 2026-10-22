@@ -374,3 +374,27 @@ async def test_slow_webhooks_do_not_starve_blocking_probe_checks(monkeypatch):
     finally:
         release.set()
         await asyncio.gather(*posts)
+
+
+# ---------------------------------------------------------------------------
+# The dashboard renders even while every probe thread is busy
+# ---------------------------------------------------------------------------
+
+async def test_dashboard_renders_while_probe_threads_are_all_busy():
+    """A DNS outage can hold every probe thread (one per TCP probe) for tens of
+    seconds; the dashboard render must not queue behind them."""
+    import httpx
+
+    app = FastAPI()
+    HealthRegistry(app)
+    release = threading.Event()
+    blockers = [_get_pool().submit(release.wait, 10) for _ in range(_MAX_WORKERS)]
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await asyncio.wait_for(client.get("/health/dashboard"), 3)
+        assert response.status_code == 200
+    finally:
+        release.set()
+    for blocker in blockers:
+        blocker.result(timeout=5)
