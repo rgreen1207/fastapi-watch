@@ -78,6 +78,13 @@ _DASHBOARD_HEADERS = {
     "X-Frame-Options": "DENY",
     "Content-Security-Policy": "frame-ancestors 'none'",
 }
+# The built-in page: its one inline script (by nonce), inline styles, and
+# same-origin requests for the stream.  Anything injected despite escaping
+# cannot run script, load resources, or send data elsewhere.
+_BUILTIN_DASHBOARD_CSP = (
+    "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; connect-src 'self'; "
+    "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+)
 # Retry-After (seconds) sent when max_stream_connections streams are open.
 _STREAM_RETRY_AFTER_S = 30
 
@@ -2653,14 +2660,14 @@ class HealthRegistry:
                 # (report, maintenance), so keep honoring renderers written that way.
                 pass_maintenance = _takes_two_positional(user_renderer)
 
-                def _renderer(report: HealthReport, maintenance: bool, request: Request, history: dict | None) -> str:
+                def _renderer(report: HealthReport, maintenance: bool, request: Request, history: dict | None, nonce: str | None) -> str:
                     return user_renderer(report, maintenance) if pass_maintenance else user_renderer(report)
             elif isinstance(dashboard, (str, Path)):
                 dashboard_path = Path(dashboard).resolve()
                 if dashboard_path.suffix in (".html", ".htm"):
                     _html_content = dashboard_path.read_text(encoding="utf-8")
 
-                    def _renderer(report: HealthReport, maintenance: bool, request: Request, history: dict | None) -> str:
+                    def _renderer(report: HealthReport, maintenance: bool, request: Request, history: dict | None, nonce: str | None) -> str:
                         return _html_content
                 else:
                     raise ValueError(
@@ -2687,10 +2694,11 @@ class HealthRegistry:
                 # thread keeps the pool free for blocking probe checks.
                 render_lock = asyncio.Lock()
 
-                async def _renderer(report: HealthReport, maintenance: bool, request: Request, history: dict | None) -> str:
+                async def _renderer(report: HealthReport, maintenance: bool, request: Request, history: dict | None, nonce: str | None) -> str:
                     stream_url, _ = _dashboard_stream(request)
                     render = functools.partial(
-                        render_dashboard, report, stream_url=stream_url, maintenance_banner=maintenance, history=history
+                        render_dashboard, report, stream_url=stream_url, maintenance_banner=maintenance, history=history,
+                        nonce=nonce,
                     )
                     async with render_lock:
                         return await run_blocking(render)
@@ -2734,7 +2742,13 @@ class HealthRegistry:
                 history = await registry._storage_call("get_history") if builtin_dashboard else None
                 if history is _STORAGE_FAILED:
                     history = {}  # the page still renders, from live results only
-                content = _renderer(report, registry._in_maintenance(), request, history)
+                # The built-in page runs only its own script, so it gets a strict
+                # policy; a custom page's assets are unknown and keep the base one.
+                nonce = secrets.token_urlsafe(16) if builtin_dashboard else None
+                content = _renderer(report, registry._in_maintenance(), request, history, nonce)
                 if inspect.isawaitable(content):
                     content = await content
-                return HTMLResponse(content=content, headers=_DASHBOARD_HEADERS)
+                headers = _DASHBOARD_HEADERS
+                if nonce is not None:
+                    headers = {**headers, "Content-Security-Policy": _BUILTIN_DASHBOARD_CSP.format(nonce=nonce)}
+                return HTMLResponse(content=content, headers=headers)

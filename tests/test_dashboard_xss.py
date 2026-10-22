@@ -158,6 +158,24 @@ def test_unexpected_detail_types_do_not_fail_the_page():
     assert "200: 4, other: 1" in html
 
 
+def test_unexpected_route_keys_and_counts_do_not_fail_the_page():
+    # Mixed-type route keys failed sorting the routes table (dashboard 500);
+    # a non-numeric request_count failed ranking, which the dashboard's live
+    # updates (?view=dashboard) also run for every event.
+    from fastapi_watch.dashboard import _current_probe
+
+    result = ProbeResult(
+        name="custom", status=ProbeStatus.HEALTHY,
+        details={"routes": {
+            1: {"request_count": 3}, "/a": {"request_count": "5"}, "/b": {"request_count": None},
+            "/c": {"request_count": math.nan}, "/d": {"request_count": 7},
+        }},
+    )
+    html = render_dashboard(HealthReport.from_results([result]), stream_url="/s", history={"custom": [result]})
+    assert "<td>/d</td>" in html and "<td>1</td>" in html
+    assert list(_current_probe(result)["details"]["routes"])[:2] == ["/d", "1"]
+
+
 class _HostileProbe(BaseProbe):
     name = "hostile"
     description = _PAYLOADS[1]

@@ -260,7 +260,40 @@ def test_dashboard_is_never_cached_sniffed_or_framed(auth, dashboard):
     assert resp.headers["cache-control"] == "no-store"
     assert resp.headers["x-content-type-options"] == "nosniff"
     assert resp.headers["x-frame-options"] == "DENY"
+    assert "frame-ancestors 'none'" in resp.headers["content-security-policy"]
+
+
+def test_custom_dashboard_keeps_the_base_policy():
+    # A custom page's scripts and assets are unknown: only framing is restricted.
+    app = FastAPI()
+    HealthRegistry(app, poll_interval_ms=None, dashboard=lambda report: "<html>custom</html>")
+    resp = TestClient(app).get("/health/dashboard")
     assert resp.headers["content-security-policy"] == "frame-ancestors 'none'"
+
+
+@pytest.mark.parametrize("auth", [None, _APIKEY])
+def test_builtin_dashboard_runs_only_its_own_script(auth):
+    # Defense in depth behind the escaping: a strict CSP whose nonce is fresh
+    # per page and carried only by the page's own script, so markup injected
+    # by a probe value could not run script, load resources, or send data out.
+    app = FastAPI()
+    HealthRegistry(app, auth=auth, poll_interval_ms=None).add(NoOpProbe(name="a"))
+    client = TestClient(app)
+    nonces = []
+    for _ in range(2):
+        resp = client.get("/health/dashboard", headers=_HEADER)
+        csp = dict(
+            (part.split(" ", 1) + [""])[:2] for part in (p.strip() for p in resp.headers["content-security-policy"].split(";"))
+        )
+        assert csp["default-src"] == "'none'"
+        assert csp["connect-src"] == "'self'"
+        assert csp["base-uri"] == "'none'" and csp["form-action"] == "'none'"
+        assert csp["frame-ancestors"] == "'none'"
+        nonce = re.fullmatch(r"'nonce-([A-Za-z0-9_-]{16,})'", csp["script-src"]).group(1)
+        executable = re.findall(r"<script(?![^>]*application/json)([^>]*)>", resp.text)
+        assert executable == [f' nonce="{nonce}"']
+        nonces.append(nonce)
+    assert nonces[0] != nonces[1]
 
 
 def test_builtin_dashboard_renders_off_the_event_loop(monkeypatch):

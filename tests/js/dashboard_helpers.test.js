@@ -224,6 +224,22 @@ const tests = {
     assert.strictEqual(h.newestTime({}), -Infinity);
     assert.strictEqual(h.newestTime({ a: [{ t: 1 }, { t: 5 }], b: [], c: [{ t: 9 }] }), 9);
   },
+
+  probeNamedLikeAnObjectBuiltinHasNoHistory() {
+    // Probe names may be "constructor" or "__proto__"; with no points stored
+    // under them, a lookup must not find Object.prototype members (the page
+    // script threw on its first render and never connected the stream).
+    const now = Date.parse('2026-01-01T00:10:00Z');
+    for (const name of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {
+      assert.deepStrictEqual(h.pointsOf({}, name), []);
+      assert.deepStrictEqual(h.pointsOf(h.newHistory(), name), []);
+      assert.strictEqual(h.statusSentence([{ name: name, status: 'unhealthy' }], {}, now), name + ' unhealthy');
+    }
+    const history = h.newHistory();
+    history.__proto__ = [{ t: now - 60e3, status: 'unhealthy' }];
+    assert.deepStrictEqual(Object.keys(history), ['__proto__'], 'stored as a key, not as the prototype');
+    assert.strictEqual(h.statusSentence([{ name: '__proto__', status: 'unhealthy' }], history, now), '__proto__ unhealthy for 1 min');
+  },
 };
 
 let failed = 0;
