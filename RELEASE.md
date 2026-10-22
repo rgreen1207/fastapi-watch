@@ -35,6 +35,7 @@ Most fixes need no action. These change what you see or what is accepted:
 - **Alerters reject settings that failed every alert, at construction (`ValueError`)**: credentials in a webhook URL (`https://user:pw@host/`), a header value or OpsGenie `api_key` containing a line break or NUL (often a trailing newline from a secrets file), and a `timeout` that is zero, negative, NaN or infinite (`None` still means unbounded).
 - **`POST`/`DELETE /health/maintenance` read the body only after authentication** and refuse one over 4 KiB with `413`. An unauthenticated request now gets `401`/`403` whatever its body (a malformed one used to get `422`); non-JSON bodies from authenticated clients still get `415`.
 - **`auth={"type": "apikey", "header": ...}`** must be a non-empty string; a blank or non-string header name raises `ValueError` at startup.
+- **A negative or NaN `result_ttl_seconds` / `alert_ttl_seconds` raises `ValueError`** with the default in-memory storage too, as it already did with `RedisProbeStorage`; it used to switch time-based expiry off silently.
 
 ### Bug Fixes
 
@@ -55,6 +56,12 @@ Most fixes need no action. These change what you see or what is accepted:
 
 - **Storage no longer grows with a renamed result.** A probe whose `check()` returned a result under another name (an inner probe's result passed through, or a name that changed per check) was stored under that name, which the registry never forgets: each new name left a latest-result key and a history key behind until `result_ttl_seconds`, or forever with `result_ttl_seconds=0` (200 checks wrote 401 Redis keys). Results are now filed under the probe's registered name.
 - **One unreadable entry no longer fails history.** A history entry, alert or latest result that `RedisProbeStorage` could not parse (written by a newer version sharing the prefix during a rolling deploy, e.g. with a new status value, or corrupted) made every read raise, so `/health/history` and `/health/alerts` answered `503` until it aged out. Such entries are skipped.
+
+#### Probe timeouts, storage TTLs and documentation
+
+- **A probe raising its own `TimeoutError` no longer fails every health endpoint.** Since Python 3.11 `asyncio.TimeoutError` is the builtin `TimeoutError` that socket and client libraries raise on a connect or read timeout.  With `probe_timeout=None` the registry tried to format the missing deadline and `/health/ready`, `/status`, `/metrics` and the dashboard answered `500`; with a deadline the error claimed the probe had run for the full timeout.  Such a probe is now reported `UNHEALTHY` with `"probe check failed: TimeoutError"`; only the registry's own deadline reports `"probe timed out after N s"`.
+- **In-memory TTLs are validated.** `InMemoryProbeStorage` (and so `HealthRegistry` without `storage=`) accepted a negative or NaN TTL, which disabled time-based expiry without a word.
+- **Documentation examples run.** The README quickstart called `PostgreSQLProbe(url=...)` and `RedisProbe(url=...)`, which raise `TypeError` (they are passive probes, fed by `@probe.watch`), and attached the registry to an `app` it then replaced with `FastAPI(lifespan=...)`, so the served app had no health routes.  `ThresholdProbe`'s example passed `probe=` instead of `inner_probe`.  A test now checks every documented constructor call against its signature.
 
 #### Second review round
 

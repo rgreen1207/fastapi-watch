@@ -135,3 +135,24 @@ async def test_history_entries_capped_by_bytes():
 def test_rejects_tiny_entry_budget():
     with pytest.raises(ValueError):
         InMemoryProbeStorage(max_entry_bytes=100)
+
+
+@pytest.mark.parametrize("ttl", [-1, float("nan"), float("inf")])
+@pytest.mark.parametrize("field", ["result_ttl_seconds", "alert_ttl_seconds"])
+def test_invalid_ttl_rejected_like_redis(field, ttl):
+    """A negative or NaN TTL silently turned expiry off; RedisProbeStorage rejects them."""
+    with pytest.raises(ValueError, match="finite and >= 0"):
+        InMemoryProbeStorage(**{field: ttl})
+    store = InMemoryProbeStorage()
+    settings = dict(max_results=5, result_ttl_seconds=10, alert_ttl_seconds=10, max_alerts=5)
+    with pytest.raises(ValueError, match="finite and >= 0"):
+        store.configure(**{**settings, field: ttl})
+
+
+@pytest.mark.parametrize("ttl", [-1, float("nan")])
+def test_registry_rejects_an_invalid_ttl(ttl):
+    from fastapi import FastAPI
+    from fastapi_watch import HealthRegistry
+
+    with pytest.raises(ValueError, match="finite and >= 0"):
+        HealthRegistry(FastAPI(), result_ttl_seconds=ttl)

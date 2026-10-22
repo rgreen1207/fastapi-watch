@@ -30,6 +30,7 @@ results and alerts outside the process so they survive restarts or are shared
 across instances.  :class:`~fastapi_watch.RedisProbeStorage` (in
 ``redis_storage.py``) is the bundled Redis backend.
 """
+import math
 import time
 from collections import deque
 from typing import Protocol, runtime_checkable
@@ -40,6 +41,17 @@ from .models import AlertRecord, ProbeResult
 
 _MIN_ENTRY_BYTES = 512
 _TRUNCATED = "_truncated"
+
+
+def _check_ttls(*ttls: float) -> None:
+    """Raise ``ValueError`` unless every TTL is finite and >= 0.
+
+    A negative or NaN TTL compared false against every age, silently turning
+    time-based expiry off.
+    """
+    for ttl in ttls:
+        if not 0 <= ttl < math.inf:  # also rejects NaN
+            raise ValueError("TTLs must be finite and >= 0 (0 disables time-based expiry)")
 
 
 def _fit(result: ProbeResult, budget: int) -> "tuple[ProbeResult, bytes]":
@@ -179,6 +191,7 @@ class InMemoryProbeStorage:
     ) -> None:
         if max_entry_bytes < _MIN_ENTRY_BYTES:
             raise ValueError(f"max_entry_bytes must be at least {_MIN_ENTRY_BYTES}")
+        _check_ttls(result_ttl_seconds, alert_ttl_seconds)
         self._max_entry_bytes = int(max_entry_bytes)
         self._max_results = max(1, max_results)
         self._result_ttl = result_ttl_seconds
@@ -208,6 +221,7 @@ class InMemoryProbeStorage:
         max_alerts: int,
     ) -> None:
         """Apply new retention settings, keeping the newest entries that still fit."""
+        _check_ttls(result_ttl_seconds, alert_ttl_seconds)
         self._max_results = max(1, max_results)
         self._result_ttl = result_ttl_seconds
         self._alert_ttl = alert_ttl_seconds

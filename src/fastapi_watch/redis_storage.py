@@ -29,7 +29,7 @@ from typing import Any
 from pydantic_core import to_json
 
 from .models import AlertRecord, ProbeResult
-from .storage import _MIN_ENTRY_BYTES, _fit
+from .storage import _MIN_ENTRY_BYTES, _check_ttls, _fit
 
 # claim_alert: replace the value unless it is already this one, atomically.
 _CLAIM_SCRIPT = """
@@ -191,9 +191,7 @@ class RedisProbeStorage:
     ) -> None:
         """Apply retention settings.  Reads honour them at once; each collection
         is trimmed to them on its next write."""
-        for ttl in (result_ttl_seconds, alert_ttl_seconds):
-            if not 0 <= ttl < math.inf:  # also rejects NaN, which PX cannot express
-                raise ValueError("TTLs must be finite and >= 0 (0 disables time-based expiry)")
+        _check_ttls(result_ttl_seconds, alert_ttl_seconds)  # PX cannot express NaN or infinity either
         self._max_results = max(1, int(max_results))
         self._max_alerts = max(1, int(max_alerts))
         self._result_ttl = float(result_ttl_seconds)
