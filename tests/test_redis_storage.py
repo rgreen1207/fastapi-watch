@@ -542,6 +542,7 @@ async def test_registry_serves_from_redis(spy, prefix):
     registry = HealthRegistry(app, storage=_store(spy, prefix), poll_interval_ms=None)
     registry.add(NoOpProbe(name="noop"))
     await registry.run_all()
+    await registry._flush_writes()  # writes to a shared backend land in the background
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http:
         history = (await http.get("/health/history")).json()["probes"]
         status = (await http.get("/health/status")).json()

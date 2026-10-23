@@ -156,7 +156,8 @@ def test_ready_tag_filter_returns_only_tagged_probes():
     resp = client.get("/health/ready?tag=http")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["status"] == "healthy"
+    assert [p["name"] for p in data["probes"]] == ["api"]
+    assert data["status"] == "no_data"  # the route has had no traffic yet
 
 
 def test_ready_no_tag_returns_all_probes():
@@ -170,15 +171,15 @@ def test_ready_no_tag_returns_all_probes():
     assert resp.status_code == 200
 
 
-def test_ready_unknown_tag_returns_healthy_with_no_probes():
+def test_ready_unknown_tag_does_not_pass():
     app = FastAPI()
     registry = HealthRegistry(app, poll_interval_ms=None)
     registry.add(NoOpProbe(name="db"))
 
     client = TestClient(app)
     resp = client.get("/health/ready?tag=nonexistent")
-    assert resp.status_code == 200
-    assert resp.json()["status"] == "healthy"
+    assert resp.status_code == 404
+    assert resp.json()["unknown_tags"] == ["nonexistent"]
 
 
 # ---------------------------------------------------------------------------
@@ -376,7 +377,7 @@ def test_ready_comma_tag_or_logic():
     assert resp.status_code == 200
     data = resp.json()
     # Both tagged probes should be included (no infra)
-    assert data["status"] == "healthy"
+    assert {p["name"] for p in data["probes"]} == {"users", "orders"}
 
 
 def test_status_comma_tag_or_logic():
@@ -398,11 +399,12 @@ def test_status_comma_tag_spaces_trimmed():
     app = FastAPI()
     registry = HealthRegistry(app, poll_interval_ms=None)
     registry.add(FastAPIRouteProbe(name="api", tags=["api"]))
+    registry.add(FastAPIRouteProbe(name="jobs", tags=["other"]))
 
     client = TestClient(app)
     resp = client.get("/health/status?tag=api, other")
     names = {p["name"] for p in resp.json()["probes"]}
-    assert "api" in names
+    assert names == {"api", "jobs"}
 
 
 def test_status_single_tag_still_works():

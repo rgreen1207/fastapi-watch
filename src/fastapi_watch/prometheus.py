@@ -99,26 +99,35 @@ def render_prometheus(
         prefix: Prepended to every metric name (default ``""``).
     """
     trips = trips or {}
-    metrics: list[tuple[str, str, str, Callable[[ProbeResult], object]]] = [
-        ("probe_healthy", "gauge", "1 if probe status is healthy, 0 otherwise",
-         lambda r: 1 if r.status == ProbeStatus.HEALTHY else 0),
-        ("probe_degraded", "gauge", "1 if probe status is degraded (warning), 0 otherwise",
-         lambda r: 1 if r.status == ProbeStatus.DEGRADED else 0),
+    # A probe with nothing to report has no status: it gets no probe_healthy /
+    # probe_degraded sample (a 0 would fire "probe down" alerts on idle
+    # routes), and probe_no_data says why.
+    metrics: list[tuple[str, str, str, Callable[[ProbeResult], object], bool]] = [
+        ("probe_healthy", "gauge", "1 if probe status is healthy, 0 otherwise; absent while the probe has no data",
+         lambda r: 1 if r.status == ProbeStatus.HEALTHY else 0, True),
+        ("probe_degraded", "gauge", "1 if probe status is degraded (warning), 0 otherwise; absent while the probe has no data",
+         lambda r: 1 if r.status == ProbeStatus.DEGRADED else 0, True),
+        ("probe_no_data", "gauge", "1 while the probe has nothing to report yet (no status), 0 otherwise",
+         lambda r: 0 if r.has_data else 1, False),
         ("probe_latency_ms", "gauge", "Last observed probe check latency in milliseconds",
-         lambda r: r.latency_ms),
+         lambda r: r.latency_ms, False),
         ("probe_circuit_open", "gauge", "1 if the circuit breaker is currently open for this probe",
-         lambda r: 1 if _circuit(r).get("open", False) else 0),
+         lambda r: 1 if _circuit(r).get("open", False) else 0, False),
         ("probe_circuit_consecutive_failures", "gauge", "Current consecutive failure count for this probe",
-         lambda r: _circuit(r).get("consecutive_failures", 0)),
+         lambda r: _circuit(r).get("consecutive_failures", 0), False),
         ("probe_circuit_trips_total", "counter", "Total lifetime circuit breaker trips for this probe",
-         lambda r: trips.get(r.name, 0)),
+         lambda r: trips.get(r.name, 0), False),
     ]
 
     lines: list[str] = []
-    for name, kind, help_text, value in metrics:
+    for name, kind, help_text, value, needs_data in metrics:
         metric = f"{prefix}{name}"
         lines += [f"# HELP {metric} {help_text}", f"# TYPE {metric} {kind}"]
-        lines += [f"{metric}{_lbl(r.name, r.critical)} {_sample(value(r))}" for r in results]
+        lines += [
+            f"{metric}{_lbl(r.name, r.critical)} {_sample(value(r))}"
+            for r in results
+            if r.has_data or not needs_data
+        ]
 
     lines.append("")  # trailing newline required by spec
     return "\n".join(lines)

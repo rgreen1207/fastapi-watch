@@ -670,7 +670,7 @@ class PassiveProbe(BaseProbe):
             if call_count == 0:
                 return ProbeResult(
                     name=self.name,
-                    status=ProbeStatus.HEALTHY,
+                    status=ProbeStatus.NO_DATA,
                     latency_ms=0.0,
                     details={"message": self._empty_message},
                 )

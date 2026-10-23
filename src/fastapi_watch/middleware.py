@@ -467,7 +467,7 @@ class RequestMetricsProbe(BaseProbe):
         if middleware is None:
             return ProbeResult(
                 name=self.name,
-                status=ProbeStatus.HEALTHY,
+                status=ProbeStatus.NO_DATA,
                 latency_ms=0.0,
                 details={"message": "no requests observed yet"},
             )
@@ -477,7 +477,7 @@ class RequestMetricsProbe(BaseProbe):
         if snap["request_count"] == 0:
             return ProbeResult(
                 name=self.name,
-                status=ProbeStatus.HEALTHY,
+                status=ProbeStatus.NO_DATA,
                 latency_ms=0.0,
                 details={"message": "no requests observed yet"},
             )

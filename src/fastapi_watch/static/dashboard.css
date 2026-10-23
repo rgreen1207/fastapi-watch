@@ -83,6 +83,7 @@ body {
 }
 .header.degraded { border-top-color: var(--warn); }
 .header.unhealthy { border-top-color: var(--bad); }
+.header.no_data { border-top-color: var(--rule); }
 
 .header-inner {
   max-width: 90rem;
@@ -212,12 +213,15 @@ body {
 .seg-healthy { fill: var(--ok); }
 .seg-degraded { fill: var(--warn); }
 .seg-unhealthy { fill: var(--bad); }
+.seg-no_data { fill: var(--rule); }
 .seg-gap { fill: var(--grid); }
 .tick-mark { stroke: var(--ink); stroke-width: 1.5; }
 
 .status-chip { width: 0.6rem; height: 0.6rem; border-radius: 2px; flex: none; background: var(--ok); }
 .status-chip.degraded { background: var(--warn); }
 .status-chip.unhealthy { background: var(--bad); }
+/* No data is no status: an outlined, empty marker rather than a color. */
+.status-chip.no_data { background: transparent; border: 1px solid var(--ink-faint); }
 
 .section-title { color: var(--ink-soft); font-size: 0.9rem; margin: 0 0 0.5rem; }
 
@@ -246,6 +250,8 @@ body {
 .badge-degraded::before { background: var(--warn); }
 .badge-unhealthy { background: var(--bad-soft); }
 .badge-unhealthy::before { background: var(--bad); }
+.badge-no_data { background: var(--grid); color: var(--ink-soft); }
+.badge-no_data::before { background: transparent; border: 1px solid var(--ink-faint); }
 .badge-optional { color: var(--ink-faint); border: 1px solid var(--rule); }
 
 .charts { display: grid; gap: 0.75rem; }
@@ -295,14 +301,17 @@ body {
 
 .probe-fields { margin-top: 0.5rem; grid-column: 2; }
 .probe-fields summary { cursor: pointer; color: var(--ink-soft); font-size: 0.85rem; }
-.details-table, .routes-table { border-collapse: collapse; font-size: 0.82rem; margin-top: 0.4rem; }
-.details-table td, .routes-table td, .routes-table th { padding: 0.15rem 0.75rem 0.15rem 0; text-align: left; vertical-align: top; }
-.details-table td:first-child, .routes-table th { color: var(--ink-soft); font-weight: 500; }
+.details-table, .routes-table, .unregistered-table { border-collapse: collapse; font-size: 0.82rem; margin-top: 0.4rem; }
+.details-table td, .routes-table td, .routes-table th, .unregistered-table td, .unregistered-table th { padding: 0.15rem 0.75rem 0.15rem 0; text-align: left; vertical-align: top; }
+.details-table td:first-child, .routes-table th, .unregistered-table th { color: var(--ink-soft); font-weight: 500; }
+.unregistered-table td:first-child { overflow-wrap: anywhere; }
 .routes-table td:first-child { overflow-wrap: anywhere; }
 .error-count-btn { cursor: pointer; text-decoration: underline dotted; }
 
 /* Routes */
 .routes { margin-top: 1.5rem; }
+.unregistered { margin-top: 1.5rem; }
+.unregistered-note { color: var(--ink-soft); font-size: 0.85rem; margin: 0 0 0.4rem; }
 .routes .board-row { padding: 0.6rem 0; border-top: 1px solid var(--rule); }
 .route-path { font-weight: 600; overflow-wrap: anywhere; font-size: 0.9rem; }
 .route-stats { color: var(--ink-soft); font-size: 0.8rem; }

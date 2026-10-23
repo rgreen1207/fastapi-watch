@@ -20,7 +20,8 @@ _EVIL = "https://evil.example"
 
 def _setup():
     app = FastAPI()
-    registry = HealthRegistry(app, auth=_BASIC, poll_interval_ms=None)
+    # Listed in the schema so the documentation tests can read it (hidden by default).
+    registry = HealthRegistry(app, auth=_BASIC, poll_interval_ms=None, include_in_schema=True)
     return registry, TestClient(app)
 
 

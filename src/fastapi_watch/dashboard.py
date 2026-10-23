@@ -162,11 +162,13 @@ _STATUS_LABEL = {
     ProbeStatus.HEALTHY: "Healthy",
     ProbeStatus.DEGRADED: "Degraded",
     ProbeStatus.UNHEALTHY: "Unhealthy",
+    ProbeStatus.NO_DATA: "No data",
 }
 _STATUS_BADGE_CLS = {
     ProbeStatus.HEALTHY: "badge-healthy",
     ProbeStatus.DEGRADED: "badge-degraded",
     ProbeStatus.UNHEALTHY: "badge-unhealthy",
+    ProbeStatus.NO_DATA: "badge-no_data",
 }
 
 
@@ -179,19 +181,57 @@ def _status_sentence(report: HealthReport) -> str:
             return f"{matching[0]} {word}"
         if matching:
             return f"{len(matching)} probes {word}: {', '.join(matching)}"
-    count = len(report.probes)
-    return f"All {count} probe{'s' if count != 1 else ''} healthy" if count else "No probes registered"
+    if not report.probes:
+        return "No probes registered"
+    # A probe with no data has no status: it is not counted as healthy.
+    count = sum(1 for p in report.probes if p.has_data)
+    waiting = len(report.probes) - count
+    if not count:
+        return "No probe has reported yet"
+    sentence = f"All {count} probe{'s' if count != 1 else ''} healthy"
+    return f"{sentence}, {waiting} with no data yet" if waiting else sentence
 
 
 def _summary(report: HealthReport) -> str:
     total = len(report.probes)
     healthy = sum(1 for p in report.probes if p.is_healthy)
     degraded = sum(1 for p in report.probes if p.is_degraded)
-    unhealthy = total - healthy - degraded
+    no_data = sum(1 for p in report.probes if not p.has_data)
+    unhealthy = total - healthy - degraded - no_data
     noun = f"probe{'s' if total != 1 else ''}"
+    waiting = f", {no_data} no data" if no_data else ""
     if degraded or unhealthy:
-        return f"{healthy} healthy, {degraded} degraded, {unhealthy} unhealthy / {total} {noun}"
-    return f"{healthy} / {total} {noun} healthy"
+        return f"{healthy} healthy, {degraded} degraded, {unhealthy} unhealthy{waiting} / {total} {noun}"
+    return f"{healthy} / {total} {noun} healthy{waiting}"
+
+
+def _unregistered_row(entry: dict) -> str:
+    when = entry.get("last_requested_at")
+    when_text = when.strftime("%Y-%m-%d %H:%M:%S") if hasattr(when, "strftime") else str(when or "")
+    return (
+        f'<tr><td><span class="status-chip no_data"></span> {_e(entry.get("name", ""))}</td>'
+        f'<td>{_e(entry.get("kind", ""))}</td><td>{_e(entry.get("endpoint", ""))}</td>'
+        f'<td>{_e(entry.get("count", ""))}</td><td>{_e(when_text)}</td></tr>'
+    )
+
+
+def _unregistered_html(entries: list[dict]) -> str:
+    """Probe and tag names asked for but not registered: listed with no status.
+
+    Shown so a typo in a readiness URL (which gets ``404``) is visible here.
+    The page script keeps the table current from the live stream.
+    """
+    hidden = "" if entries else " hidden"
+    rows = "".join(_unregistered_row(e) for e in entries)
+    return (
+        f'<section class="unregistered" id="unregistered"{hidden}>'
+        '<h2 class="section-title">Requested but not registered</h2>'
+        '<p class="unregistered-note">Filters asked for these names, but no registered probe has them, '
+        "so they have no status and the requests got 404. Check for a typo in the URL.</p>"
+        '<table class="unregistered-table"><thead><tr><th>Name</th><th>Kind</th><th>Endpoint</th>'
+        "<th>Requests</th><th>Last requested</th></tr></thead>"
+        f'<tbody id="unregistered-rows">{rows}</tbody></table></section>'
+    )
 
 
 def _finite(value: Any) -> Any:
@@ -394,6 +434,7 @@ def render_dashboard(
     maintenance_banner: bool = False,
     history: dict[str, list[ProbeResult]] | None = None,
     nonce: str | None = None,
+    unregistered: list[dict] | None = None,
 ) -> str:
     """Render the dashboard page.
 
@@ -408,6 +449,9 @@ def render_dashboard(
             small however many details or routes each result carries.
         nonce: Content-Security-Policy nonce for the page script, the only
             script the page runs.
+        unregistered: Probe and tag names requested by a filter but not
+            registered (``{"name", "kind", "endpoint", "count",
+            "last_requested_at"}`` each), listed with no status.
     """
     checked_at_text = ""
     if report.checked_at:
@@ -480,6 +524,7 @@ def render_dashboard(
 {cards}
     </div>
     <section class="routes" id="routes" hidden></section>
+    {_unregistered_html(unregistered or [])}
     {_glossary_html()}
     <div class="footer">
       <a href="status">JSON status</a> &nbsp;·&nbsp; <a href="history">History</a> &nbsp;·&nbsp;

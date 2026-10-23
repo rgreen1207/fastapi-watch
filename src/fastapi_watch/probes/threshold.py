@@ -101,8 +101,9 @@ class ThresholdProbe(BaseProbe):
     async def check(self) -> ProbeResult:
         result = await self._inner.check()
 
-        # Already UNHEALTHY — don't downgrade a genuine failure
-        if result.status == ProbeStatus.UNHEALTHY:
+        # Already UNHEALTHY — don't downgrade a genuine failure.  NO_DATA has
+        # no values to compare: a threshold must not turn it into a status.
+        if result.status in (ProbeStatus.UNHEALTHY, ProbeStatus.NO_DATA):
             return result.model_copy(update={"name": self.name})
 
         details = result.details or {}

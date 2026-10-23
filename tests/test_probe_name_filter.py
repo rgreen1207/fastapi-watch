@@ -31,11 +31,11 @@ def test_status_probe_filter_multiple():
     assert "svc-c" not in names
 
 
-def test_status_probe_filter_nonexistent_returns_empty():
+def test_status_probe_filter_nonexistent_is_404():
     client = _make_client()
     resp = client.get("/health/status?probe=nonexistent")
-    assert resp.status_code == 200
-    assert resp.json()["probes"] == []
+    assert resp.status_code == 404
+    assert resp.json()["unknown_probes"] == ["nonexistent"]
 
 
 def test_status_no_probe_param_returns_all():
@@ -61,11 +61,12 @@ def test_ready_probe_filter_single():
     assert data["status"] == "healthy"
 
 
-def test_ready_probe_filter_nonexistent_returns_healthy():
+def test_ready_probe_filter_nonexistent_does_not_pass():
+    """A mistyped probe name in a readiness URL used to pass every check."""
     client = _make_client()
     resp = client.get("/health/ready?probe=nonexistent")
-    assert resp.status_code == 200
-    assert resp.json()["status"] == "healthy"
+    assert resp.status_code == 404
+    assert resp.json()["unknown_probes"] == ["nonexistent"]
 
 
 def test_status_probe_and_tag_filter_and_logic():
@@ -118,7 +119,7 @@ def test_ready_stream_probe_filter_single_fetch():
 
 
 def test_probe_filter_excludes_when_tag_does_not_match():
-    """?probe=X&tag=Y with X not having tag Y → empty result (AND logic)."""
+    """?probe=X&tag=Y with X not having tag Y selects nothing (AND logic): 404."""
     app = FastAPI()
     registry = HealthRegistry(app, poll_interval_ms=None)
     probe_a = NoOpProbe(name="svc-a")
@@ -127,5 +128,5 @@ def test_probe_filter_excludes_when_tag_does_not_match():
     client = TestClient(app)
 
     resp = client.get("/health/status?probe=svc-a&tag=database")
-    assert resp.status_code == 200
-    assert resp.json()["probes"] == []
+    assert resp.status_code == 404
+    assert resp.json()["unknown_tags"] == ["database"]

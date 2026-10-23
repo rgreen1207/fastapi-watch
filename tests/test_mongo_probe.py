@@ -5,10 +5,10 @@ from fastapi_watch.probes.mongo import MongoProbe
 
 
 @pytest.mark.asyncio
-async def test_no_calls_returns_healthy():
+async def test_no_calls_has_no_data():
     probe = MongoProbe(name="mongodb")
     result = await probe.check()
-    assert result.status == ProbeStatus.HEALTHY
+    assert result.status == ProbeStatus.NO_DATA
     assert result.details["message"] == "no calls observed yet"
 
 

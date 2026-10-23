@@ -200,6 +200,9 @@ class MyServiceProbe(BaseProbe):
 | `"healthy"` | All clear | `200` | `200` |
 | `"degraded"` | Under stress, still serving | `200` | `207` |
 | `"unhealthy"` | Critical failure | `503` | `207` |
+| `"no_data"` | Nothing to report yet: no status | `200` | `200` |
+
+`no_data` is what passive, route and WebSocket probes and `RequestMetricsProbe` report before they have observed a single call. It is not healthy and not failing: it never alerts or fires `on_state_change`, `ThresholdProbe` passes it through, `/metrics` writes no `probe_healthy`/`probe_degraded` sample for it (`probe_no_data` is `1`), and the dashboard shows it grey. It does not fail readiness, so a pod whose probes need traffic to report can still become ready. A `probe=`/`tag=` filter that selects no registered probe is different: it gets `404` (see the README).
 
 DEGRADED lets a probe communicate "something is wrong but we're still responding" without triggering an emergency. Load balancers keep routing traffic.
 
@@ -207,6 +210,7 @@ Overall status rules (critical probes only):
 - Any UNHEALTHY → overall `"unhealthy"`
 - Any DEGRADED (no UNHEALTHY) → overall `"degraded"`
 - All passing → overall `"healthy"`
+- No critical probe has data yet → overall `"no_data"`
 
 ```python
 return ProbeResult(

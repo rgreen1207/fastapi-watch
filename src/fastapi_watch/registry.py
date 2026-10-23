@@ -88,6 +88,12 @@ _BUILTIN_DASHBOARD_CSP = (
 )
 # Retry-After (seconds) sent when max_stream_connections streams are open.
 _STREAM_RETRY_AFTER_S = 30
+# Probe and tag names asked for by a filter that matched nothing (a typo in a
+# readiness URL, say), remembered for the dashboard: at most this many, each
+# for this long, each cut to this length (anyone can send them with auth=None).
+_MAX_UNKNOWN_REQUESTS = 20
+_UNKNOWN_REQUEST_TTL_S = 3600.0
+_MAX_UNKNOWN_NAME_LEN = 100
 # Largest body POST/DELETE /maintenance read; a valid one is under 100 bytes.
 _MAX_CHANGE_BODY_BYTES = 4096
 
@@ -794,6 +800,8 @@ class HealthRegistry:
         self._stream_slots: int = 0
         self._shutting_down: bool = False
         self._sse_tasks: set[asyncio.Task] = set()
+        # (kind, name) -> {"kind", "name", "endpoint", "count", "last_requested_at"}; see _unknown_filter_names
+        self._unknown_requests: dict[tuple[str, str], dict] = {}
         self._signal_handler_installed: bool = False
 
         # Bounded alert queue — avoids unbounded create_task() per state-change.
@@ -2069,6 +2077,62 @@ class HealthRegistry:
                 (self._logger or _LIB_LOGGER).exception("fastapi-watch: poll iteration failed")
             await asyncio.sleep(1.0)
 
+    def _unmatched_filters(
+        self, endpoint: str, tags: frozenset[str] | None, probes: frozenset[str] | None
+    ) -> Response | None:
+        """``404`` when a ``tag=`` / ``probe=`` filter selects no registered probe, else ``None``.
+
+        A report with no probes in it is "healthy", so a mistyped probe name
+        in a Kubernetes readiness URL passed every check, outage or not.
+        Unknown names are also remembered (bounded) so the dashboard lists them.
+        """
+        if not tags and not probes:
+            return None
+        registered = {p.name: set(getattr(p, "tags", None) or []) for p, _ in self._probes}
+        for name, result in self._last_results.items():
+            if name in registered:
+                registered[name] |= set(result.tags)  # a probe may report tags of its own
+        known_tags = set().union(*registered.values()) if registered else set()
+        unknown_probes = sorted((probes or frozenset()) - registered.keys())
+        unknown_tags = sorted((tags or frozenset()) - known_tags)
+        selected = [
+            name for name, probe_tags in registered.items()
+            if (not probes or name in probes) and (not tags or probe_tags & tags)
+        ]
+        if selected and not unknown_probes and not unknown_tags:
+            return None
+        for kind, names in (("probe", unknown_probes), ("tag", unknown_tags)):
+            for name in names:
+                self._remember_unknown(kind, name, endpoint)
+        if unknown_probes or unknown_tags:
+            error = " and ".join(
+                f"unknown {kind}" for kind, names in (("probe", unknown_probes), ("tag", unknown_tags)) if names
+            )
+        else:
+            error = "no probe matches every filter"
+        return JSONResponse(
+            {"error": error, "unknown_probes": unknown_probes, "unknown_tags": unknown_tags},
+            status_code=404,
+        )
+
+    def _remember_unknown(self, kind: str, name: str, endpoint: str) -> None:
+        """Record a request for an unregistered probe or tag name (bounded in count, age and length)."""
+        name = name[:_MAX_UNKNOWN_NAME_LEN]
+        entry = self._unknown_requests.pop((kind, name), None) or {"kind": kind, "name": name, "count": 0}
+        entry["count"] += 1
+        entry["endpoint"] = endpoint
+        entry["last_requested_at"] = datetime.now(self._tzinfo)
+        self._unknown_requests[(kind, name)] = entry  # most recent last
+        while len(self._unknown_requests) > _MAX_UNKNOWN_REQUESTS:
+            del self._unknown_requests[next(iter(self._unknown_requests))]
+
+    def _recent_unknown_requests(self) -> list[dict]:
+        """Unregistered names requested within ``_UNKNOWN_REQUEST_TTL_S``, most recent first."""
+        cutoff = datetime.now(self._tzinfo) - timedelta(seconds=_UNKNOWN_REQUEST_TTL_S)
+        for key in [k for k, e in self._unknown_requests.items() if e["last_requested_at"] < cutoff]:
+            del self._unknown_requests[key]
+        return [dict(e) for e in reversed(self._unknown_requests.values())]
+
     def _in_grace_period(self) -> bool:
         if not self._grace_period_ms:
             return False
@@ -2197,6 +2261,8 @@ class HealthRegistry:
         """
         in_maintenance = self._in_maintenance()
         for result in results:
+            if not result.has_data:
+                continue  # no status: nothing changed, nothing to announce
             old = self._probe_states.get(result.name, ProbeStatus.HEALTHY)
             self._probe_states[result.name] = result.status
             alert_record: AlertRecord | None = None
@@ -2445,6 +2511,7 @@ class HealthRegistry:
             # embedded probes (full details, routes cut to the charted top ones).
             data = report.model_dump(mode="json", exclude={"probes"})
             data["probes"] = [_current_probe(r) for r in report.probes]
+            data["unregistered"] = registry._recent_unknown_requests()  # names asked for, no status
             return to_json(data).decode()
 
         sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
@@ -2452,13 +2519,20 @@ class HealthRegistry:
         def _storage_unavailable() -> Response:
             return JSONResponse({"error": "storage unavailable"}, status_code=503)
 
-        def _open_stream(request: Request, tag: str | None, probe: str | None, view: str | None) -> Response:
+        def _open_stream(
+            request: Request, endpoint: str, tag: str | None, probe: str | None, view: str | None
+        ) -> Response:
             """Start an SSE response, or answer 503 once ``max_stream_connections`` are open.
 
             The slot is taken here, before the generator starts, so a burst of
             connections cannot all pass the check; it is released when the
-            response finishes, even if the generator never ran.
+            response finishes, even if the generator never ran.  Filters that
+            select no probe are refused with 404, as on ``/ready``.
             """
+            filter_tags, filter_probes = _parse_csv_filter(tag), _parse_csv_filter(probe)
+            unmatched = registry._unmatched_filters(endpoint, filter_tags, filter_probes)
+            if unmatched is not None:
+                return unmatched
             release = registry._reserve_stream_slot()
             if release is None:
                 return JSONResponse(
@@ -2470,8 +2544,8 @@ class HealthRegistry:
                 registry._event_stream(
                     request,
                     functools.partial(_make_sse_report, view=view),
-                    filter_tags=_parse_csv_filter(tag),
-                    filter_probes=_parse_csv_filter(probe),
+                    filter_tags=filter_tags,
+                    filter_probes=filter_probes,
                     expires_at=getattr(request.state, "stream_token_expiry", None),
                 ),
                 release=release,
@@ -2502,15 +2576,19 @@ class HealthRegistry:
             tag: str | None = Query(default=None),
             probe: str | None = Query(default=None),
         ) -> Response:
+            _filter = _parse_csv_filter(tag)
+            _probe_filter = _parse_csv_filter(probe)
+            # Before maintenance and grace: a mistyped URL must not pass then either.
+            unmatched = registry._unmatched_filters("ready", _filter, _probe_filter)
+            if unmatched is not None:
+                return unmatched
             if registry._in_maintenance():
                 return JSONResponse({"status": "maintenance"}, status_code=200)
             if registry._in_grace_period():
                 return JSONResponse({"status": "starting"}, status_code=503)
             results = await registry._get_results()
-            _filter = _parse_csv_filter(tag)
             if _filter:
                 results = [r for r in results if _filter & set(r.tags)]
-            _probe_filter = _parse_csv_filter(probe)
             if _probe_filter:
                 results = [r for r in results if r.name in _probe_filter]
             report = HealthReport.from_results(
@@ -2539,11 +2617,14 @@ class HealthRegistry:
             tag: str | None = Query(default=None),
             probe: str | None = Query(default=None),
         ) -> Response:
-            results = await registry._get_results()
             _filter = _parse_csv_filter(tag)
+            _probe_filter = _parse_csv_filter(probe)
+            unmatched = registry._unmatched_filters("status", _filter, _probe_filter)
+            if unmatched is not None:
+                return unmatched
+            results = await registry._get_results()
             if _filter:
                 results = [r for r in results if _filter & set(r.tags)]
-            _probe_filter = _parse_csv_filter(probe)
             if _probe_filter:
                 results = [r for r in results if r.name in _probe_filter]
             report = HealthReport.from_results(
@@ -2551,7 +2632,7 @@ class HealthRegistry:
                 checked_at=registry._last_checked_at,
                 timezone=registry._timezone_name,
             )
-            code = 200 if report.status == ProbeStatus.HEALTHY else 207
+            code = 200 if report.status in (ProbeStatus.HEALTHY, ProbeStatus.NO_DATA) else 207
             return Response(
                 content=report.model_dump_json(),
                 status_code=code,
@@ -2661,7 +2742,7 @@ class HealthRegistry:
                 ),
             ),
         ) -> Response:
-            return _open_stream(request, tag, probe, view)
+            return _open_stream(request, "ready/stream", tag, probe, view)
 
         @self.app.get(
             f"{prefix}/status/stream",
@@ -2686,7 +2767,7 @@ class HealthRegistry:
                 ),
             ),
         ) -> Response:
-            return _open_stream(request, tag, probe, view)
+            return _open_stream(request, "status/stream", tag, probe, view)
 
         @self.app.get(
             f"{prefix}/metrics",
@@ -2837,7 +2918,7 @@ class HealthRegistry:
                     stream_url, _ = _dashboard_stream(request)
                     render = functools.partial(
                         render_dashboard, report, stream_url=stream_url, maintenance_banner=maintenance, history=history,
-                        nonce=nonce,
+                        nonce=nonce, unregistered=registry._recent_unknown_requests(),
                     )
                     async with render_lock:
                         return await run_render(render)

@@ -192,6 +192,19 @@ const tests = {
     assert.strictEqual(h.statusSentence([], {}, now), 'No probes registered');
   },
 
+  statusSentenceDoesNotCountNoDataAsHealthy() {
+    const now = 600e3;
+    assert.strictEqual(
+      h.statusSentence([{ name: 'a', status: 'healthy' }, { name: 'b', status: 'no_data' }], {}, now),
+      'All 1 probe healthy, 1 with no data yet',
+    );
+    assert.strictEqual(h.statusSentence([{ name: 'b', status: 'no_data' }], {}, now), 'No probe has reported yet');
+    assert.strictEqual(
+      h.statusSentence([{ name: 'a', status: 'unhealthy' }, { name: 'b', status: 'no_data' }], {}, now),
+      'a unhealthy',
+    );
+  },
+
   retryDelayBacksOffWithJitterUpToACap() {
     assert.strictEqual(h.retryDelayMs(1, 0), 1000);
     assert.strictEqual(h.retryDelayMs(1, 0.999999) < 2000, true);
