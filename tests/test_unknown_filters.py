@@ -175,3 +175,32 @@ def test_stream_whose_filter_selects_no_result_reports_an_error_not_healthy(path
     assert "event: error\n" in body
     assert '"error":"no probe matches every filter"' in body
     assert "healthy" not in body
+
+
+@pytest.mark.parametrize("path", ["/health/ready", "/health/status"])
+def test_tag_only_a_result_reports_is_known_on_a_fresh_pod(path):
+    """Before the probe had run once, its own tag was "unknown": 404 forever in single-fetch mode."""
+    app = FastAPI()
+    HealthRegistry(app, poll_interval_ms=None).add(_OwnTags())
+    response = TestClient(app).get(f"{path}?tag=primary")
+    assert response.status_code in (207, 503)
+    assert response.json()["status"] == "unhealthy"
+
+
+def test_unknown_tag_does_not_rerun_probes_that_already_reported():
+    calls = []
+
+    class _Counted(BaseProbe):
+        name = "counted"
+
+        async def check(self) -> ProbeResult:
+            calls.append(1)
+            return ProbeResult(name=self.name, status=ProbeStatus.HEALTHY)
+
+    app = FastAPI()
+    HealthRegistry(app, poll_interval_ms=60_000).add(_Counted())
+    client = TestClient(app)
+    client.get("/health/ready")
+    for _ in range(3):
+        assert client.get("/health/ready?tag=typo").status_code == 404
+    assert len(calls) == 1

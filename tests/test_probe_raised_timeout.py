@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from fastapi_watch import HealthRegistry
+from fastapi_watch import registry as registry_module
 from fastapi_watch.models import ProbeResult
 from fastapi_watch.probes.base import BaseProbe
 
@@ -136,3 +137,31 @@ async def test_cancelled_caller_returns_only_after_the_check_unwinds():
         await task
     events.append("caller returned")
     assert events == ["check unwound", "caller returned"]
+
+
+async def test_probe_ignoring_cancellation_is_still_bounded(caplog):
+    """A check that swallows cancellation used to hold every request sharing its run forever."""
+    release = asyncio.Event()
+
+    class _Stubborn(BaseProbe):
+        name = "stubborn"
+        timeout = 0.1
+
+        async def check(self) -> ProbeResult:
+            while not release.is_set():
+                try:
+                    await asyncio.sleep(10)
+                except asyncio.CancelledError:
+                    pass  # ignores cancellation
+
+    registry = HealthRegistry(FastAPI())
+    registry.add(_Stubborn())
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    with caplog.at_level("WARNING", logger="fastapi_watch"):
+        [result] = await registry.run_all()
+    elapsed = loop.time() - started
+    assert result.error == "probe timed out after 0.1 s"
+    assert elapsed < 0.1 + registry_module._CANCEL_GRACE_S + 0.5
+    assert "did not stop within" in caplog.text
+    release.set()

@@ -95,6 +95,8 @@ _MAX_UNKNOWN_REQUESTS = 20
 _UNKNOWN_REQUEST_TTL_S = 3600.0
 _MAX_UNKNOWN_NAME_LEN = 100
 _NO_FILTER_MATCH = "no probe matches every filter"
+# How long a cancelled probe check may take to unwind before it is abandoned.
+_CANCEL_GRACE_S = 1.0
 # Largest body POST/DELETE /maintenance read; a valid one is under 100 bytes.
 _MAX_CHANGE_BODY_BYTES = 4096
 
@@ -1632,21 +1634,11 @@ class HealthRegistry:
                 try:
                     done, _ = await asyncio.wait({task}, timeout=timeout)
                 except asyncio.CancelledError:
-                    # As wait_for does: the caller returns only once the check
-                    # has unwound (closing its connections, say).
-                    task.cancel()
-                    await asyncio.wait({task})
-                    if not task.cancelled():
-                        task.exception()  # retrieved: the caller's cancellation wins
+                    await self._cancel_check(probe, task)
                     raise
                 if not done:
-                    # As wait_for does: cancel the check and let it finish
-                    # unwinding, so two runs of one probe never overlap.
                     deadline_expired = True
-                    task.cancel()
-                    await asyncio.wait({task})
-                    if not task.cancelled():
-                        task.exception()  # retrieved: it is reported as the timeout
+                    await self._cancel_check(probe, task)
                     raise asyncio.TimeoutError
                 result = task.result()
             if not isinstance(result, ProbeResult):
@@ -1716,6 +1708,26 @@ class HealthRegistry:
 
             run.add_done_callback(_forget)
         return list(await asyncio.shield(run))
+
+    async def _cancel_check(self, probe: BaseProbe, task: "asyncio.Task") -> None:
+        """Cancel a running check and let it unwind, for at most ``_CANCEL_GRACE_S``.
+
+        Like ``wait_for``, the caller waits for the check's cleanup (closing a
+        connection, say), so runs of one probe do not overlap.  Unlike it, the
+        wait is bounded: a check that ignores cancellation would otherwise hold
+        every health request sharing its run indefinitely.  Such a check is
+        left running in the background and logged.
+        """
+        task.cancel()
+        await asyncio.wait({task}, timeout=_CANCEL_GRACE_S)
+        # Its outcome is reported as the timeout or cancellation, not raised.
+        task.add_done_callback(lambda done: done.cancelled() or done.exception())
+        if not task.done():
+            (self._logger or _LIB_LOGGER).warning(
+                "fastapi-watch: probe %r did not stop within %g s of being cancelled; "
+                "it keeps running in the background and the next check may overlap it",
+                probe.name, _CANCEL_GRACE_S,
+            )
 
     async def _safe_check(self, probe: BaseProbe, critical: bool) -> ProbeResult:
         """Run one probe with circuit-breaker and timeout handling."""
@@ -2144,7 +2156,7 @@ class HealthRegistry:
                 (self._logger or _LIB_LOGGER).exception("fastapi-watch: poll iteration failed")
             await asyncio.sleep(1.0)
 
-    def _unmatched_filters(
+    async def _unmatched_filters(
         self, endpoint: str, tags: frozenset[str] | None, probes: frozenset[str] | None
     ) -> Response | None:
         """``404`` when a ``tag=`` / ``probe=`` filter selects no registered probe, else ``None``.
@@ -2155,6 +2167,12 @@ class HealthRegistry:
         """
         if not tags and not probes:
             return None
+        if tags:
+            declared = set().union(*(set(getattr(p, "tags", None) or []) for p, _ in self._probes))
+            unreported = [(p, c) for p, c in self._probes if p.name not in self._last_results]
+            if tags - declared and unreported:
+                # A probe may report tags of its own, unknown until it has run once.
+                await self._execute_probes(unreported)
         registered = {p.name: set(getattr(p, "tags", None) or []) for p, _ in self._probes}
         for name, result in self._last_results.items():
             if name in registered:
@@ -2299,7 +2317,7 @@ class HealthRegistry:
                 if (filter_tags or filter_probes) and not results:
                     # As /ready answers 404: an empty report would read as healthy.
                     # A probe's own result can carry other tags than it registered.
-                    error = to_json({"error": "no probe matches every filter"}).decode()
+                    error = to_json({"error": _NO_FILTER_MATCH}).decode()
                     yield f"retry: {_SINGLE_FETCH_RETRY_MS}\nevent: error\ndata: {error}\n\n"
                     return
                 if interval_s is None:
@@ -2619,7 +2637,7 @@ class HealthRegistry:
         def _storage_unavailable() -> Response:
             return JSONResponse({"error": "storage unavailable"}, status_code=503)
 
-        def _open_stream(
+        async def _open_stream(
             request: Request, endpoint: str, tag: str | None, probe: str | None, view: str | None
         ) -> Response:
             """Start an SSE response, or answer 503 once ``max_stream_connections`` are open.
@@ -2630,7 +2648,7 @@ class HealthRegistry:
             select no probe are refused with 404, as on ``/ready``.
             """
             filter_tags, filter_probes = _parse_csv_filter(tag), _parse_csv_filter(probe)
-            unmatched = registry._unmatched_filters(endpoint, filter_tags, filter_probes)
+            unmatched = await registry._unmatched_filters(endpoint, filter_tags, filter_probes)
             if unmatched is not None:
                 return unmatched
             release = registry._reserve_stream_slot()
@@ -2679,7 +2697,7 @@ class HealthRegistry:
             _filter = _parse_csv_filter(tag)
             _probe_filter = _parse_csv_filter(probe)
             # Before maintenance and grace: a mistyped URL must not pass then either.
-            unmatched = registry._unmatched_filters("ready", _filter, _probe_filter)
+            unmatched = await registry._unmatched_filters("ready", _filter, _probe_filter)
             if unmatched is not None:
                 return unmatched
             if registry._in_maintenance():
@@ -2721,7 +2739,7 @@ class HealthRegistry:
         ) -> Response:
             _filter = _parse_csv_filter(tag)
             _probe_filter = _parse_csv_filter(probe)
-            unmatched = registry._unmatched_filters("status", _filter, _probe_filter)
+            unmatched = await registry._unmatched_filters("status", _filter, _probe_filter)
             if unmatched is not None:
                 return unmatched
             results = await registry._get_results()
@@ -2846,7 +2864,7 @@ class HealthRegistry:
                 ),
             ),
         ) -> Response:
-            return _open_stream(request, "ready/stream", tag, probe, view)
+            return await _open_stream(request, "ready/stream", tag, probe, view)
 
         @self.app.get(
             f"{prefix}/status/stream",
@@ -2871,7 +2889,7 @@ class HealthRegistry:
                 ),
             ),
         ) -> Response:
-            return _open_stream(request, "status/stream", tag, probe, view)
+            return await _open_stream(request, "status/stream", tag, probe, view)
 
         @self.app.get(
             f"{prefix}/metrics",
