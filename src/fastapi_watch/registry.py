@@ -27,7 +27,7 @@ from pydantic_core import to_json
 
 from ._executor import run_render
 from .alerts import BaseAlerter, WebhookAlerter
-from .dashboard import _current_probe, render_dashboard
+from .dashboard import _current_probe, _render_dashboard_bytes
 from .models import AlertRecord, HealthReport, ProbeResult, ProbeStatus
 from .prometheus import render_prometheus, validate_metrics_prefix
 from .probe_group import ProbeGroup
@@ -2978,16 +2978,26 @@ class HealthRegistry:
                 # One render at a time, on fastapi-watch's render thread: a page
                 # with long history is CPU work (tens of ms, megabytes of HTML)
                 # that would otherwise block the app's event loop, and its own
-                # thread never waits behind hung blocking probe checks.
-                render_lock = asyncio.Lock()
+                # thread never waits behind hung blocking probe checks.  An
+                # asyncio.Lock binds to the loop it is first contended on, so
+                # each loop (the app run again, e.g. per test) gets its own.
+                render_locks: dict[str, Any] = {"loop": None, "lock": None}
 
-                async def _renderer(report: HealthReport, maintenance: bool, request: Request, history: dict | None, nonce: str | None) -> str:
+                def _render_lock() -> asyncio.Lock:
+                    loop = asyncio.get_running_loop()
+                    if render_locks["loop"] is not loop:
+                        render_locks["loop"], render_locks["lock"] = loop, asyncio.Lock()
+                    return render_locks["lock"]
+
+                async def _renderer(report: HealthReport, maintenance: bool, request: Request, history: dict | None, nonce: str | None) -> bytes:
                     stream_url, _ = _dashboard_stream(request)
+                    # Encoded on the render thread too: a str response would be
+                    # encoded (megabytes) on the event loop.
                     render = functools.partial(
-                        render_dashboard, report, stream_url=stream_url, maintenance_banner=maintenance, history=history,
+                        _render_dashboard_bytes, report, stream_url=stream_url, maintenance_banner=maintenance, history=history,
                         nonce=nonce, unregistered=registry._recent_unknown_requests(),
                     )
-                    async with render_lock:
+                    async with _render_lock():
                         return await run_render(render)
 
                 if token_key is not None:

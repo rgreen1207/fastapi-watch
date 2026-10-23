@@ -302,13 +302,13 @@ def test_builtin_dashboard_renders_off_the_event_loop(monkeypatch):
     import fastapi_watch.registry as registry_module
 
     threads = []
-    real = registry_module.render_dashboard
+    real = registry_module._render_dashboard_bytes
 
     def _recording(*args, **kwargs):
         threads.append(threading.current_thread().name)
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(registry_module, "render_dashboard", _recording)
+    monkeypatch.setattr(registry_module, "_render_dashboard_bytes", _recording)
     resp = TestClient(_app(None)).get("/health/dashboard")
     assert resp.status_code == 200 and "data-stream-url" in resp.text
     assert threads and threads[0].startswith("fastapi-watch")

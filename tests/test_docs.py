@@ -156,3 +156,44 @@ def test_documented_constructor_keywords_exist(class_name, keywords):
     accepted = _accepted_keywords(_public_classes()[class_name])
     if accepted is not None:
         assert not set(keywords) - accepted, f"{class_name} does not accept {set(keywords) - accepted}"
+
+
+# ---------------------------------------------------------------------------
+# Dashboard response headers
+# ---------------------------------------------------------------------------
+
+def test_documented_dashboard_policy_is_the_one_sent():
+    # DOCS.md long said the page's script had no nonce and set no policy of
+    # its own, after the built-in page began sending a strict one.
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from fastapi_watch import HealthRegistry
+
+    resp = TestClient(HealthRegistry(FastAPI()).app).get("/health/dashboard")
+    docs = (ROOT / "DOCS.md").read_text(encoding="utf-8")
+    directives = [d.strip() for d in resp.headers["content-security-policy"].split(";")]
+    assert any(d.startswith("script-src 'nonce-") for d in directives)
+    for directive in directives:
+        if not directive.startswith("script-src"):
+            assert f"`{directive}`" in docs, f"DOCS.md does not mention {directive!r}"
+    for header in ("Cache-Control", "X-Content-Type-Options", "X-Frame-Options"):
+        assert f"`{header}: {resp.headers[header]}`" in docs
+
+
+def test_readme_endpoint_table_lists_every_health_route():
+    from fastapi import FastAPI
+    from fastapi.routing import APIRoute
+
+    from fastapi_watch import HealthRegistry
+
+    app = FastAPI()
+    HealthRegistry(app, auth={"type": "apikey", "key": "k"})  # with auth, every route is mounted
+    served = {
+        f"{method} {route.path}"
+        for route in app.routes if isinstance(route, APIRoute) and route.path.startswith("/health")
+        for method in route.methods - {"HEAD"}
+    }
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    documented = set(re.findall(r"^\| `((?:GET|POST|DELETE) /health[^`]*)` \|", readme, re.M))
+    assert documented == served

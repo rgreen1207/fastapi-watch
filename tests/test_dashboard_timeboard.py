@@ -225,6 +225,51 @@ def test_embedded_data_is_encoded_one_probe_at_a_time(monkeypatch):
     assert max(sizes) < sum(sizes) / 10
 
 
+def test_served_page_is_encoded_on_the_render_thread_without_widening(monkeypatch):
+    # The page's own text is not ASCII ("—", "·"), so joining it with the
+    # embedded data made one str of 2 bytes a character: widening and then
+    # encoding 78 MB (200 probes x 2000 points) were ~20 and ~30 ms of held
+    # GIL, the encode on the event loop itself.  The data parts stay ASCII and
+    # are encoded on the render thread one at a time.
+    import threading
+
+    import fastapi_watch.dashboard as dashboard_module
+    import fastapi_watch.registry as registry_module
+
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    history = {
+        name: [ProbeResult(name=name, status=ProbeStatus.DEGRADED, latency_ms=1.0, description="naïve — ✓",
+                           checked_at=start + timedelta(seconds=10 * k), details={"p95_rtt_ms": 2.0, "note": "é"})
+               for k in range(3)]
+        for name in ("a", "b")
+    }
+    report = HealthReport.from_results([results[-1] for results in history.values()])
+    unregistered = [{"name": "typo<", "kind": "probe", "endpoint": "ready", "count": 2, "last_requested_at": start}]
+    parts = dashboard_module._page_parts(report, "/s", True, history, "n0nce", unregistered)
+    assert not "".join(parts).isascii()
+    assert all(part.isascii() for part in parts[1:-1]) and len(parts) == 2 + 1 + len(history) + 1
+    page = dashboard_module._render_dashboard_bytes(report, stream_url="/s", maintenance_banner=True,
+                                                    history=history, nonce="n0nce", unregistered=unregistered)
+    assert page == render_dashboard(report, stream_url="/s", maintenance_banner=True, history=history,
+                                    nonce="n0nce", unregistered=unregistered).encode("utf-8")
+    assert b"typo&lt;" in page
+
+    rendered = []
+    real = registry_module._render_dashboard_bytes
+
+    def _recording(*args, **kwargs):
+        out = real(*args, **kwargs)
+        rendered.append((threading.current_thread().name, type(out)))
+        return out
+
+    monkeypatch.setattr(registry_module, "_render_dashboard_bytes", _recording)
+    app = FastAPI()
+    HealthRegistry(app).add(NoOpProbe(name="db"))
+    resp = TestClient(app).get("/health/dashboard")
+    assert resp.status_code == 200 and "data-stream-url" in resp.text
+    assert rendered == [("fastapi-watch-render_0", bytes)]
+
+
 def test_embedded_current_probe_keeps_details_but_trims_routes():
     [result] = _request_metrics_history(routes=150, entries=1)
     html = render_dashboard(HealthReport.from_results([result]), stream_url="/s")
@@ -243,3 +288,24 @@ def test_route_ranking_matches_the_page_script():
 
     routes = {"/b": {"request_count": 5}, "/a": {"request_count": 5}, "/c": {"request_count": 9}, "/d": "junk", "/e": {}}
     assert _top_routes(routes) == ["/c", "/a", "/b", "/d", "/e"]
+
+
+def test_concurrent_renders_work_on_every_event_loop():
+    # The one-render-at-a-time lock bound to the first loop it was contended
+    # on, so when the app ran again on a new loop (a test per TestClient, say)
+    # every page load that had to wait for it answered 500.
+    import asyncio
+
+    import httpx
+
+    app = FastAPI()
+    HealthRegistry(app, poll_interval_ms=None).add(NoOpProbe(name="db"))
+
+    async def burst() -> list[int]:
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            responses = await asyncio.gather(*(client.get("/health/dashboard") for _ in range(5)))
+        return [r.status_code for r in responses]
+
+    assert asyncio.run(burst()) == [200] * 5
+    assert asyncio.run(burst()) == [200] * 5
