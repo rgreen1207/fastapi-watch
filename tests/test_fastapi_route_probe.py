@@ -745,7 +745,7 @@ def test_circuit_breaker_disabled_via_init():
 
 
 def test_circuit_breaker_disabled_by_default():
-    """Passive probes read in-memory stats: suspending them protects nothing (1.7.2)."""
+    """Passive probes read in-memory stats: suspending them protects nothing (1.8.0)."""
     probe = FastAPIRouteProbe(name="api")
     assert probe.circuit_breaker_enabled is False
 

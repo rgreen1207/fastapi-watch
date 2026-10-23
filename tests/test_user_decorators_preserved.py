@@ -1,6 +1,6 @@
 """Monitoring a route never removes the application's own decorators.
 
-Up to 1.7.2, discover_routes() and watch_router() wrapped
+Up to 1.7.1, discover_routes() and watch_router() wrapped
 ``getattr(route.endpoint, "__wrapped__", route.endpoint)``, which follows any
 ``functools.wraps`` decorator: an endpoint behind an auth guard was replaced by
 its bare handler, so a route answering 403 served 200 and its data as soon as

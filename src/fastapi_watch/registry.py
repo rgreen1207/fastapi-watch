@@ -314,7 +314,7 @@ def _takes_two_positional(fn: Callable) -> bool:
     """True if *fn* can be called with two positional arguments.
 
     When the signature cannot be inspected (some builtins and C extensions),
-    assume it can — that is how every renderer was called before 1.7.2.
+    assume it can — that is how every renderer was called before 1.8.0.
     """
     try:
         params = list(inspect.signature(fn).parameters.values())

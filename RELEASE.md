@@ -1,6 +1,6 @@
 # Release Notes
 
-## v1.7.2
+## v1.8.0
 
 **Correctness and hardening release.**
 
