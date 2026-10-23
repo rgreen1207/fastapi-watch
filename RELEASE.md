@@ -2,7 +2,7 @@
 
 ## v1.8.0
 
-**Correctness and hardening release.**
+**Correctness, hardening and isolation release.** Three review rounds against two goals: monitoring must never slow or break the application it watches, and its storage must stay within the limits you set. Highlights: shutdown now runs for apps with `lifespan=` (queued alerts, pending writes, probe cleanup); storage can no longer grow from renamed results; a hung or misbehaving probe can no longer hang health endpoints; apps sharing a Redis prefix see only their own probes; a mistyped `?probe=`/`?tag=` gets `404` instead of passing readiness; probes with nothing to report yet show `no_data` instead of `healthy`; health routes leave the OpenAPI schema by default. Upgrading from 1.7.x: read the list below.
 
 ### Upgrading: behavior changes in this release
 
@@ -349,8 +349,21 @@ New `max_stream_connections` (default `100`) bounds concurrent SSE streams; furt
 
 The `/metrics` endpoint names every metric `probe_*` (`probe_healthy`, `probe_latency_ms`, …), which collides with blackbox_exporter's `probe_*` metrics when both are scraped into one Prometheus. New `HealthRegistry(metrics_prefix="fastapi_watch_")` namespaces them. The default `""` keeps the existing names, so current dashboards and alerts are unaffected; a non-empty default may come in a future minor release.
 
+#### `no_data`: probes with nothing to report have no status
+
+Passive, route and WebSocket probes and `RequestMetricsProbe` report the new `ProbeStatus.NO_DATA` until they observe their first call, instead of `healthy`. It never alerts, does not fail readiness, is grey on the dashboard, and has no `probe_healthy` sample on `/metrics`; the new `probe_no_data` gauge and `ProbeResult.has_data` expose it.
+
+#### Filters that select nothing fail; the dashboard shows what was asked for
+
+A `?probe=`/`?tag=` naming an unregistered probe or tag, or known filters that together select nothing, get `404` on `/health/ready`, `/health/status` and the streams. The dashboard lists the unknown names under "Requested but not registered", so a typo in a Kubernetes probe URL is visible.
+
+#### Each app sees only its own probes
+
+`/health/history`, `/health/alerts` and the dashboard show only the probes the app registers, so apps sharing a Redis prefix stay apart while replicas share their history. The built-in backends read only those keys (`get_history(names)` / `get_alerts(names)`).
+
 #### Other additions
 
+- `HealthRegistry(include_in_schema=False)` — health routes are left out of the OpenAPI schema unless set to `True`.
 - `HealthRegistry(probe_timeout=...)` — registry-wide probe deadline (see Bug Fixes).
 - `RequestMetricsProbe(app)` — resolves the live middleware from the app (see Bug Fixes).
 - `EventLoopProbe(sample_interval_ms=...)` and the `current_lag_ms` detail.
@@ -465,6 +478,14 @@ Passive and route probes stored `"<type>: <message>"` as `details["last_error"]`
 #### `CeleryProbe(detailed=True)` no longer publishes task arguments
 
 Task `args` and `kwargs` — often user data or secrets — were included for every active, reserved, and scheduled task. They are dropped unless `include_task_args=True`, and each list is capped at 50 entries per worker with a `truncated` count.
+
+#### Request bodies are read only after authentication
+
+FastAPI parses a declared request body before any dependency runs, so `POST /health/maintenance` parsed arbitrary JSON from unauthenticated clients. The body is now read after authentication and capped at 4 KiB (`413`).
+
+#### Apps sharing a storage prefix no longer see each other's probe data
+
+Two applications on one Redis prefix (the default prefix is the same for every app) each served the other's probe history, details and alerts. See New Features.
 
 #### Maintenance endpoints resist cross-site requests
 

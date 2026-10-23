@@ -650,7 +650,7 @@ Every response from `/health/ready`, `/health/status`, and the SSE streams share
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `status` | `"healthy"` \| `"degraded"` \| `"unhealthy"` | Overall result — critical probes only |
+| `status` | `"healthy"` \| `"degraded"` \| `"unhealthy"` \| `"no_data"` | Overall result — critical probes only; `"no_data"` while none of them has reported |
 | `checked_at` | `string \| null` | UTC ISO 8601 timestamp of the last probe run |
 | `timezone` | `string \| null` | IANA timezone name |
 | `probes` | `array` | Individual probe results |
@@ -661,7 +661,7 @@ Every response from `/health/ready`, `/health/status`, and the SSE streams share
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | `string` | Probe identifier |
-| `status` | `"healthy"` \| `"degraded"` \| `"unhealthy"` | State for this probe |
+| `status` | `"healthy"` \| `"degraded"` \| `"unhealthy"` \| `"no_data"` | State for this probe; `"no_data"` (no status) until it has observed anything |
 | `critical` | `boolean` | `true` if the probe affects overall status |
 | `latency_ms` | `number` | How long the check took |
 | `error` | `string \| null` | Error message on failure |
@@ -1785,7 +1785,7 @@ The endpoint is subject to the same `auth` as all other health endpoints.
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | `str` | Probe identifier |
-| `status` | `ProbeStatus` | `"healthy"`, `"degraded"`, or `"unhealthy"` |
+| `status` | `ProbeStatus` | `"healthy"`, `"degraded"`, `"unhealthy"`, or `"no_data"` (nothing observed yet) |
 | `critical` | `bool` | Affects overall status and readiness |
 | `latency_ms` | `float` | Check duration in milliseconds |
 | `error` | `str \| None` | Error message on failure |

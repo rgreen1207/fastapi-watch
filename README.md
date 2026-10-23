@@ -80,16 +80,16 @@ Every route is now monitored with real-traffic data. Health endpoints are live a
 | Endpoint | Purpose | Status |
 |---|---|---|
 | `GET /health/live` | Liveness — process is alive | `200` while the process runs (`401`/`403` without credentials when `auth=` is set) |
-| `GET /health/ready` | Readiness — all critical probes passing | `200` / `503` |
-| `GET /health/status` | Full probe detail | `200` / `207` |
+| `GET /health/ready` | Readiness — all critical probes passing | `200` / `503` / `404` for a `?probe=`/`?tag=` that selects nothing |
+| `GET /health/status` | Full probe detail | `200` / `207` / `404` as above |
 | `GET /health/dashboard` | Live HTML dashboard (SSE) | `200` |
 | `GET /health/dashboard/stream-url` | Fresh dashboard stream URL and token — built-in dashboard with `auth=` only | `200` |
 | `GET /health/metrics` | Prometheus text format 0.0.4 | `200` |
 | `GET /health/history` | Rolling result history per probe | `200` / `503` when storage fails |
 | `GET /health/alerts` | Probe state-change log | `200` / `503` when storage fails |
 | `GET /health/startup` | Startup gate; 503 until `set_started()` | `200` / `503` |
-| `GET /health/ready/stream` | SSE stream of readiness | stream |
-| `GET /health/status/stream` | SSE stream of full probe detail (`?view=dashboard` trims per-route data to what the dashboard charts) | stream |
+| `GET /health/ready/stream` | SSE stream of readiness | stream / `404` as above |
+| `GET /health/status/stream` | SSE stream of full probe detail (`?view=dashboard` trims per-route data to what the dashboard charts) | stream / `404` as above |
 | `GET /health/maintenance` | Maintenance mode status | `200` |
 | `POST /health/maintenance` | Enable maintenance mode — mounted only when `auth=` is set | `200` / `413` / `415` / `422` |
 | `DELETE /health/maintenance` | Disable maintenance mode — mounted only when `auth=` is set | `200` |
