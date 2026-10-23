@@ -389,7 +389,7 @@ A `Mount` with a path parameter (`/t/{tenant}`) produced one per-route entry per
 #### Less work per request
 
 - `RequestMetricsMiddleware` caches whether an endpoint is a health route, takes one clock reading per request and skips Mount handling when there is none (≈1.8 → 1.4 µs of middleware work per request). Passive probes do their formatting at check time (≈1.5 → 1.1 µs per watched call) and time throughput on a monotonic clock, so an NTP step no longer skews `requests_per_minute`.
-- The dashboard is rendered in fastapi-watch's thread pool, one render at a time (68 ms of event-loop time for 20 probes × 2,000 history entries), embeds only the charted p95 for older route entries, and `/health/history` serializes in one pass (about 4× faster).
+- The dashboard is rendered off the event loop on fastapi-watch's own render thread, one render at a time (it took 68 ms of event-loop time for 20 probes × 2,000 history entries), embeds only the charted p95 for older route entries, and `/health/history` serializes in one pass (about 4× faster).
 - Open streams share a single-fetch probe's result checked within their interval instead of each running the probe (20 streams ran a database check 100 times in 5 s), and registry-interval probes are polled only while a stream is open.
 - Alerters post from their own thread pool, so a slow webhook can no longer occupy the threads blocking probe checks use and time them out; their connect attempts share the request deadline across every resolved address.
 - Dashboard tabs whose stream is refused retry the stream alone with jittered backoff (up to 5 minutes) instead of re-rendering the page every 30 s, and renew expired tokens without a reload.
