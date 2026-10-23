@@ -106,6 +106,8 @@ Events are sent at the shortest effective probe interval (a probe with `poll_int
 
 In single-fetch mode (no probe has an interval) the stream sends one event, preceded by `retry: 30000`, and closes. Browsers then wait 30 seconds before reconnecting instead of their ~3-second default — each reconnect runs every probe again.
 
+A `?probe=`/`?tag=` filter naming no registered probe or tag gets `404` before the stream starts. If known filters select no result (a probe that reports tags of its own is filtered by those), the stream instead sends `retry: 30000`, `event: error` and `data: {"error": "no probe matches every filter"}`, then closes, never an empty report that would read as healthy. A browser `EventSource` delivers that event to `onerror` (with `event.data` set) and reconnects 30 seconds later.
+
 **Connection limit.** At most `max_stream_connections` streams (default `100`, across both stream endpoints) are open at once; each one wakes every 0.5 s, so the cap keeps stream clients from loading the app's event loop. Further stream requests get `503` with `Retry-After: 30` before any streaming starts. Pass `max_stream_connections=None` for no limit.
 
 Streams keep working while the storage backend is down: they are served from this process's own results (see [Polling and caching](#polling-and-caching)). A stream opened with a dashboard stream token closes when the token expires; see [Authentication](#authentication).
