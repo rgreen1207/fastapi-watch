@@ -190,7 +190,7 @@ GET /health/status?probe=postgresql,redis   # only these two probes
 GET /health/status?tag=payments&probe=checkout  # must match both
 ```
 
-A filter naming an unregistered probe or tag (a typo such as `?probe=postgress`), even alongside names that match, gets `404` with the unknown names, never a passing report; so do known filters that together select nothing, and the dashboard lists the name under "Requested but not registered".
+A filter naming an unregistered probe or tag (a typo such as `?probe=postgress`), even alongside names that match, gets `404` with the unknown names, never a passing report, and the dashboard lists the name under "Requested but not registered". Known filters that together select nothing also get `404` (`"no probe matches every filter"`).
 
 The dashboard shows tag chips on each probe card and a clickable filter bar to isolate groups at a glance.
 

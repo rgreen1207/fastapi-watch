@@ -128,3 +128,19 @@ async def test_no_data_is_not_written_to_storage():
         await busy.run_all()
     assert [r.status for r in (await shared.get_history())["svc"]] == [ProbeStatus.HEALTHY] * 2
     assert (await shared.get_latest("svc")).status == ProbeStatus.HEALTHY
+
+
+async def test_forgetting_a_probe_that_only_had_no_data_leaves_shared_data_alone():
+    # Nothing was written for it, so another replica's data under that name is
+    # not this process's to delete when it stops registering the probe.
+    shared = InMemoryProbeStorage()
+    idle, busy = (HealthRegistry(FastAPI(), poll_interval_ms=None, storage=shared) for _ in range(2))
+    idle.add(_Scripted("svc", [ProbeStatus.NO_DATA]))
+    busy.add(_Scripted("svc", [ProbeStatus.HEALTHY]))
+    await busy.run_all()
+    await idle.run_all()
+    assert idle._written_names == set()
+    idle._probes.clear()  # e.g. discover_routes(refresh=True) dropped it
+    await idle._forget_unregistered()
+    assert [r.status for r in (await shared.get_history())["svc"]] == [ProbeStatus.HEALTHY]
+    assert (await shared.get_latest("svc")).status == ProbeStatus.HEALTHY
