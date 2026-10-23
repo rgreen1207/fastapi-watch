@@ -1475,7 +1475,14 @@ class HealthRegistry:
         to 1 s) because the *monitoring store* is down.  Each probe has at
         most one writer; while the store is behind, only the newest unwritten
         result per probe is kept.
+
+        A ``no_data`` result is not written: there is nothing to chart, and in
+        a shared backend it interleaved with replicas that do have data (a
+        lane flapping between grey and green), while replicas still running
+        1.7.1 failed every read of it (their ``/health/ready`` answered 500).
         """
+        if not result.has_data:
+            return
         if self._writes_inline():
             await asyncio.gather(
                 self._storage_call("set_latest", result),

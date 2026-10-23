@@ -9,7 +9,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from fastapi_watch import FastAPIRouteProbe, HealthRegistry, ThresholdProbe
+from fastapi_watch import FastAPIRouteProbe, HealthRegistry, InMemoryProbeStorage, ThresholdProbe
 from fastapi_watch.models import HealthReport, ProbeResult, ProbeStatus
 from fastapi_watch.probes import NoOpProbe
 from fastapi_watch.probes.base import BaseProbe
@@ -113,3 +113,18 @@ def test_dashboard_renders_no_data():
     registry.add(FastAPIRouteProbe(name="orders")).add(NoOpProbe(name="db"))
     response = TestClient(app).get("/health/dashboard")
     assert response.status_code == 200
+
+
+async def test_no_data_is_not_written_to_storage():
+    # Replicas share a probe's history: one replica's no_data interleaved with
+    # another's real results, and a replica still on 1.7.1 sharing a custom
+    # backend failed every read of the unknown status (/health/ready 500).
+    shared = InMemoryProbeStorage()
+    idle, busy = (HealthRegistry(FastAPI(), poll_interval_ms=None, storage=shared) for _ in range(2))
+    idle.add(_Scripted("svc", [ProbeStatus.NO_DATA]))
+    busy.add(_Scripted("svc", [ProbeStatus.HEALTHY]))
+    for _ in range(2):
+        assert (await idle.run_all())[0].status == ProbeStatus.NO_DATA
+        await busy.run_all()
+    assert [r.status for r in (await shared.get_history())["svc"]] == [ProbeStatus.HEALTHY] * 2
+    assert (await shared.get_latest("svc")).status == ProbeStatus.HEALTHY

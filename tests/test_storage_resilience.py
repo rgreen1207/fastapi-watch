@@ -615,9 +615,18 @@ async def test_discover_routes_refresh_forgets_the_replaced_probe_name():
 
     storage = _CountingStorage()
     registry = HealthRegistry(app, storage=storage, poll_interval_ms=None)
+
+    async def call_items():
+        # A route probe with no observed call reports no_data, which is not stored.
+        route = next(r for r in app.routes if getattr(r, "path", None) == "/items")
+        await route.dependant.call()
+
     registry.discover_routes(name_fn=lambda route: "items-v1")
+    await call_items()
     await registry.run_all()
+    assert set(await storage.get_all_latest()) == {"items-v1"}
     registry.discover_routes(refresh=True, name_fn=lambda route: "items-v2")
+    await call_items()
     await registry.run_all()
     assert {p.name for p, _ in registry._probes} == {"items-v2"}
     await registry._forget_unregistered()
