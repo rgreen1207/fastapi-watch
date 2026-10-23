@@ -288,3 +288,24 @@ def test_route_ranking_matches_the_page_script():
 
     routes = {"/b": {"request_count": 5}, "/a": {"request_count": 5}, "/c": {"request_count": 9}, "/d": "junk", "/e": {}}
     assert _top_routes(routes) == ["/c", "/a", "/b", "/d", "/e"]
+
+
+def test_concurrent_renders_work_on_every_event_loop():
+    # The one-render-at-a-time lock bound to the first loop it was contended
+    # on, so when the app ran again on a new loop (a test per TestClient, say)
+    # every page load that had to wait for it answered 500.
+    import asyncio
+
+    import httpx
+
+    app = FastAPI()
+    HealthRegistry(app, poll_interval_ms=None).add(NoOpProbe(name="db"))
+
+    async def burst() -> list[int]:
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            responses = await asyncio.gather(*(client.get("/health/dashboard") for _ in range(5)))
+        return [r.status_code for r in responses]
+
+    assert asyncio.run(burst()) == [200] * 5
+    assert asyncio.run(burst()) == [200] * 5
