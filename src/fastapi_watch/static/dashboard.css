@@ -305,6 +305,7 @@ body {
 .details-table td, .routes-table td, .routes-table th, .unregistered-table td, .unregistered-table th { padding: 0.15rem 0.75rem 0.15rem 0; text-align: left; vertical-align: top; }
 .details-table td:first-child, .routes-table th, .unregistered-table th { color: var(--ink-soft); font-weight: 500; }
 .unregistered-table td:first-child { overflow-wrap: anywhere; }
+.unregistered-table .status-chip { display: inline-block; vertical-align: middle; }
 .routes-table td:first-child { overflow-wrap: anywhere; }
 .error-count-btn { cursor: pointer; text-decoration: underline dotted; }
 
