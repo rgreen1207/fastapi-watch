@@ -1458,7 +1458,11 @@ class HealthRegistry:
             await self._fire_state_changes([result])
             return result
         self._last_checked_at = checked_at
-        self._written_names.add(result.name)  # always probe.name (see _guarded_check)
+        if result.has_data:
+            # Only names written here are forgotten here.  A no_data result is
+            # not written, so other replicas' data under its name is not ours
+            # to delete when the probe is unregistered.
+            self._written_names.add(result.name)  # always probe.name (see _guarded_check)
         await asyncio.gather(self._store_result(result), self._fire_state_changes([result]))
         return result
 
