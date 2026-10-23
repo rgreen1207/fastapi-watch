@@ -767,6 +767,9 @@ class HealthRegistry:
         self._last_results: dict[str, ProbeResult] = {}
         # id(probe) -> its in-flight run, shared by concurrent callers
         self._inflight: dict[int, asyncio.Task] = {}
+        # id(probe) -> its check that ignored cancellation and is still running
+        # (see _cancel_check).  At most one per probe: none is started meanwhile.
+        self._abandoned_checks: dict[int, asyncio.Task] = {}
         # Writes to a backend other than the default in-memory one run in the
         # background (see _store_result): the newest result per probe and the
         # alert records not yet written, and one writer task per probe name
@@ -1625,6 +1628,15 @@ class HealthRegistry:
         """
         timeout = probe.timeout if probe.timeout is not None else self._probe_timeout
         deadline_expired = False
+        if id(probe) in self._abandoned_checks:
+            # Starting another would leave one more running each time it is
+            # abandoned: a task (and whatever connection it holds) per check.
+            return ProbeResult(
+                name=probe.name,
+                status=ProbeStatus.UNHEALTHY,
+                critical=critical,
+                error="previous check ignored cancellation and is still running",
+            )
         try:
             coro = probe.check()
             if timeout is None:
@@ -1716,18 +1728,26 @@ class HealthRegistry:
         connection, say), so runs of one probe do not overlap.  Unlike it, the
         wait is bounded: a check that ignores cancellation would otherwise hold
         every health request sharing its run indefinitely.  Such a check is
-        left running in the background and logged.
+        left running in the background and logged, and the probe is not
+        checked again (reported unhealthy) until it stops: otherwise each check
+        would abandon one more task, without bound.
         """
         task.cancel()
-        await asyncio.wait({task}, timeout=_CANCEL_GRACE_S)
         # Its outcome is reported as the timeout or cancellation, not raised.
         task.add_done_callback(lambda done: done.cancelled() or done.exception())
-        if not task.done():
-            (self._logger or _LIB_LOGGER).warning(
-                "fastapi-watch: probe %r did not stop within %g s of being cancelled; "
-                "it keeps running in the background and the next check may overlap it",
-                probe.name, _CANCEL_GRACE_S,
-            )
+        try:
+            await asyncio.wait({task}, timeout=_CANCEL_GRACE_S)
+        finally:
+            if not task.done():
+                key = id(probe)  # unique while the task, which references the probe, runs
+                self._abandoned_checks[key] = task
+                task.add_done_callback(lambda _: self._abandoned_checks.pop(key, None))
+                (self._logger or _LIB_LOGGER).warning(
+                    "fastapi-watch: probe %r did not stop within %g s of being cancelled; "
+                    "it keeps running in the background and the probe reports unhealthy "
+                    "until it stops",
+                    probe.name, _CANCEL_GRACE_S,
+                )
 
     async def _safe_check(self, probe: BaseProbe, critical: bool) -> ProbeResult:
         """Run one probe with circuit-breaker and timeout handling."""
