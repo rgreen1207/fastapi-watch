@@ -1538,11 +1538,19 @@ class HealthRegistry:
             return _STORAGE_FAILED
 
     def _storage_reads_by_name(self, op: str) -> bool:
-        """True if ``storage.<op>`` takes ``names`` (the built-in backends do)."""
+        """True if ``storage.<op>`` takes ``names`` as its first argument (the built-in backends do).
+
+        It is passed positionally: a keyword-only ``names`` failed every read
+        with ``TypeError`` (``503`` on ``/health/history`` and ``/health/alerts``),
+        so such a backend is filtered after the read instead.
+        """
         try:
-            return "names" in inspect.signature(getattr(self._storage, op)).parameters
+            params = list(inspect.signature(getattr(self._storage, op)).parameters.values())
         except (TypeError, ValueError):
             return False
+        return bool(params) and params[0].name == "names" and params[0].kind in (
+            inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD
+        )
 
     async def _own_history(self) -> Any:
         """History of the probes this registry registers, or ``_STORAGE_FAILED``.
