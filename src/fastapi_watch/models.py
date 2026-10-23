@@ -46,10 +46,11 @@ class ProbeResult(BaseModel):
 
     @property
     def is_passing(self) -> bool:
-        """True when status is HEALTHY or DEGRADED (not UNHEALTHY).
+        """True unless status is UNHEALTHY (so HEALTHY, DEGRADED or NO_DATA).
 
         Used by the circuit breaker to determine whether to reset the failure
-        counter — a DEGRADED probe is still answering, just under stress.
+        counter — a DEGRADED probe is still answering, just under stress, and
+        a probe with no data has not failed.
         """
         return self.status != ProbeStatus.UNHEALTHY
 

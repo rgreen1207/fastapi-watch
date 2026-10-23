@@ -1628,7 +1628,12 @@ class HealthRegistry:
                 try:
                     done, _ = await asyncio.wait({task}, timeout=timeout)
                 except asyncio.CancelledError:
+                    # As wait_for does: the caller returns only once the check
+                    # has unwound (closing its connections, say).
                     task.cancel()
+                    await asyncio.wait({task})
+                    if not task.cancelled():
+                        task.exception()  # retrieved: the caller's cancellation wins
                     raise
                 if not done:
                     # As wait_for does: cancel the check and let it finish
@@ -2287,6 +2292,12 @@ class HealthRegistry:
                     results = [r for r in results if filter_tags & set(r.tags)]
                 if filter_probes:
                     results = [r for r in results if r.name in filter_probes]
+                if (filter_tags or filter_probes) and not results:
+                    # As /ready answers 404: an empty report would read as healthy.
+                    # A probe's own result can carry other tags than it registered.
+                    error = to_json({"error": "no probe matches every filter"}).decode()
+                    yield f"retry: {_SINGLE_FETCH_RETRY_MS}\nevent: error\ndata: {error}\n\n"
+                    return
                 if interval_s is None:
                     yield f"retry: {_SINGLE_FETCH_RETRY_MS}\ndata: {make_report(results)}\n\n"
                     return

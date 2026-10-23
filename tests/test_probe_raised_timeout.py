@@ -110,3 +110,29 @@ async def test_cancelling_the_caller_cancels_the_check():
     with pytest.raises(asyncio.CancelledError):
         await task
     assert cancelled.is_set()
+
+
+async def test_cancelled_caller_returns_only_after_the_check_unwinds():
+    """As wait_for: cleanup in the check finishes before the caller sees CancelledError."""
+    started, events = asyncio.Event(), []
+
+    class _SlowCleanup(BaseProbe):
+        name = "slow_cleanup"
+        timeout = 30.0
+
+        async def check(self) -> ProbeResult:
+            started.set()
+            try:
+                await asyncio.sleep(30)
+            finally:
+                await asyncio.sleep(0.05)  # e.g. closing a connection
+                events.append("check unwound")
+
+    registry = HealthRegistry(FastAPI())
+    task = asyncio.ensure_future(registry._guarded_check(_SlowCleanup(), True))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    events.append("caller returned")
+    assert events == ["check unwound", "caller returned"]

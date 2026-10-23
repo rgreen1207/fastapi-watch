@@ -163,3 +163,15 @@ def test_registered_tag_that_selects_no_result_is_404(path):
     assert response.status_code == 404
     assert response.json() == {"error": "no probe matches every filter", "unknown_probes": [], "unknown_tags": []}
     assert client.get(f"{path}?tag=primary").json()["status"] == "unhealthy"
+
+
+@pytest.mark.parametrize("path", ["/health/ready/stream", "/health/status/stream"])
+@pytest.mark.parametrize("poll_interval_ms", [None, 60_000])
+def test_stream_whose_filter_selects_no_result_reports_an_error_not_healthy(path, poll_interval_ms):
+    app = FastAPI()
+    HealthRegistry(app, poll_interval_ms=poll_interval_ms).add(_OwnTags())
+    with TestClient(app).stream("GET", f"{path}?tag=db") as stream:
+        body = "".join(stream.iter_text())  # the stream ends after the error
+    assert "event: error\n" in body
+    assert '"error":"no probe matches every filter"' in body
+    assert "healthy" not in body

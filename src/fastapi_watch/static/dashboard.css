@@ -213,7 +213,8 @@ body {
 .seg-healthy { fill: var(--ok); }
 .seg-degraded { fill: var(--warn); }
 .seg-unhealthy { fill: var(--bad); }
-.seg-no_data { fill: var(--rule); }
+/* Visibly a segment (not the empty track) without a status color. */
+.seg-no_data { fill: var(--ink-faint); fill-opacity: 0.45; }
 .seg-gap { fill: var(--grid); }
 .tick-mark { stroke: var(--ink); stroke-width: 1.5; }
 

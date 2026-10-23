@@ -202,7 +202,7 @@ class MyServiceProbe(BaseProbe):
 | `"unhealthy"` | Critical failure | `503` | `207` |
 | `"no_data"` | Nothing to report yet: no status | `200` | `200` |
 
-`no_data` is what passive, route and WebSocket probes and `RequestMetricsProbe` report before they have observed a single call. It is not healthy and not failing: it never alerts or fires `on_state_change`, `ThresholdProbe` passes it through, `/metrics` writes no `probe_healthy`/`probe_degraded` sample for it (`probe_no_data` is `1`), and the dashboard shows it grey. It does not fail readiness, so a pod whose probes need traffic to report can still become ready. A `probe=`/`tag=` filter that selects no registered probe is different: it gets `404` (see the README).
+`no_data` is what passive, route and WebSocket probes and `RequestMetricsProbe` report before they have observed a single call. It is not healthy and not failing: it never alerts or fires `on_state_change`, `ThresholdProbe` passes it through, `/metrics` writes no `probe_healthy`/`probe_degraded` sample for it (`probe_no_data` is `1`), and the dashboard shows it grey. It is not written to storage, so it does not appear in `/health/history` (and replicas of earlier versions sharing the backend never read a status they do not know). It does not fail readiness, so a pod whose probes need traffic to report can still become ready. A `probe=`/`tag=` filter that selects no registered probe is different: it gets `404` (see the README).
 
 DEGRADED lets a probe communicate "something is wrong but we're still responding" without triggering an emergency. Load balancers keep routing traffic.
 
@@ -599,7 +599,7 @@ registry = HealthRegistry(app, storage=storage, history_size=120, result_ttl_sec
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `redis` | required | A `redis.asyncio` client |
-| `prefix` | `"fastapi-watch"` | Prefix for every key. On Redis Cluster use braces (`"{myapp:health}"`) so all keys share a slot |
+| `prefix` | `"fastapi-watch"` | Prefix for every key. On Redis Cluster use braces (`"{myapp:health}"`) so all keys share a slot. Give each app its own: alerts under one prefix share one `max_alerts` cap, so another app's alerts can push yours out of `/health/alerts` |
 | `max_results` | `120` | History entries per probe |
 | `result_ttl_seconds` | `7200` | Age limit for latest results and history entries. `0` = no age limit |
 | `alert_ttl_seconds` | `259200` | Age limit for alerts. `0` = no age limit |
