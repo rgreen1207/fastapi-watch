@@ -225,6 +225,25 @@ def test_malformed_json_is_a_422():
     assert registry._in_maintenance() is False
 
 
+@pytest.mark.parametrize("content", [b"\xff\xfe{}", b'{"minutes": 1e999}', b'{"minutes": NaN}'])
+def test_unencodable_body_input_is_a_422_not_a_500(content):
+    """The error echoes its input: raw non-UTF-8 bytes or a non-finite number
+    could not be written as JSON, so the 422 itself failed with 500."""
+    registry, client = _setup()
+    client = TestClient(client.app, raise_server_exceptions=False)
+    resp = client.post("/health/maintenance", headers={**_CREDS, "Content-Type": "application/json"}, content=content)
+    assert resp.status_code == 422
+    assert resp.json()["detail"][0]["loc"][0] == "body"
+    assert registry._in_maintenance() is False
+
+
+def test_maintenance_422_is_still_documented():
+    _, client = _setup()
+    spec = client.get("/openapi.json").json()
+    ref = spec["paths"]["/health/maintenance"]["post"]["responses"]["422"]["content"]["application/json"]["schema"]["$ref"]
+    assert ref.rsplit("/", 1)[-1] in spec["components"]["schemas"]
+
+
 def test_maintenance_body_is_still_documented():
     _, client = _setup()
     spec = client.get("/openapi.json").json()

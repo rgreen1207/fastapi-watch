@@ -6,6 +6,7 @@ and probe ``aclose()`` were all skipped at shutdown.
 """
 import asyncio
 import contextlib
+import time
 
 import pytest
 from fastapi import APIRouter, FastAPI, Request
@@ -222,3 +223,42 @@ def test_queued_alerts_sent_at_shutdown(with_lifespan):
         assert client.get("/health/ready").status_code == 503
         assert sent == []
     assert sent == ["failing"]
+
+
+def test_alert_worker_survives_a_second_event_loop():
+    """Each ``with TestClient(app)`` runs on a new loop.  The alert queue stayed
+    bound to the first, so the next worker died on its first wait and a
+    coalesced recovery alert was never sent."""
+    from fastapi_watch.alerts import BaseAlerter
+
+    sent: list = []
+    state = {"status": ProbeStatus.HEALTHY}
+
+    class _Recording(BaseAlerter):
+        async def notify(self, alert):
+            sent.append(alert.new_status)
+
+    class _Switch(BaseProbe):
+        name = "switch"
+
+        async def check(self) -> ProbeResult:
+            return ProbeResult(name=self.name, status=state["status"])
+
+    app = FastAPI()
+    registry = HealthRegistry(app, poll_interval_ms=None, alerters=[_Recording()], alert_min_interval_s=0.2)
+    registry.add(_Switch())
+    for cycle in (1, 2):
+        sent.clear()
+        registry._alert_last_sent_at.clear()
+        with TestClient(app) as client:
+            state["status"] = ProbeStatus.UNHEALTHY
+            client.get("/health/ready")
+            time.sleep(0.05)
+            state["status"] = ProbeStatus.HEALTHY
+            client.get("/health/ready")  # coalesced: sent once the interval ends
+            deadline = time.monotonic() + 2
+            while len(sent) < 2 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            worker = registry._alert_worker
+            assert worker is not None and not worker.done(), f"cycle {cycle}: worker died"
+        assert sent == [ProbeStatus.UNHEALTHY, ProbeStatus.HEALTHY], f"cycle {cycle}"
