@@ -79,7 +79,7 @@ Every route is now monitored with real-traffic data. Health endpoints are live a
 
 | Endpoint | Purpose | Status |
 |---|---|---|
-| `GET /health/live` | Liveness — process is alive | always `200` |
+| `GET /health/live` | Liveness — process is alive | `200` while the process runs (`401`/`403` without credentials when `auth=` is set) |
 | `GET /health/ready` | Readiness — all critical probes passing | `200` / `503` |
 | `GET /health/status` | Full probe detail | `200` / `207` |
 | `GET /health/dashboard` | Live HTML dashboard (SSE) | `200` |
