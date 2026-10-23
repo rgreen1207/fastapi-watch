@@ -11,7 +11,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from fastapi_watch import HealthRegistry, registry as registry_module
+from fastapi_watch.models import ProbeResult, ProbeStatus
 from fastapi_watch.probes import NoOpProbe
+from fastapi_watch.probes.base import BaseProbe
 
 
 def _client(**kwargs):
@@ -137,3 +139,27 @@ def test_dashboard_stream_carries_unknown_names():
     entries = json.loads(event[len("data: "):])["unregistered"]
     assert [(e["name"], e["kind"], e["endpoint"], e["count"]) for e in entries] == [("postgress", "probe", "ready", 1)]
     assert isinstance(entries[0]["last_requested_at"], str)
+
+
+class _OwnTags(BaseProbe):
+    """Registered with tag "db", but reports tags of its own."""
+
+    name = "postgres"
+    tags = ["db"]
+
+    async def check(self) -> ProbeResult:
+        return ProbeResult(name=self.name, status=ProbeStatus.UNHEALTHY, tags=["primary"])
+
+
+@pytest.mark.parametrize("path", ["/health/ready", "/health/status"])
+def test_registered_tag_that_selects_no_result_is_404(path):
+    # Results are filtered by the tags they report, so the tag the probe was
+    # registered with passed the unknown-name check and selected nothing: an
+    # empty "healthy" report (200) while the probe was failing.
+    app = FastAPI()
+    HealthRegistry(app, poll_interval_ms=None).add(_OwnTags())
+    client = TestClient(app)
+    response = client.get(f"{path}?tag=db")
+    assert response.status_code == 404
+    assert response.json() == {"error": "no probe matches every filter", "unknown_probes": [], "unknown_tags": []}
+    assert client.get(f"{path}?tag=primary").json()["status"] == "unhealthy"

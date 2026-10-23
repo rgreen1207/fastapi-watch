@@ -130,7 +130,8 @@ class ProbeStorage(Protocol):
         async def claim_alert(self, key: str, value: str, ttl_seconds: float) -> bool: ...
 
     ``get_history`` and ``get_alerts`` may also accept a ``names`` argument
-    (an iterable of probe names): the registry then passes the probes it
+    (an iterable of probe names, as the first positional parameter, e.g.
+    ``get_history(self, names=None)``): the registry then passes the probes it
     registers and the backend reads only theirs.  A backend without it
     returns everything, and the registry drops other apps' probes itself.
 

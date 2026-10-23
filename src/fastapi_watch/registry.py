@@ -94,6 +94,7 @@ _STREAM_RETRY_AFTER_S = 30
 _MAX_UNKNOWN_REQUESTS = 20
 _UNKNOWN_REQUEST_TTL_S = 3600.0
 _MAX_UNKNOWN_NAME_LEN = 100
+_NO_FILTER_MATCH = "no probe matches every filter"
 # Largest body POST/DELETE /maintenance read; a valid one is under 100 bytes.
 _MAX_CHANGE_BODY_BYTES = 4096
 
@@ -1475,7 +1476,14 @@ class HealthRegistry:
         to 1 s) because the *monitoring store* is down.  Each probe has at
         most one writer; while the store is behind, only the newest unwritten
         result per probe is kept.
+
+        A ``no_data`` result is not written: there is nothing to chart, and in
+        a shared backend it interleaved with replicas that do have data (a
+        lane flapping between grey and green), while replicas still running
+        1.7.1 failed every read of it (their ``/health/ready`` answered 500).
         """
+        if not result.has_data:
+            return
         if self._writes_inline():
             await asyncio.gather(
                 self._storage_call("set_latest", result),
@@ -1538,11 +1546,19 @@ class HealthRegistry:
             return _STORAGE_FAILED
 
     def _storage_reads_by_name(self, op: str) -> bool:
-        """True if ``storage.<op>`` takes ``names`` (the built-in backends do)."""
+        """True if ``storage.<op>`` takes ``names`` as its first argument (the built-in backends do).
+
+        It is passed positionally: a keyword-only ``names`` failed every read
+        with ``TypeError`` (``503`` on ``/health/history`` and ``/health/alerts``),
+        so such a backend is filtered after the read instead.
+        """
         try:
-            return "names" in inspect.signature(getattr(self._storage, op)).parameters
+            params = list(inspect.signature(getattr(self._storage, op)).parameters.values())
         except (TypeError, ValueError):
             return False
+        return bool(params) and params[0].name == "names" and params[0].kind in (
+            inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD
+        )
 
     async def _own_history(self) -> Any:
         """History of the probes this registry registers, or ``_STORAGE_FAILED``.
@@ -2151,11 +2167,21 @@ class HealthRegistry:
                 f"unknown {kind}" for kind, names in (("probe", unknown_probes), ("tag", unknown_tags)) if names
             )
         else:
-            error = "no probe matches every filter"
+            error = _NO_FILTER_MATCH
         return JSONResponse(
             {"error": error, "unknown_probes": unknown_probes, "unknown_tags": unknown_tags},
             status_code=404,
         )
+
+    @staticmethod
+    def _filtered_out_everything() -> Response:
+        """``404`` for known filters that left no result.
+
+        A probe that reports tags of its own is filtered by those, so a tag
+        it was registered with passes :meth:`_unmatched_filters` and still
+        selects nothing: an empty report, "healthy" however the probe fared.
+        """
+        return JSONResponse({"error": _NO_FILTER_MATCH, "unknown_probes": [], "unknown_tags": []}, status_code=404)
 
     def _remember_unknown(self, kind: str, name: str, endpoint: str) -> None:
         """Record a request for an unregistered probe or tag name (bounded in count, age and length)."""
@@ -2650,6 +2676,8 @@ class HealthRegistry:
                 results = [r for r in results if _filter & set(r.tags)]
             if _probe_filter:
                 results = [r for r in results if r.name in _probe_filter]
+            if not results and (_filter or _probe_filter):
+                return registry._filtered_out_everything()
             report = HealthReport.from_results(
                 results,
                 checked_at=registry._last_checked_at,
@@ -2686,6 +2714,8 @@ class HealthRegistry:
                 results = [r for r in results if _filter & set(r.tags)]
             if _probe_filter:
                 results = [r for r in results if r.name in _probe_filter]
+            if not results and (_filter or _probe_filter):
+                return registry._filtered_out_everything()
             report = HealthReport.from_results(
                 results,
                 checked_at=registry._last_checked_at,

@@ -41,6 +41,16 @@ class _LegacyStorage:
     async def get_alerts(self): return await self._inner.get_alerts()
 
 
+class _KeywordOnlyNamesStorage(InMemoryProbeStorage):
+    """A custom backend whose names argument is keyword-only."""
+
+    async def get_history(self, *, names=None):
+        return await super().get_history(names)
+
+    async def get_alerts(self, *, names=None):
+        return await super().get_alerts(names)
+
+
 def _two_apps(storage_factory):
     shared = InMemoryProbeStorage()
     apps = []
@@ -64,6 +74,20 @@ def test_history_alerts_and_dashboard_show_only_own_probes(storage_factory):
         assert {a["probe"] for a in s.get("/health/alerts").json()["alerts"]} == {"search-db"}
         assert "search-db" not in b.get("/health/dashboard").text
         assert "billing-db" not in s.get("/health/dashboard").text
+
+
+def test_backend_with_keyword_only_names_is_filtered_after_the_read():
+    # names was passed positionally: every read raised TypeError, so history
+    # and alerts answered 503 for as long as the app ran.
+    app = FastAPI()
+    HealthRegistry(app, storage=_KeywordOnlyNamesStorage(), poll_interval_ms=None).add(_Flips("api-db"))
+    with TestClient(app) as client:
+        client.get("/health/status")
+        client.get("/health/status")
+        history = client.get("/health/history")
+        alerts = client.get("/health/alerts")
+    assert history.status_code == 200 and set(history.json()["probes"]) == {"api-db"}
+    assert alerts.status_code == 200 and {a["probe"] for a in alerts.json()["alerts"]} == {"api-db"}
 
 
 def test_replicas_still_share_history():
