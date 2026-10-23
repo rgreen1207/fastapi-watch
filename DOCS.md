@@ -1917,6 +1917,20 @@ startupProbe:
 
 Use `/health/live` for liveness (only restart on genuine hang) and `/health/ready` for readiness (stop routing when dependencies are down). Use `/health/startup` to gate rollout until the application and its startup probes have passed.
 
+With `auth=` set, every health endpoint needs credentials, the kubelet's probes included: without them liveness gets `401`/`403` and Kubernetes restarts the pod over and over. Send them with `httpGet.httpHeaders`, for example `{"type": "apikey", ...}` with:
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /health/live
+    port: 8000
+    httpHeaders:
+      - name: X-API-Key
+        value: "<the key>"   # better: inject it from a Secret into the pod spec
+```
+
+A `?probe=` or `?tag=` in a probe path must name registered probes: an unknown name gets `404`, which Kubernetes treats as a failed check.
+
 For slow-starting applications:
 
 ```python
