@@ -94,6 +94,7 @@ _STREAM_RETRY_AFTER_S = 30
 _MAX_UNKNOWN_REQUESTS = 20
 _UNKNOWN_REQUEST_TTL_S = 3600.0
 _MAX_UNKNOWN_NAME_LEN = 100
+_NO_FILTER_MATCH = "no probe matches every filter"
 # Largest body POST/DELETE /maintenance read; a valid one is under 100 bytes.
 _MAX_CHANGE_BODY_BYTES = 4096
 
@@ -2166,11 +2167,21 @@ class HealthRegistry:
                 f"unknown {kind}" for kind, names in (("probe", unknown_probes), ("tag", unknown_tags)) if names
             )
         else:
-            error = "no probe matches every filter"
+            error = _NO_FILTER_MATCH
         return JSONResponse(
             {"error": error, "unknown_probes": unknown_probes, "unknown_tags": unknown_tags},
             status_code=404,
         )
+
+    @staticmethod
+    def _filtered_out_everything() -> Response:
+        """``404`` for known filters that left no result.
+
+        A probe that reports tags of its own is filtered by those, so a tag
+        it was registered with passes :meth:`_unmatched_filters` and still
+        selects nothing: an empty report, "healthy" however the probe fared.
+        """
+        return JSONResponse({"error": _NO_FILTER_MATCH, "unknown_probes": [], "unknown_tags": []}, status_code=404)
 
     def _remember_unknown(self, kind: str, name: str, endpoint: str) -> None:
         """Record a request for an unregistered probe or tag name (bounded in count, age and length)."""
@@ -2665,6 +2676,8 @@ class HealthRegistry:
                 results = [r for r in results if _filter & set(r.tags)]
             if _probe_filter:
                 results = [r for r in results if r.name in _probe_filter]
+            if not results and (_filter or _probe_filter):
+                return registry._filtered_out_everything()
             report = HealthReport.from_results(
                 results,
                 checked_at=registry._last_checked_at,
@@ -2701,6 +2714,8 @@ class HealthRegistry:
                 results = [r for r in results if _filter & set(r.tags)]
             if _probe_filter:
                 results = [r for r in results if r.name in _probe_filter]
+            if not results and (_filter or _probe_filter):
+                return registry._filtered_out_everything()
             report = HealthReport.from_results(
                 results,
                 checked_at=registry._last_checked_at,
