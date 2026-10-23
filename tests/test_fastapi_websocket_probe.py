@@ -177,10 +177,10 @@ async def test_non_websocket_object_records_connection_without_messages():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_check_before_any_connections_is_healthy():
+async def test_check_before_any_connections_has_no_data():
     probe = FastAPIWebSocketProbe(name="chat")
     result = await probe.check()
-    assert result.status == ProbeStatus.HEALTHY
+    assert result.status == ProbeStatus.NO_DATA
     assert result.details["message"] == "no connections observed yet"
 
 

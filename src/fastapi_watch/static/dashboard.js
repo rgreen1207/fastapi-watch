@@ -308,7 +308,13 @@
     var degraded = probes.filter(function (p) { return p.critical !== false && p.status === 'degraded'; });
     var pick = failing.length ? failing : degraded;
     if (!pick.length) {
-      return probes.length ? 'All ' + probes.length + ' probe' + (probes.length !== 1 ? 's' : '') + ' healthy' : 'No probes registered';
+      if (!probes.length) return 'No probes registered';
+      // A probe with no data has no status: it is not counted as healthy.
+      var count = probes.filter(function (p) { return p.status !== 'no_data'; }).length;
+      var waiting = probes.length - count;
+      if (!count) return 'No probe has reported yet';
+      var sentence = 'All ' + count + ' probe' + (count !== 1 ? 's' : '') + ' healthy';
+      return waiting ? sentence + ', ' + waiting + ' with no data yet' : sentence;
     }
     var word = failing.length ? 'unhealthy' : 'degraded';
     if (pick.length === 1) {
@@ -739,7 +745,9 @@
 
   // ── Live updates ──────────────────────────────────────────────────────
 
-  function statusLabel(s) { return s === 'healthy' ? 'Healthy' : s === 'degraded' ? 'Degraded' : 'Unhealthy'; }
+  function statusLabel(s) {
+    return s === 'healthy' ? 'Healthy' : s === 'degraded' ? 'Degraded' : s === 'no_data' ? 'No data' : 'Unhealthy';
+  }
 
   function fmtDetail(key, val) {
     if (val === null || val === undefined) return null;
@@ -814,12 +822,42 @@
   }
 
   function summaryText(probes) {
-    var total = probes.length, healthy = 0, degraded = 0;
-    probes.forEach(function (p) { if (p.status === 'healthy') healthy++; else if (p.status === 'degraded') degraded++; });
-    var unhealthy = total - healthy - degraded;
+    var total = probes.length, healthy = 0, degraded = 0, noData = 0;
+    probes.forEach(function (p) {
+      if (p.status === 'healthy') healthy++;
+      else if (p.status === 'degraded') degraded++;
+      else if (p.status === 'no_data') noData++;
+    });
+    var unhealthy = total - healthy - degraded - noData;
     var noun = 'probe' + (total !== 1 ? 's' : '');
-    if (degraded || unhealthy) return healthy + ' healthy, ' + degraded + ' degraded, ' + unhealthy + ' unhealthy / ' + total + ' ' + noun;
-    return healthy + ' / ' + total + ' ' + noun + ' healthy';
+    var waiting = noData ? ', ' + noData + ' no data' : '';
+    if (degraded || unhealthy) return healthy + ' healthy, ' + degraded + ' degraded, ' + unhealthy + ' unhealthy' + waiting + ' / ' + total + ' ' + noun;
+    return healthy + ' / ' + total + ' ' + noun + ' healthy' + waiting;
+  }
+
+  /** Names asked for by a filter but not registered: no status, kept current from the stream. */
+  function updateUnregistered(entries) {
+    var section = doc.getElementById('unregistered');
+    var tbody = doc.getElementById('unregistered-rows');
+    if (!section || !tbody || !Array.isArray(entries)) return;
+    while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+    entries.forEach(function (e) {
+      var tr = doc.createElement('tr');
+      var when = typeof e.last_requested_at === 'string' ? e.last_requested_at.replace('T', ' ').slice(0, 19) : '';
+      [e.name, e.kind, e.endpoint, e.count, when].forEach(function (value, i) {
+        var td = doc.createElement('td');
+        if (i === 0) {
+          var chip = doc.createElement('span');
+          chip.className = 'status-chip no_data';
+          td.appendChild(chip);
+          td.appendChild(doc.createTextNode(' '));
+        }
+        td.appendChild(doc.createTextNode(value === undefined || value === null ? '' : String(value)));
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    section.hidden = entries.length === 0;
   }
 
   function stored(key) {
@@ -864,6 +902,7 @@
     }
     if (probeSetChanged(probes)) reloadPage();
     probes.forEach(updateCard);
+    updateUnregistered(report.unregistered);
     scheduleRender();
   }
 

@@ -5,10 +5,10 @@ from fastapi_watch.probes.smtp import SMTPProbe
 
 
 @pytest.mark.asyncio
-async def test_no_sends_returns_healthy():
+async def test_no_sends_has_no_data():
     probe = SMTPProbe(name="sendgrid")
     result = await probe.check()
-    assert result.status == ProbeStatus.HEALTHY
+    assert result.status == ProbeStatus.NO_DATA
     assert result.details["message"] == "no calls observed yet"
 
 

@@ -33,6 +33,7 @@ across instances.  :class:`~fastapi_watch.RedisProbeStorage` (in
 import math
 import time
 from collections import deque
+from collections.abc import Iterable
 from typing import Protocol, runtime_checkable
 
 from pydantic_core import to_json
@@ -127,6 +128,11 @@ class ProbeStorage(Protocol):
         # each alert, and a probe going back to a status inside the window is
         # announced again.  ttl_seconds <= 0: always True, nothing stored.
         async def claim_alert(self, key: str, value: str, ttl_seconds: float) -> bool: ...
+
+    ``get_history`` and ``get_alerts`` may also accept a ``names`` argument
+    (an iterable of probe names): the registry then passes the probes it
+    registers and the backend reads only theirs.  A backend without it
+    returns everything, and the registry drops other apps' probes itself.
 
     For Redis use the bundled :class:`~fastapi_watch.RedisProbeStorage`.  A
     custom backend outline::
@@ -296,10 +302,12 @@ class InMemoryProbeStorage:
         self._history[name].append(result)
         self._history_times[name].append(time.monotonic())
 
-    async def get_history(self) -> dict[str, list[ProbeResult]]:
+    async def get_history(self, names: Iterable[str] | None = None) -> dict[str, list[ProbeResult]]:
+        """History per probe, oldest first; only the probes in *names* when given."""
         now = time.monotonic()
         out: dict[str, list[ProbeResult]] = {}
-        for name, entries in self._history.items():
+        selected = self._history if names is None else {n: self._history[n] for n in names if n in self._history}
+        for name, entries in selected.items():
             if self._result_ttl > 0:
                 times = self._history_times.get(name, deque())
                 valid = [result for result, recorded_at in zip(entries, times) if (now - recorded_at) <= self._result_ttl]
@@ -312,9 +320,11 @@ class InMemoryProbeStorage:
     async def append_alert(self, alert: AlertRecord) -> None:
         self._alerts.append((time.monotonic(), alert))
 
-    async def get_alerts(self) -> list[AlertRecord]:
+    async def get_alerts(self, names: Iterable[str] | None = None) -> list[AlertRecord]:
+        """Alerts, oldest first; only those of probes in *names* when given."""
         if self._alert_ttl > 0:
             now = time.monotonic()
             while self._alerts and (now - self._alerts[0][0]) > self._alert_ttl:
                 self._alerts.popleft()
-        return [alert for _, alert in self._alerts]
+        wanted = None if names is None else set(names)
+        return [alert for _, alert in self._alerts if wanted is None or alert.probe in wanted]

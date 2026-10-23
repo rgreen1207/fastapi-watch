@@ -23,7 +23,7 @@ import itertools
 import math
 import os
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from typing import Any
 
 from pydantic_core import to_json
@@ -346,11 +346,13 @@ class RedisProbeStorage:
             self._index(pipe, result.name, now, ttl_ms)
             await pipe.execute()
 
-    async def get_history(self) -> dict[str, list[ProbeResult]]:
+    async def get_history(self, names: Iterable[str] | None = None) -> dict[str, list[ProbeResult]]:
+        """History per probe, oldest first: of exactly *names* when given (only
+        their keys are read), otherwise of every probe written under the prefix."""
         now = time.time()
         cutoff = self._cutoff(self._result_ttl, now)
         async with self._slot():
-            names = await self._names(now)
+            names = await self._names(now) if names is None else sorted(names)
             if not names:
                 return {}
             async with self._redis.pipeline(transaction=False) as pipe:
@@ -380,14 +382,16 @@ class RedisProbeStorage:
                 pipe.persist(key)
             await pipe.execute()
 
-    async def get_alerts(self) -> list[AlertRecord]:
+    async def get_alerts(self, names: Iterable[str] | None = None) -> list[AlertRecord]:
+        """Alerts, oldest first: only those of probes in *names* when given."""
         cutoff = self._cutoff(self._alert_ttl, time.time())
         async with self._slot():
             members = await self._redis.zrevrangebyscore(
                 self._alerts_key, "+inf", cutoff, start=0, num=self._max_alerts
             )
         alerts = (_decode(AlertRecord, m, tagged=True) for m in reversed(members))
-        return [a for a in alerts if a is not None]
+        wanted = None if names is None else set(names)
+        return [a for a in alerts if a is not None and (wanted is None or a.probe in wanted)]
 
     async def claim_alert(self, key: str, value: str, ttl_seconds: float) -> bool:
         """Store *value* under *key* for *ttl_seconds*; return False only if the

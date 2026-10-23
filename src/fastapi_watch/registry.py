@@ -88,6 +88,12 @@ _BUILTIN_DASHBOARD_CSP = (
 )
 # Retry-After (seconds) sent when max_stream_connections streams are open.
 _STREAM_RETRY_AFTER_S = 30
+# Probe and tag names asked for by a filter that matched nothing (a typo in a
+# readiness URL, say), remembered for the dashboard: at most this many, each
+# for this long, each cut to this length (anyone can send them with auth=None).
+_MAX_UNKNOWN_REQUESTS = 20
+_UNKNOWN_REQUEST_TTL_S = 3600.0
+_MAX_UNKNOWN_NAME_LEN = 100
 # Largest body POST/DELETE /maintenance read; a valid one is under 100 bytes.
 _MAX_CHANGE_BODY_BYTES = 4096
 
@@ -445,6 +451,26 @@ async def _json_body(request: Request) -> bytes:
     return body
 
 
+def _body_errors(exc: ValidationError) -> list[dict]:
+    """*exc*'s errors located in the request body, as FastAPI reports them, and encodable as JSON.
+
+    Each error echoes its input: for malformed JSON that is the raw body, which
+    need not be UTF-8, and a number may be NaN or infinite; either turned the
+    422 into a 500.  Malformed JSON reports ``{}``, as FastAPI's own body
+    parsing does, and a non-finite number its name.
+    """
+    errors = []
+    for err in exc.errors(include_url=False):
+        err = {**err, "loc": ("body", *err["loc"])}
+        value = err.get("input")
+        if err["type"] == "json_invalid":
+            err["input"] = {}
+        elif isinstance(value, float) and not math.isfinite(value):
+            err["input"] = str(value)
+        errors.append(err)
+    return errors
+
+
 def _make_auth_checker(auth) -> Callable | None:
     """Return a FastAPI dependency that enforces authentication, or ``None`` for open access.
 
@@ -624,6 +650,9 @@ class HealthRegistry:
             and only the first to announce each change sends it.  A failing claim sends anyway.  Without
             ``claim_alert`` a warning is logged at init and alerts are not
             deduplicated.
+        include_in_schema: List the health endpoints in the app's OpenAPI
+            schema and ``/docs`` (keyword-only, default ``False``: they are
+            operational endpoints, not part of the application's API).
         stream_token_secret: Key that signs the dashboard's short-lived stream
             tokens (keyword-only).  By default the key is derived from the
             *auth* credentials with scrypt, or is random per process for a
@@ -674,6 +703,7 @@ class HealthRegistry:
         max_stream_connections: int | None = 100,
         alert_min_interval_s: float = 0.0,
         alert_dedupe_window_s: float | None = None,
+        include_in_schema: bool = False,
     ) -> None:
         if probe_timeout is not None and probe_timeout <= 0:
             raise ValueError(f"probe_timeout must be positive or None, got {probe_timeout!r}")
@@ -790,11 +820,14 @@ class HealthRegistry:
         self._stream_slots: int = 0
         self._shutting_down: bool = False
         self._sse_tasks: set[asyncio.Task] = set()
+        # (kind, name) -> {"kind", "name", "endpoint", "count", "last_requested_at"}; see _unknown_filter_names
+        self._unknown_requests: dict[tuple[str, str], dict] = {}
         self._signal_handler_installed: bool = False
 
         # Bounded alert queue — avoids unbounded create_task() per state-change.
         # A None item only wakes the worker to re-check coalesced alerts.
         self._alert_queue: asyncio.Queue[AlertRecord | None] = asyncio.Queue(maxsize=256)
+        self._alert_queue_loop: asyncio.AbstractEventLoop | None = None  # see _alert_queue_on
         self._alert_worker: asyncio.Task | None = None
 
         # Flap limiting: monotonic time of each probe's last alert, and the
@@ -819,7 +852,7 @@ class HealthRegistry:
             self._alert_dedupe_window_s = None
 
         if serve_routes:
-            self._register_routes(tags or ["health"], dashboard=dashboard)
+            self._register_routes(tags or ["health"], dashboard=dashboard, include_in_schema=include_in_schema)
         self._shut_down: bool = False
         self._hook_shutdown()
         for group in groups or []:
@@ -1503,6 +1536,38 @@ class HealthRegistry:
             self._log_storage_failure(op, exc)
             return _STORAGE_FAILED
 
+    def _storage_reads_by_name(self, op: str) -> bool:
+        """True if ``storage.<op>`` takes ``names`` (the built-in backends do)."""
+        try:
+            return "names" in inspect.signature(getattr(self._storage, op)).parameters
+        except (TypeError, ValueError):
+            return False
+
+    async def _own_history(self) -> Any:
+        """History of the probes this registry registers, or ``_STORAGE_FAILED``.
+
+        Apps sharing a storage namespace (the same Redis prefix) must not see
+        each other's probes; replicas of one app register the same names, so
+        they still share their history.
+        """
+        names = {p.name for p, _ in self._probes}
+        if self._storage_reads_by_name("get_history"):
+            return await self._storage_call("get_history", names)
+        history = await self._storage_call("get_history")
+        if history is _STORAGE_FAILED:
+            return history
+        return {name: entries for name, entries in history.items() if name in names}
+
+    async def _own_alerts(self) -> Any:
+        """Alerts of the probes this registry registers, or ``_STORAGE_FAILED``."""
+        names = {p.name for p, _ in self._probes}
+        if self._storage_reads_by_name("get_alerts"):
+            return await self._storage_call("get_alerts", names)
+        alerts = await self._storage_call("get_alerts")
+        if alerts is _STORAGE_FAILED:
+            return alerts
+        return [alert for alert in alerts if alert.probe in names]
+
     def _log_storage_failure(self, op: str, exc: BaseException) -> None:
         """Log a failed storage *op*, at most once per ``_STORAGE_LOG_INTERVAL_S``."""
         now = time.monotonic()
@@ -1963,9 +2028,9 @@ class HealthRegistry:
         """
         if not self._alert_queue.empty() and (self._alert_worker is None or self._alert_worker.done()):
             # Queued with no worker to send them (it is not started once shutting down).
-            self._alert_worker = asyncio.get_running_loop().create_task(
-                self._alert_loop(), name="fastapi-watch-alert-worker"
-            )
+            loop = asyncio.get_running_loop()
+            self._alert_queue_on(loop)
+            self._alert_worker = loop.create_task(self._alert_loop(), name="fastapi-watch-alert-worker")
         if self._alert_worker is None:
             return
         try:
@@ -2032,6 +2097,62 @@ class HealthRegistry:
             except Exception:
                 (self._logger or _LIB_LOGGER).exception("fastapi-watch: poll iteration failed")
             await asyncio.sleep(1.0)
+
+    def _unmatched_filters(
+        self, endpoint: str, tags: frozenset[str] | None, probes: frozenset[str] | None
+    ) -> Response | None:
+        """``404`` when a ``tag=`` / ``probe=`` filter selects no registered probe, else ``None``.
+
+        A report with no probes in it is "healthy", so a mistyped probe name
+        in a Kubernetes readiness URL passed every check, outage or not.
+        Unknown names are also remembered (bounded) so the dashboard lists them.
+        """
+        if not tags and not probes:
+            return None
+        registered = {p.name: set(getattr(p, "tags", None) or []) for p, _ in self._probes}
+        for name, result in self._last_results.items():
+            if name in registered:
+                registered[name] |= set(result.tags)  # a probe may report tags of its own
+        known_tags = set().union(*registered.values()) if registered else set()
+        unknown_probes = sorted((probes or frozenset()) - registered.keys())
+        unknown_tags = sorted((tags or frozenset()) - known_tags)
+        selected = [
+            name for name, probe_tags in registered.items()
+            if (not probes or name in probes) and (not tags or probe_tags & tags)
+        ]
+        if selected and not unknown_probes and not unknown_tags:
+            return None
+        for kind, names in (("probe", unknown_probes), ("tag", unknown_tags)):
+            for name in names:
+                self._remember_unknown(kind, name, endpoint)
+        if unknown_probes or unknown_tags:
+            error = " and ".join(
+                f"unknown {kind}" for kind, names in (("probe", unknown_probes), ("tag", unknown_tags)) if names
+            )
+        else:
+            error = "no probe matches every filter"
+        return JSONResponse(
+            {"error": error, "unknown_probes": unknown_probes, "unknown_tags": unknown_tags},
+            status_code=404,
+        )
+
+    def _remember_unknown(self, kind: str, name: str, endpoint: str) -> None:
+        """Record a request for an unregistered probe or tag name (bounded in count, age and length)."""
+        name = name[:_MAX_UNKNOWN_NAME_LEN]
+        entry = self._unknown_requests.pop((kind, name), None) or {"kind": kind, "name": name, "count": 0}
+        entry["count"] += 1
+        entry["endpoint"] = endpoint
+        entry["last_requested_at"] = datetime.now(self._tzinfo)
+        self._unknown_requests[(kind, name)] = entry  # most recent last
+        while len(self._unknown_requests) > _MAX_UNKNOWN_REQUESTS:
+            del self._unknown_requests[next(iter(self._unknown_requests))]
+
+    def _recent_unknown_requests(self) -> list[dict]:
+        """Unregistered names requested within ``_UNKNOWN_REQUEST_TTL_S``, most recent first."""
+        cutoff = datetime.now(self._tzinfo) - timedelta(seconds=_UNKNOWN_REQUEST_TTL_S)
+        for key in [k for k, e in self._unknown_requests.items() if e["last_requested_at"] < cutoff]:
+            del self._unknown_requests[key]
+        return [dict(e) for e in reversed(self._unknown_requests.values())]
 
     def _in_grace_period(self) -> bool:
         if not self._grace_period_ms:
@@ -2161,6 +2282,8 @@ class HealthRegistry:
         """
         in_maintenance = self._in_maintenance()
         for result in results:
+            if not result.has_data:
+                continue  # no status: nothing changed, nothing to announce
             old = self._probe_states.get(result.name, ProbeStatus.HEALTHY)
             self._probe_states[result.name] = result.status
             alert_record: AlertRecord | None = None
@@ -2295,11 +2418,28 @@ class HealthRegistry:
             return  # a check finishing during shutdown must not leave a new worker pending
         if self._alert_worker is None or self._alert_worker.done():
             try:
-                self._alert_worker = asyncio.get_running_loop().create_task(
-                    self._alert_loop(), name="fastapi-watch-alert-worker"
-                )
+                loop = asyncio.get_running_loop()
             except RuntimeError:
-                pass  # no running loop yet
+                return  # no running loop yet
+            self._alert_queue_on(loop)
+            self._alert_worker = loop.create_task(self._alert_loop(), name="fastapi-watch-alert-worker")
+
+    def _alert_queue_on(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Make the alert queue usable from *loop*, keeping the alerts queued in it.
+
+        An ``asyncio.Queue`` binds to the first loop that waits on it.  When the
+        app runs again on a new loop (``with TestClient(app)`` per test), the
+        worker died on its first wait with "bound to a different event loop",
+        losing coalesced alerts; so the queue moves to the new loop instead.
+        """
+        if self._alert_queue_loop is loop:
+            return
+        if self._alert_queue_loop is not None:
+            queue: asyncio.Queue[AlertRecord | None] = asyncio.Queue(maxsize=self._alert_queue.maxsize)
+            while not self._alert_queue.empty():
+                queue.put_nowait(self._alert_queue.get_nowait())
+            self._alert_queue = queue
+        self._alert_queue_loop = loop
 
     async def _alert_loop(self) -> None:
         """Drain the alert queue, dispatching each alert to all registered alerters.
@@ -2371,6 +2511,7 @@ class HealthRegistry:
         self,
         tags: list[str],
         dashboard: bool | Callable[..., str] | str | Path = True,
+        include_in_schema: bool = False,
     ) -> None:
         registry = self
         prefix = self.prefix
@@ -2408,6 +2549,7 @@ class HealthRegistry:
             # embedded probes (full details, routes cut to the charted top ones).
             data = report.model_dump(mode="json", exclude={"probes"})
             data["probes"] = [_current_probe(r) for r in report.probes]
+            data["unregistered"] = registry._recent_unknown_requests()  # names asked for, no status
             return to_json(data).decode()
 
         sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
@@ -2415,13 +2557,20 @@ class HealthRegistry:
         def _storage_unavailable() -> Response:
             return JSONResponse({"error": "storage unavailable"}, status_code=503)
 
-        def _open_stream(request: Request, tag: str | None, probe: str | None, view: str | None) -> Response:
+        def _open_stream(
+            request: Request, endpoint: str, tag: str | None, probe: str | None, view: str | None
+        ) -> Response:
             """Start an SSE response, or answer 503 once ``max_stream_connections`` are open.
 
             The slot is taken here, before the generator starts, so a burst of
             connections cannot all pass the check; it is released when the
-            response finishes, even if the generator never ran.
+            response finishes, even if the generator never ran.  Filters that
+            select no probe are refused with 404, as on ``/ready``.
             """
+            filter_tags, filter_probes = _parse_csv_filter(tag), _parse_csv_filter(probe)
+            unmatched = registry._unmatched_filters(endpoint, filter_tags, filter_probes)
+            if unmatched is not None:
+                return unmatched
             release = registry._reserve_stream_slot()
             if release is None:
                 return JSONResponse(
@@ -2433,8 +2582,8 @@ class HealthRegistry:
                 registry._event_stream(
                     request,
                     functools.partial(_make_sse_report, view=view),
-                    filter_tags=_parse_csv_filter(tag),
-                    filter_probes=_parse_csv_filter(probe),
+                    filter_tags=filter_tags,
+                    filter_probes=filter_probes,
                     expires_at=getattr(request.state, "stream_token_expiry", None),
                 ),
                 release=release,
@@ -2445,6 +2594,7 @@ class HealthRegistry:
         @self.app.get(
             f"{prefix}/live",
             tags=tags,
+            include_in_schema=include_in_schema,
             summary="Liveness check",
             description="Returns 200 while the process is running.",
             dependencies=auth_deps,
@@ -2455,6 +2605,7 @@ class HealthRegistry:
         @self.app.get(
             f"{prefix}/ready",
             tags=tags,
+            include_in_schema=include_in_schema,
             summary="Readiness check",
             description="Returns 200 if all critical probes pass, 503 otherwise.",
             dependencies=auth_deps,
@@ -2463,15 +2614,19 @@ class HealthRegistry:
             tag: str | None = Query(default=None),
             probe: str | None = Query(default=None),
         ) -> Response:
+            _filter = _parse_csv_filter(tag)
+            _probe_filter = _parse_csv_filter(probe)
+            # Before maintenance and grace: a mistyped URL must not pass then either.
+            unmatched = registry._unmatched_filters("ready", _filter, _probe_filter)
+            if unmatched is not None:
+                return unmatched
             if registry._in_maintenance():
                 return JSONResponse({"status": "maintenance"}, status_code=200)
             if registry._in_grace_period():
                 return JSONResponse({"status": "starting"}, status_code=503)
             results = await registry._get_results()
-            _filter = _parse_csv_filter(tag)
             if _filter:
                 results = [r for r in results if _filter & set(r.tags)]
-            _probe_filter = _parse_csv_filter(probe)
             if _probe_filter:
                 results = [r for r in results if r.name in _probe_filter]
             report = HealthReport.from_results(
@@ -2491,6 +2646,7 @@ class HealthRegistry:
         @self.app.get(
             f"{prefix}/status",
             tags=tags,
+            include_in_schema=include_in_schema,
             summary="Detailed health status",
             description="Returns full probe results. 200 when all healthy, 207 when any probe fails.",
             dependencies=auth_deps,
@@ -2499,11 +2655,14 @@ class HealthRegistry:
             tag: str | None = Query(default=None),
             probe: str | None = Query(default=None),
         ) -> Response:
-            results = await registry._get_results()
             _filter = _parse_csv_filter(tag)
+            _probe_filter = _parse_csv_filter(probe)
+            unmatched = registry._unmatched_filters("status", _filter, _probe_filter)
+            if unmatched is not None:
+                return unmatched
+            results = await registry._get_results()
             if _filter:
                 results = [r for r in results if _filter & set(r.tags)]
-            _probe_filter = _parse_csv_filter(probe)
             if _probe_filter:
                 results = [r for r in results if r.name in _probe_filter]
             report = HealthReport.from_results(
@@ -2511,7 +2670,7 @@ class HealthRegistry:
                 checked_at=registry._last_checked_at,
                 timezone=registry._timezone_name,
             )
-            code = 200 if report.status == ProbeStatus.HEALTHY else 207
+            code = 200 if report.status in (ProbeStatus.HEALTHY, ProbeStatus.NO_DATA) else 207
             return Response(
                 content=report.model_dump_json(),
                 status_code=code,
@@ -2521,6 +2680,7 @@ class HealthRegistry:
         @self.app.get(
             f"{prefix}/history",
             tags=tags,
+            include_in_schema=include_in_schema,
             summary="Probe result history",
             description=(
                 "Returns the last N results for each probe (oldest-first), within the result TTL window. "
@@ -2529,7 +2689,7 @@ class HealthRegistry:
             dependencies=auth_deps,
         )
         async def probe_history() -> Response:
-            history = await registry._storage_call("get_history")
+            history = await registry._own_history()
             if history is _STORAGE_FAILED:
                 return _storage_unavailable()
             # Serialized in one pass by pydantic-core: history can run to
@@ -2540,6 +2700,7 @@ class HealthRegistry:
         @self.app.get(
             f"{prefix}/alerts",
             tags=tags,
+            include_in_schema=include_in_schema,
             summary="Alert history",
             description=(
                 "Returns probe state-change alerts retained within the alert TTL window (default 72 hours). "
@@ -2548,7 +2709,7 @@ class HealthRegistry:
             dependencies=auth_deps,
         )
         async def alert_history() -> Response:
-            alerts = await registry._storage_call("get_alerts")
+            alerts = await registry._own_alerts()
             if alerts is _STORAGE_FAILED:
                 return _storage_unavailable()
             return Response(content=to_json({"alerts": alerts}), media_type="application/json")
@@ -2556,6 +2717,7 @@ class HealthRegistry:
         @self.app.get(
             f"{prefix}/startup",
             tags=tags,
+            include_in_schema=include_in_schema,
             summary="Startup check",
             description=(
                 "Returns 503 until :meth:`set_started` is called (and any startup probes pass). "
@@ -2580,6 +2742,7 @@ class HealthRegistry:
         @self.app.get(
             f"{prefix}/probes",
             tags=tags,
+            include_in_schema=include_in_schema,
             summary="Probe introspection",
             description="Lists all registered probes and their config without running them.",
             dependencies=auth_deps,
@@ -2600,6 +2763,7 @@ class HealthRegistry:
         @self.app.get(
             f"{prefix}/ready/stream",
             tags=tags,
+            include_in_schema=include_in_schema,
             summary="Readiness stream",
             description="SSE (Server-Sent Events) stream of readiness. Poll loop stops when last client disconnects.",
             dependencies=stream_deps,
@@ -2616,11 +2780,12 @@ class HealthRegistry:
                 ),
             ),
         ) -> Response:
-            return _open_stream(request, tag, probe, view)
+            return _open_stream(request, "ready/stream", tag, probe, view)
 
         @self.app.get(
             f"{prefix}/status/stream",
             tags=tags,
+            include_in_schema=include_in_schema,
             summary="Health status stream",
             description=(
                 "SSE (Server-Sent Events) stream of full probe results. Poll loop stops when last client disconnects. "
@@ -2640,11 +2805,12 @@ class HealthRegistry:
                 ),
             ),
         ) -> Response:
-            return _open_stream(request, tag, probe, view)
+            return _open_stream(request, "status/stream", tag, probe, view)
 
         @self.app.get(
             f"{prefix}/metrics",
             tags=tags,
+            include_in_schema=include_in_schema,
             summary="Prometheus metrics",
             description=(
                 "Probe health exported in Prometheus text format 0.0.4.  "
@@ -2663,6 +2829,7 @@ class HealthRegistry:
         @self.app.get(
             f"{prefix}/maintenance",
             tags=tags,
+            include_in_schema=include_in_schema,
             summary="Maintenance mode status",
             description="Returns whether maintenance mode is currently active and when it expires.",
             dependencies=auth_deps,
@@ -2686,6 +2853,7 @@ class HealthRegistry:
             @self.app.post(
                 f"{prefix}/maintenance",
                 tags=tags,
+                include_in_schema=include_in_schema,
                 summary="Enable maintenance mode",
                 description=(
                     "Enables maintenance mode. Optional body: ``{\"minutes\": N}`` or "
@@ -2701,6 +2869,16 @@ class HealthRegistry:
                         "required": False,
                         "content": {"application/json": {"schema": _MaintenanceRequest.model_json_schema()}},
                     },
+                    # Documented by FastAPI only for declared parameters, which this route no
+                    # longer has; the schema is in the spec for the routes' query parameters.
+                    "responses": {
+                        "422": {
+                            "description": "Validation Error",
+                            "content": {
+                                "application/json": {"schema": {"$ref": "#/components/schemas/HTTPValidationError"}},
+                            },
+                        },
+                    },
                 },
             )
             async def enable_maintenance(raw: bytes = Depends(_json_body)) -> Response:
@@ -2708,9 +2886,7 @@ class HealthRegistry:
                 try:
                     body = _MaintenanceRequest.model_validate_json(raw) if raw else _MaintenanceRequest()
                 except ValidationError as exc:
-                    raise RequestValidationError(
-                        [{**err, "loc": ("body", *err["loc"])} for err in exc.errors(include_url=False)]
-                    ) from None
+                    raise RequestValidationError(_body_errors(exc)) from None
                 now = datetime.now(registry._tzinfo)
                 if body.until is not None:
                     until = registry._aware(body.until)
@@ -2731,6 +2907,7 @@ class HealthRegistry:
             @self.app.delete(
                 f"{prefix}/maintenance",
                 tags=tags,
+                include_in_schema=include_in_schema,
                 summary="Disable maintenance mode",
                 description="Clears maintenance mode immediately. Browser cross-site requests get 403.",
                 dependencies=change_deps,
@@ -2789,7 +2966,7 @@ class HealthRegistry:
                     # encoded (megabytes) on the event loop.
                     render = functools.partial(
                         _render_dashboard_bytes, report, stream_url=stream_url, maintenance_banner=maintenance, history=history,
-                        nonce=nonce,
+                        nonce=nonce, unregistered=registry._recent_unknown_requests(),
                     )
                     async with render_lock:
                         return await run_render(render)
@@ -2799,6 +2976,7 @@ class HealthRegistry:
                     @self.app.get(
                         f"{prefix}/dashboard/stream-url",
                         tags=tags,
+                        include_in_schema=include_in_schema,
                         summary="Fresh dashboard stream URL",
                         description=(
                             "Returns the dashboard's live-update stream URL with a newly minted token, "
@@ -2818,6 +2996,7 @@ class HealthRegistry:
             @self.app.get(
                 f"{prefix}/dashboard",
                 tags=tags,
+                include_in_schema=include_in_schema,
                 summary="Health dashboard",
                 description="Server-rendered HTML dashboard with live SSE updates.",
                 response_class=HTMLResponse,
@@ -2830,7 +3009,7 @@ class HealthRegistry:
                     checked_at=registry._last_checked_at,
                     timezone=registry._timezone_name,
                 )
-                history = await registry._storage_call("get_history") if builtin_dashboard else None
+                history = await registry._own_history() if builtin_dashboard else None
                 if history is _STORAGE_FAILED:
                     history = {}  # the page still renders, from live results only
                 # The built-in page runs only its own script, so it gets a strict

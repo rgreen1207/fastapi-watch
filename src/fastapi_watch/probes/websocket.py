@@ -283,7 +283,7 @@ class FastAPIWebSocketProbe(BaseProbe):
         if self._total_connections == 0 and self._active_connections == 0:
             return ProbeResult(
                 name=self.name,
-                status=ProbeStatus.HEALTHY,
+                status=ProbeStatus.NO_DATA,
                 latency_ms=0.0,
                 details={"message": "no connections observed yet"},
             )

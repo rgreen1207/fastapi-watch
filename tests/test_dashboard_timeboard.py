@@ -244,13 +244,15 @@ def test_served_page_is_encoded_on_the_render_thread_without_widening(monkeypatc
         for name in ("a", "b")
     }
     report = HealthReport.from_results([results[-1] for results in history.values()])
-    parts = dashboard_module._page_parts(report, "/s", True, history, "n0nce")
+    unregistered = [{"name": "typo<", "kind": "probe", "endpoint": "ready", "count": 2, "last_requested_at": start}]
+    parts = dashboard_module._page_parts(report, "/s", True, history, "n0nce", unregistered)
     assert not "".join(parts).isascii()
     assert all(part.isascii() for part in parts[1:-1]) and len(parts) == 2 + 1 + len(history) + 1
     page = dashboard_module._render_dashboard_bytes(report, stream_url="/s", maintenance_banner=True,
-                                                    history=history, nonce="n0nce")
+                                                    history=history, nonce="n0nce", unregistered=unregistered)
     assert page == render_dashboard(report, stream_url="/s", maintenance_banner=True, history=history,
-                                    nonce="n0nce").encode("utf-8")
+                                    nonce="n0nce", unregistered=unregistered).encode("utf-8")
+    assert b"typo&lt;" in page
 
     rendered = []
     real = registry_module._render_dashboard_bytes

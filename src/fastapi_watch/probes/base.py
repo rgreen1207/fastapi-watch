@@ -2,6 +2,7 @@ import functools
 import inspect
 import logging
 import math
+import sys
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -87,6 +88,30 @@ def _resolved_signature(wrapper: Callable, func: Callable) -> Callable:
     except Exception:
         pass
     return wrapper
+
+
+def _leave_to_wrapper(agen: Any) -> None:
+    """Event-loop finalizer for a watched async generator: its wrapper closes it."""
+
+
+def _first_step_unhooked(agen: Any) -> Any:
+    """``agen.asend(None)``, keeping *agen* away from the event loop's finalizer.
+
+    The loop's async-generator hooks are bound on a generator's first step.
+    A watched generator's wrapper gets them and closes the generator it wraps;
+    were that one finalized by the loop as well, an abandoned pair (collected
+    in a reference cycle, or still open at loop shutdown) got two concurrent
+    ``aclose()`` calls, and one failed into the loop's error log
+    ("asynchronous generator is already running").
+    """
+    hooks = sys.get_asyncgen_hooks()
+    if hooks.firstiter is None and hooks.finalizer is None:
+        return agen.asend(None)
+    sys.set_asyncgen_hooks(firstiter=None, finalizer=_leave_to_wrapper)
+    try:
+        return agen.asend(None)
+    finally:
+        sys.set_asyncgen_hooks(*hooks)
 
 
 def _round_ms(value: float | None) -> float | None:
@@ -545,13 +570,13 @@ class PassiveProbe(BaseProbe):
             async def async_gen_wrapper(*args: Any, **kwargs: Any) -> Any:
                 started = _start()
                 inner = func(*args, **kwargs)
+                step = _first_step_unhooked(inner)
                 busy_s = 0.0
-                sent: Any = None
                 thrown: BaseException | None = None
                 while True:
                     resumed = time.perf_counter()
                     try:
-                        item = await (inner.asend(sent) if thrown is None else inner.athrow(thrown))
+                        item = await step
                     except StopAsyncIteration:
                         _on_success(None, started, (busy_s + time.perf_counter() - resumed) * 1000)
                         return
@@ -561,7 +586,7 @@ class PassiveProbe(BaseProbe):
                         raise
                     busy_s += time.perf_counter() - resumed
                     try:
-                        sent, thrown = (yield item), None
+                        sent = yield item
                     except GeneratorExit:
                         resumed = time.perf_counter()
                         try:
@@ -572,7 +597,9 @@ class PassiveProbe(BaseProbe):
                         _on_success(None, started, (busy_s + time.perf_counter() - resumed) * 1000)
                         raise
                     except BaseException as exc:
-                        sent, thrown = None, exc
+                        step, thrown = inner.athrow(exc), exc
+                    else:
+                        step, thrown = inner.asend(sent), None
             return _resolved_signature(async_gen_wrapper, func)
 
         if inspect.isgeneratorfunction(func):
@@ -643,7 +670,7 @@ class PassiveProbe(BaseProbe):
             if call_count == 0:
                 return ProbeResult(
                     name=self.name,
-                    status=ProbeStatus.HEALTHY,
+                    status=ProbeStatus.NO_DATA,
                     latency_ms=0.0,
                     details={"message": self._empty_message},
                 )

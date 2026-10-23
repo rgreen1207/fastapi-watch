@@ -147,7 +147,9 @@ class FastAPIRouteProbe(PassiveProbe):
 
         ``HTTPException`` is caught to record its status code and then
         re-raised so FastAPI's normal exception handling is unaffected.
-        Any other exception is recorded as a 500 and re-raised.
+        ``ClientDisconnect`` (the client hung up while the handler read its
+        body) is recorded as a 499; any other exception as a 500.  Either
+        way it is re-raised.
         """
         if isinstance(func_or_label, str):
             self._label = func_or_label

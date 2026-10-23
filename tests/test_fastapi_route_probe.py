@@ -23,10 +23,10 @@ async def _call(wrapper, *args, **kwargs):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_check_before_any_requests_is_healthy():
+async def test_check_before_any_requests_has_no_data():
     probe = FastAPIRouteProbe(name="api")
     result = await probe.check()
-    assert result.status == ProbeStatus.HEALTHY
+    assert result.status == ProbeStatus.NO_DATA
     assert result.name == "api"
     assert result.details["message"] == "no requests observed yet"
 

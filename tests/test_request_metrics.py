@@ -39,12 +39,12 @@ def _make_app(per_route: bool = True, max_error_rate: float = 0.1, max_avg_rtt_m
 
 
 @pytest.mark.asyncio
-async def test_no_requests_returns_healthy():
+async def test_no_requests_has_no_data():
     app = FastAPI()
     middleware = RequestMetricsMiddleware(app)
     probe = RequestMetricsProbe(middleware)
     result = await probe.check()
-    assert result.status == ProbeStatus.HEALTHY
+    assert result.status == ProbeStatus.NO_DATA
     assert result.details.get("message") == "no requests observed yet"
 
 
@@ -290,11 +290,11 @@ def test_matched_routes_key_on_full_template():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_probe_given_app_before_first_request_is_healthy():
+async def test_probe_given_app_before_first_request_has_no_data():
     app = _crashing_app()
     app.add_middleware(RequestMetricsMiddleware)
     result = await RequestMetricsProbe(app).check()
-    assert result.status == ProbeStatus.HEALTHY
+    assert result.status == ProbeStatus.NO_DATA
     assert result.details == {"message": "no requests observed yet"}
 
 

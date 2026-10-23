@@ -9,6 +9,11 @@ class ProbeStatus(str, Enum):
     HEALTHY = "healthy"
     DEGRADED = "degraded"
     UNHEALTHY = "unhealthy"
+    # Nothing to report yet (e.g. a passive probe before its first observed
+    # call): no status at all.  Never counts as healthy or failing, never
+    # alerts, and does not fail readiness, so a pod that needs traffic to
+    # produce data can still become ready.
+    NO_DATA = "no_data"
 
 
 class ProbeResult(BaseModel):
@@ -33,6 +38,11 @@ class ProbeResult(BaseModel):
     def is_degraded(self) -> bool:
         """True when status is DEGRADED."""
         return self.status == ProbeStatus.DEGRADED
+
+    @property
+    def has_data(self) -> bool:
+        """False while the probe has nothing to report yet (status NO_DATA)."""
+        return self.status != ProbeStatus.NO_DATA
 
     @property
     def is_passing(self) -> bool:
@@ -70,6 +80,8 @@ class HealthReport(BaseModel):
             overall = ProbeStatus.UNHEALTHY
         elif any(r.status == ProbeStatus.DEGRADED for r in critical):
             overall = ProbeStatus.DEGRADED
+        elif critical and not any(r.has_data for r in critical):
+            overall = ProbeStatus.NO_DATA  # nothing critical has reported yet
         else:
             overall = ProbeStatus.HEALTHY
         failing = [r.name for r in critical if r.status == ProbeStatus.UNHEALTHY]

@@ -7,6 +7,7 @@ application; later releases ran it, but the probe timed only the creation of
 the generator (~0 ms) and never saw an error raised while it ran.
 """
 import asyncio
+import gc
 import inspect
 import threading
 
@@ -231,6 +232,54 @@ async def test_async_aclose_is_forwarded():
     await gen.aclose()
     assert closed == [True]
     assert (await probe.check()).details["call_count"] == 1
+
+
+@pytest.mark.parametrize("abandon", ["reference_cycle", "loop_shutdown"])
+def test_abandoned_async_generator_is_closed_once_without_loop_errors(abandon):
+    """The event loop finalizes an abandoned async generator.  It must close
+    only the wrapper, which closes the generator it wraps: closing both at
+    once failed one ("already running") into the loop's error log."""
+    probe = PassiveProbe("p")
+    cleanups = []
+    loop_errors = []
+    kept = []
+
+    @probe.watch
+    async def rows():
+        try:
+            yield 1
+            yield 2
+        finally:
+            await asyncio.sleep(0)  # closing a connection, say
+            cleanups.append(True)
+
+    async def stop_early():
+        gen = rows()
+        try:
+            async for _ in gen:
+                raise ValueError("stop")
+        except ValueError as exc:
+            if abandon == "reference_cycle":
+                error = exc  # noqa: F841 -- exception -> traceback -> frame -> exception
+            else:
+                kept.append(gen)
+
+    async def main():
+        asyncio.get_running_loop().set_exception_handler(lambda loop, context: loop_errors.append(context))
+        gc.disable()
+        try:
+            await stop_early()
+            gc.collect()
+        finally:
+            gc.enable()
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    asyncio.run(main())  # closes generators still open at shutdown
+
+    assert loop_errors == []
+    assert cleanups == [True]
+    assert _details(probe)["call_count"] == 1
 
 
 # ---------------------------------------------------------------------------

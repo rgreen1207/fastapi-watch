@@ -335,8 +335,10 @@ class RequestMetricsMiddleware:
                 return
             try:
                 await send(message)
-            except Exception:
-                client_gone = True  # the server could not deliver it: the client hung up
+            except OSError:
+                # ASGI servers raise an OSError subclass when the client has gone.
+                # Anything else (h11 refusing an invalid header) is a server error.
+                client_gone = True
                 raise
 
         try:
@@ -465,7 +467,7 @@ class RequestMetricsProbe(BaseProbe):
         if middleware is None:
             return ProbeResult(
                 name=self.name,
-                status=ProbeStatus.HEALTHY,
+                status=ProbeStatus.NO_DATA,
                 latency_ms=0.0,
                 details={"message": "no requests observed yet"},
             )
@@ -475,7 +477,7 @@ class RequestMetricsProbe(BaseProbe):
         if snap["request_count"] == 0:
             return ProbeResult(
                 name=self.name,
-                status=ProbeStatus.HEALTHY,
+                status=ProbeStatus.NO_DATA,
                 latency_ms=0.0,
                 details={"message": "no requests observed yet"},
             )
