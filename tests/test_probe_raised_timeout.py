@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from fastapi_watch import HealthRegistry
 from fastapi_watch import registry as registry_module
-from fastapi_watch.models import ProbeResult
+from fastapi_watch.models import ProbeResult, ProbeStatus
 from fastapi_watch.probes.base import BaseProbe
 
 
@@ -165,3 +165,47 @@ async def test_probe_ignoring_cancellation_is_still_bounded(caplog):
     assert elapsed < 0.1 + registry_module._CANCEL_GRACE_S + 0.5
     assert "did not stop within" in caplog.text
     release.set()
+
+
+async def test_probe_ignoring_cancellation_is_not_started_again_while_it_runs(monkeypatch, caplog):
+    """Each check used to abandon one more task: a stuck probe leaked one per poll or request."""
+    monkeypatch.setattr(registry_module, "_CANCEL_GRACE_S", 0.01)
+    release = asyncio.Event()
+    running = []
+
+    class _Stubborn(BaseProbe):
+        name = "stubborn"
+        timeout = 0.01
+
+        async def check(self) -> ProbeResult:
+            running.append(1)
+            try:
+                while not release.is_set():
+                    try:
+                        await release.wait()
+                    except asyncio.CancelledError:
+                        pass  # ignores cancellation
+            finally:
+                running.pop()
+            return ProbeResult(name=self.name, status=ProbeStatus.HEALTHY)
+
+    registry = HealthRegistry(FastAPI(), circuit_breaker=False)
+    registry.add(_Stubborn())
+    with caplog.at_level("WARNING", logger="fastapi_watch"):
+        results = [(await registry.run_all())[0] for _ in range(5)]
+    stuck = len(running)
+    if stuck > 1:
+        release.set()  # let them all finish, or the event loop never closes
+    assert stuck == 1
+    assert results[0].error == "probe timed out after 0.01 s"
+    assert {r.error for r in results[1:]} == {"previous check ignored cancellation and is still running"}
+    assert {r.status for r in results} == {ProbeStatus.UNHEALTHY}
+    assert caplog.text.count("did not stop within") == 1
+    release.set()
+    for _ in range(100):
+        if not registry._abandoned_checks:
+            break
+        await asyncio.sleep(0.01)
+    assert registry._abandoned_checks == {}
+    [result] = await registry.run_all()  # checked again once it has stopped
+    assert result.status == ProbeStatus.HEALTHY
