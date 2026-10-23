@@ -368,10 +368,11 @@ def _validate_auth(auth) -> None:
         if not value.strip():
             raise ValueError(f"auth {field!r} must not be empty or whitespace")
     # A blank header name refused every request (403) and a non-string one
-    # failed every request (500), both only once traffic arrived.
+    # failed every request (500), both only once traffic arrived; a name that
+    # is not an HTTP token (" X-API-Key", "X-API-Key:") can never match one.
     if auth["type"] == "apikey":
         header = auth.get("header", "X-API-Key")
-        if not isinstance(header, str) or not header.strip():
+        if not isinstance(header, str) or not re.fullmatch(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+", header):
             raise ValueError(f"auth 'header' must be a non-empty header name, got {header!r}")
 
 
@@ -1601,20 +1602,38 @@ class HealthRegistry:
         hung check would otherwise hang every one of them.
         """
         timeout = probe.timeout if probe.timeout is not None else self._probe_timeout
-        loop = asyncio.get_running_loop()
-        started = loop.time()
+        deadline_expired = False
         try:
             coro = probe.check()
-            result = await asyncio.wait_for(coro, timeout) if timeout is not None else await coro
+            if timeout is None:
+                result = await coro
+            else:
+                task = asyncio.ensure_future(coro)
+                try:
+                    done, _ = await asyncio.wait({task}, timeout=timeout)
+                except asyncio.CancelledError:
+                    task.cancel()
+                    raise
+                if not done:
+                    # As wait_for does: cancel the check and let it finish
+                    # unwinding, so two runs of one probe never overlap.
+                    deadline_expired = True
+                    task.cancel()
+                    await asyncio.wait({task})
+                    if not task.cancelled():
+                        task.exception()  # retrieved: it is reported as the timeout
+                    raise asyncio.TimeoutError
+                result = task.result()
             if not isinstance(result, ProbeResult):
                 # Left unchecked, one buggy custom probe turned every endpoint into a 500.
                 raise TypeError(f"check() returned {type(result).__name__}, not ProbeResult")
         except asyncio.TimeoutError as exc:
             # Since Python 3.11 asyncio.TimeoutError is the builtin TimeoutError,
             # which a probe raises itself on a connect or read timeout.  Only the
-            # deadline expiring is reported as one: formatting a None timeout
-            # turned every health endpoint into a 500.
-            if timeout is None or loop.time() - started < timeout:
+            # registry's own deadline is reported as one (decided by whether it
+            # fired, not by elapsed time, which a coarse clock gets wrong):
+            # formatting a None timeout turned every health endpoint into a 500.
+            if not deadline_expired:
                 if self._logger:
                     self._logger.exception("Probe %r raised an unhandled %s", probe.name, type(exc).__name__)
                 return ProbeResult(
@@ -1983,13 +2002,15 @@ class HealthRegistry:
         self._cancel_poll_task()
 
     async def _shutdown(self) -> None:
-        """Signal SSE streams to stop and cancel the poll task.
+        """Stop streams and polling, then finish the work still pending.
 
-        Called from the lifespan teardown as a safety net.  On uvicorn the signal
-        handler installed by _install_early_shutdown_hook fires first (before
-        connection draining), so this is usually a no-op by the time it runs.
-        It also handles non-signal shutdowns (e.g. programmatic server stop).
-        Runs once: both the lifespan wrapper and ``on_shutdown`` may call it.
+        Called when the app's lifespan ends.  On uvicorn the signal handler
+        installed by _install_early_shutdown_hook has already ended the SSE
+        streams and the poll loop (before connection draining); this also
+        covers non-signal shutdowns (e.g. a programmatic server stop).  It
+        then sends queued alerts, lets pending storage writes land and closes
+        the probes, each bounded in time.  Runs once: both the lifespan
+        wrapper and ``on_shutdown`` may call it.
         """
         if self._shut_down:
             return

@@ -567,6 +567,10 @@ async def test_rabbitmq_management_api_sends_basic_auth_header_without_deprecate
     {"type": "apikey", "key": "k", "header": ""},
     {"type": "apikey", "key": "k", "header": "  "},
     {"type": "apikey", "key": "k", "header": None},
+    # Not an HTTP token: such a header can never arrive, so every request was refused.
+    {"type": "apikey", "key": "k", "header": " X-API-Key"},
+    {"type": "apikey", "key": "k", "header": "X-API-Key:"},
+    {"type": "apikey", "key": "k", "header": "X API Key"},
 ])
 @pytest.mark.parametrize("serve_routes", [True, False])
 def test_blank_credentials_raise_at_init(auth, serve_routes):
@@ -584,3 +588,8 @@ def test_empty_api_key_no_longer_admits_headerless_requests():
     """Previously key="" matched the empty string an absent header reads as."""
     with pytest.raises(ValueError):
         HealthRegistry(FastAPI(), auth={"type": "apikey", "key": ""})
+
+
+@pytest.mark.parametrize("header", ["X-API-Key", "x-api-key", "Authorization", "X_Token"])
+def test_ordinary_apikey_header_names_accepted(header):
+    HealthRegistry(FastAPI(), auth={"type": "apikey", "key": "k", "header": header})

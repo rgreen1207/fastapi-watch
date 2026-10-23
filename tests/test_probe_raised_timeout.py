@@ -61,3 +61,52 @@ async def test_startup_probe_raising_timeout_answers_503():
     registry.set_started()
     response = TestClient(app, raise_server_exceptions=False).get("/health/startup")
     assert response.status_code == 503
+
+
+async def test_own_timeout_after_the_deadline_would_have_passed_is_not_the_deadline(monkeypatch):
+    """Classified by whether the deadline fired, not by elapsed time.
+
+    On a coarse clock (Windows: ~15.6 ms) elapsed time can disagree with the
+    timer; here the loop clock jumps past the deadline before the probe
+    raises its own TimeoutError, which must still be reported as its own.
+    """
+    class _SlowThenRaises(BaseProbe):
+        name = "slow_then_raises"
+        timeout = 5.0
+
+        async def check(self) -> ProbeResult:
+            loop = asyncio.get_running_loop()
+            real_time = loop.time
+            # The clock jumps past the deadline and stays there while the
+            # registry classifies the error (restored at teardown).
+            monkeypatch.setattr(loop, "time", lambda: real_time() + 10)
+            raise TimeoutError("read timed out")
+
+    registry = HealthRegistry(FastAPI())
+    registry.add(_SlowThenRaises())
+    [result] = await registry.run_all()
+    assert result.error == "probe check failed: TimeoutError"
+
+
+async def test_cancelling_the_caller_cancels_the_check():
+    started, cancelled = asyncio.Event(), asyncio.Event()
+
+    class _Waits(BaseProbe):
+        name = "waits"
+        timeout = 30.0
+
+        async def check(self) -> ProbeResult:
+            started.set()
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+    registry = HealthRegistry(FastAPI())
+    task = asyncio.ensure_future(registry._guarded_check(_Waits(), True))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cancelled.is_set()
