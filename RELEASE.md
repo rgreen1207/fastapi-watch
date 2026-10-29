@@ -1,5 +1,60 @@
 # Release Notes
 
+## v1.8.1
+
+**Route monitoring fixes for FastAPI 0.137+ included routers.** Most important: `watch_router()` monitored nothing for a router whose routes come from its own `include_router()`.
+
+### Bug Fixes
+
+#### `watch_router()` silently monitored nothing for routers built from nested `include_router()` calls
+
+On FastAPI 0.137 and later, a router that pulls its routes in with `router.include_router(child)` holds an `_IncludedRouter` wrapper instead of copies of the child's routes. `watch_router()` read only the router's direct `routes`, found no handlers, and registered no probes without any error or warning. A common package layout triggers it:
+
+```python
+# app/api/imports/__init__.py
+router = APIRouter()
+router.include_router(import_router)   # the routes live on import_router
+
+registry.watch_router(router)          # 1.7.1–1.8.0: no probes on FastAPI 0.137+
+```
+
+This affected 1.7.1 and 1.8.0. On FastAPI before 0.137 the routes are copied into the outer router, so it worked there.
+
+**Fix:** `watch_router()` now walks the router's routes recursively, as `discover_routes()` already walked the app's. Probes get the full path a client requests (`GET /api/import/db`) and record traffic, including when the app has already served requests before `watch_router()` runs. A router that was never added to the app is monitored under the prefixes of the includes inside it.
+
+**Workaround on 1.8.0:** pass the router that declares the routes (`import_router` above) to `watch_router()`.
+
+#### `include_router(tags=...)` missing from route probe tags (FastAPI 0.137+)
+
+`discover_routes()` and `watch_router()` merge a route's FastAPI tags into its probe's tags. FastAPI 0.137+ keeps the tags passed to `include_router(..., tags=[...])` on the include instead of copying them onto each route, so probes got only the tags declared on the route or its `APIRouter(tags=...)`, and filtering by those tags (`?tag=`) skipped them. Include tags at every nesting level are now merged in, as on earlier FastAPI.
+
+#### A router included twice went unmonitored when one prefix was excluded (FastAPI 0.137+)
+
+With `app.include_router(router, prefix="/v1")` and `app.include_router(router, prefix="/v2")`, FastAPI 0.137+ serves both prefixes from the same route object. `discover_routes(exclude_paths=["/v1/*"])` skipped that route at `/v1` and then treated it as already handled at `/v2`, so neither prefix was monitored. It is now monitored as `GET /v2/...`. Both prefixes run the same handler, so on FastAPI 0.137+ that probe also counts requests to `/v1`.
+
+### Documentation
+
+Corrections where the docs disagreed with the code:
+
+- `RequestMetricsProbe` and `FastAPIRouteProbe` were said to report `healthy` before the first request. Since 1.8.0 they report `no_data`, which does not fail readiness or fire alerts. The same holds for `FastAPIWebSocketProbe` with `min_active_connections` set, and `ThresholdProbe` passes `no_data` through.
+- The `HealthRegistry` docstring example called `RedisProbe(url=...)`, which raises `TypeError`; it now uses `TCPProbe`.
+- The OpenAPI description of `/health/status` said `207` when any probe fails. It is `207` when a *critical* probe is degraded or unhealthy, and `200` while critical probes have no data yet.
+- `discover_routes()` excludes the registry's own routes, not every route under the health prefix: an app route such as `/healthcheck` is monitored.
+- Passive probes do accept `poll_interval_ms`.
+- `expose_error_messages=True` gives `"HTTPException: <detail>"`, not `"HTTPException: 503: <detail>"`.
+- The `ThresholdProbe` summary row named its first argument `probe`; it is `inner_probe`.
+- The `circuit_breaker` details dict appears only on probes the breaker applies to, which excludes passive probes by default.
+- Only passive and route probes take `tags=`; tag others through a `ProbeGroup` or `probe.tags`.
+- The `fastapi_watch.prometheus` docstring now lists `probe_no_data`, and says `probe_healthy`/`probe_degraded` are absent while a probe has no data.
+- `checked_at` is in the registry's `timezone`, not always UTC.
+- Smaller wording fixes: `window_size` on the passive probes, `watch_router()`'s reason to run after `include_router`, the readiness summary in the `HealthRegistry` docstring, the `InMemoryProbeStorage` TTL note, and the auto-tracked `cache_hits`/`cache_misses`.
+
+### Compatibility
+
+Tested and passing across FastAPI 0.116.1 – 0.158.1.
+
+---
+
 ## v1.8.0
 
 **Correctness, hardening and isolation release.** Three review rounds against two goals: monitoring must never slow or break the application it watches, and its storage must stay within the limits you set. Highlights: shutdown now runs for apps with `lifespan=` (queued alerts, pending writes, probe cleanup); storage can no longer grow from renamed results; a hung or misbehaving probe can no longer hang health endpoints; apps sharing a Redis prefix see only their own probes; a mistyped `?probe=`/`?tag=` gets `404` instead of passing readiness; probes with nothing to report yet show `no_data` instead of `healthy`; health routes leave the OpenAPI schema by default. Upgrading from 1.7.x: read the list below.
