@@ -2,7 +2,7 @@
 
 ## v1.8.1
 
-**Route monitoring fixes for FastAPI 0.137+ included routers.** Most important: `watch_router()` monitored nothing for a router whose routes come from its own `include_router()`.
+**Route monitoring fixes for included routers and mounted sub-applications.** Most important: `watch_router()` monitored nothing for a router whose routes come from its own `include_router()`.
 
 ### Bug Fixes
 
@@ -32,6 +32,10 @@ This affected 1.7.1 and 1.8.0. On FastAPI before 0.137 the routes are copied int
 
 With `app.include_router(router, prefix="/v1")` and `app.include_router(router, prefix="/v2")`, FastAPI 0.137+ serves both prefixes from the same route object. `discover_routes(exclude_paths=["/v1/*"])` skipped that route at `/v1` and then treated it as already handled at `/v2`, so neither prefix was monitored. It is now monitored as `GET /v2/...`. Both prefixes run the same handler, so on FastAPI 0.137+ that probe also counts requests to `/v1`.
 
+#### Routes of mounted sub-applications were never monitored
+
+`discover_routes()` and `watch_router()` did not look inside a `Mount`, so routes of a FastAPI sub-application attached with `app.mount("/v2", sub_app)` got no probes on any FastAPI version. They are now monitored under the full path (`GET /v2/items/{item_id}`), path filters match it, and the sub-application's route caches are refreshed so FastAPI 0.137+ serves the monitored handlers. A sub-application's own `HealthRegistry` routes stay excluded, and a `Mount` around a plain ASGI app (`StaticFiles`) has nothing to monitor.
+
 ### Documentation
 
 Corrections where the docs disagreed with the code:
@@ -47,6 +51,9 @@ Corrections where the docs disagreed with the code:
 - Only passive and route probes take `tags=`; tag others through a `ProbeGroup` or `probe.tags`.
 - The `fastapi_watch.prometheus` docstring now lists `probe_no_data`, and says `probe_healthy`/`probe_degraded` are absent while a probe has no data.
 - `checked_at` is in the registry's `timezone`, not always UTC.
+- `ProbeResult.has_data` is now listed with the other `ProbeResult` properties.
+- The README's maintenance endpoint rows list the `401`/`403`/`413`/`415` responses, which `DELETE` returns as well as `POST`.
+- The 1.8.0 notes said `RequestMetricsMiddleware` and `RequestMetricsProbe` reject an out-of-range `max_error_rate`. The middleware does not take one and the probe does not check it; the notes now list what each class actually validates.
 - Smaller wording fixes: `window_size` on the passive probes, `watch_router()`'s reason to run after `include_router`, the readiness summary in the `HealthRegistry` docstring, the `InMemoryProbeStorage` TTL note, and the auto-tracked `cache_hits`/`cache_misses`.
 
 ### Compatibility
@@ -70,7 +77,7 @@ Most fixes need no action. These change what you see or what is accepted:
 - **`POST`/`DELETE /health/maintenance` refuse cross-site browser requests (`403`) and non-JSON bodies (`415`).** curl and other non-browser clients are unaffected.
 - **Retention arguments reach custom backends.** `history_size`, `result_ttl_seconds`, `alert_ttl_seconds`, and `max_alerts` passed together with `storage=` are applied through the backend's `configure()`; a backend without one logs a warning naming the ignored arguments.
 - **Request metrics no longer count fastapi-watch's own routes**, and streaming responses are timed until their last chunk, so their RTT rises.
-- **Invalid probe and middleware settings raise `ValueError`** (`window_size <= 0`, `cache_window_size <= 0`, `ema_alpha` outside (0, 1], `max_error_rate` outside [0, 1], `max_routes < 1`) instead of silently recording nothing.
+- **Invalid probe and middleware settings raise `ValueError`** instead of silently recording nothing: on passive, route and WebSocket probes `window_size <= 0`, `ema_alpha` outside (0, 1] and `max_error_rate` outside [0, 1] (and `cache_window_size <= 0` on passive and route probes); on `RequestMetricsMiddleware` `window_size <= 0`, `ema_alpha` outside (0, 1] and `max_routes < 1`. `RequestMetricsProbe` does not check its `max_error_rate`.
 - **Dashboard stream tokens** are signed with a new key, so tokens minted before the upgrade stop validating (they lasted at most 5 minutes). When a page's token expires it fetches a fresh one from the new `GET /health/dashboard/stream-url` and reconnects without reloading.
 - **`/health/history` and `/health/alerts` return `503 {"error": "storage unavailable"}`** when the storage backend fails, instead of `500`.
 - **Results are listed in registration order**, not storage insertion order.
@@ -343,7 +350,7 @@ While a probe's circuit was open the registry served its cached result stamped w
 
 #### Invalid probe settings fail at startup
 
-`window_size=0` or `cache_window_size=0` made every recording raise `IndexError`, which was swallowed, so the probe silently recorded nothing forever. Passive, route, and WebSocket probes and `RequestMetricsMiddleware` now raise `ValueError` for out-of-range `window_size`, `cache_window_size`, `ema_alpha`, `max_error_rate`, and `max_routes`. `PassiveProbe.check()` also reads its state under its lock, which is safe on free-threaded Python.
+`window_size=0` or `cache_window_size=0` made every recording raise `IndexError`, which was swallowed, so the probe silently recorded nothing forever. Passive, route, and WebSocket probes now raise `ValueError` for out-of-range `window_size`, `ema_alpha` and `max_error_rate` (and passive and route probes for `cache_window_size`); `RequestMetricsMiddleware` does for `window_size`, `ema_alpha` and `max_routes`. `PassiveProbe.check()` also reads its state under its lock, which is safe on free-threaded Python.
 
 #### `EventLoopProbe` stops its sampler at shutdown
 

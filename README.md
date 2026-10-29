@@ -91,8 +91,8 @@ Every route is now monitored with real-traffic data. Health endpoints are live a
 | `GET /health/ready/stream` | SSE stream of readiness | stream / `404` as above |
 | `GET /health/status/stream` | SSE stream of full probe detail (`?view=dashboard` trims per-route data to what the dashboard charts) | stream / `404` as above |
 | `GET /health/maintenance` | Maintenance mode status | `200` |
-| `POST /health/maintenance` | Enable maintenance mode — mounted only when `auth=` is set | `200` / `413` / `415` / `422` |
-| `DELETE /health/maintenance` | Disable maintenance mode — mounted only when `auth=` is set | `200` |
+| `POST /health/maintenance` | Enable maintenance mode — mounted only when `auth=` is set | `200` / `401` / `403` / `413` / `415` / `422` |
+| `DELETE /health/maintenance` | Disable maintenance mode — mounted only when `auth=` is set | `200` / `401` / `403` / `413` / `415` |
 | `GET /health/probes` | Registered probe config (no probe runs) | `200` |
 
 The prefix defaults to `/health` and is configurable: `HealthRegistry(app, prefix="/ops/health")`.
@@ -105,7 +105,7 @@ The fastest way to monitor your API is auto-discovery. fastapi-watch monitors re
 
 ### `discover_routes` — monitor everything at once
 
-One call after all routers are included. Every route gets a passive probe with no decorators required.
+One call after all routers are included. Every route gets a passive probe with no decorators required, including routes of FastAPI sub-applications attached with `app.mount()`.
 
 ```python
 @asynccontextmanager

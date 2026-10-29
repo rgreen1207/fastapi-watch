@@ -229,6 +229,7 @@ return ProbeResult(
 | `is_healthy` | `status == "healthy"` |
 | `is_degraded` | `status == "degraded"` |
 | `is_passing` | `status != "unhealthy"` |
+| `has_data` | `status != "no_data"` |
 
 DEGRADED counts as passing for the circuit breaker — a probe oscillating between healthy and degraded never trips its circuit.
 
@@ -935,7 +936,7 @@ registry.watch_router(internal_router, tags=["internal"], critical=False)
 
 ### `discover_routes` — lowest priority
 
-Scans all registered routes and monitors any that haven't already been covered. Call it from a lifespan startup handler so all `include_router` calls have already run. Routes mounted by any `HealthRegistry` are always excluded; your own routes under the same prefix (`/healthcheck`, say) are monitored.
+Scans all registered routes, including those of FastAPI sub-applications attached with `app.mount()`, and monitors any that haven't already been covered. Call it from a lifespan startup handler so all `include_router` calls have already run. Routes mounted by any `HealthRegistry` are always excluded; your own routes under the same prefix (`/healthcheck`, say) are monitored.
 
 ```python
 @asynccontextmanager
@@ -959,7 +960,7 @@ async def lifespan(app):
 | `name_fn` | `None` | Callable `(route) -> str` for custom probe names; defaults to the handler function name |
 | `**probe_kwargs` | — | Forwarded to each `FastAPIRouteProbe` (e.g. `max_error_rate=0.05`) |
 
-**Probe naming:** each probe is named after the handler function (`route.name`), which FastAPI sets from the function name by default — so probes have readable names like `list_users` and `create_order` without any configuration. When two routes share a handler name (common across routers), the later one is qualified with its methods and path — e.g. `list_items` and `list_items:GET_orders` — so each keeps its own result. `exclude_paths` / `include_paths` match the full path a client requests, including any `include_router` prefix.
+**Probe naming:** each probe is named after the handler function (`route.name`), which FastAPI sets from the function name by default — so probes have readable names like `list_users` and `create_order` without any configuration. When two routes share a handler name (common across routers), the later one is qualified with its methods and path — e.g. `list_items` and `list_items:GET_orders` — so each keeps its own result. `exclude_paths` / `include_paths` match the full path a client requests, including any `include_router` prefix and `Mount` path (`/t/{tenant}/items` for a sub-app mounted at `/t/{tenant}`).
 
 **Probe description:** each probe's description is automatically set to the HTTP method and path (e.g. `GET /users/{user_id}` or `WS /ws/chat`), which appears as a subtitle under the probe name on the dashboard.
 
@@ -1793,6 +1794,7 @@ The endpoint is subject to the same `auth` as all other health endpoints.
 | `is_healthy` | `bool` | `status == "healthy"` |
 | `is_degraded` | `bool` | `status == "degraded"` |
 | `is_passing` | `bool` | `status != "unhealthy"` |
+| `has_data` | `bool` | `status != "no_data"` (`False` while the probe has nothing to report yet) |
 
 ---
 
