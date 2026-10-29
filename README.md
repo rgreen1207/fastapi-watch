@@ -175,7 +175,7 @@ When all three approaches are used together, each route is monitored exactly onc
 
 ## Tag-based filtering
 
-Passive and route probes accept `tags=[...]`; tag any other probe through a `ProbeGroup(tags=[...])` or by setting `probe.tags`. FastAPI route tags (`@app.get("/items", tags=["store"])`) are automatically merged in. Filter any endpoint by tag:
+Passive, route and WebSocket probes accept `tags=[...]`; tag any other probe through a `ProbeGroup(tags=[...])` or by setting `probe.tags`. FastAPI route tags (`@app.get("/items", tags=["store"])`) are automatically merged in. Filter any endpoint by tag:
 
 ```bash
 GET /health/ready?tag=payments         # only payment probes

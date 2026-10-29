@@ -2,7 +2,14 @@
 
 ## v1.8.1
 
-**Route monitoring fixes for included routers and mounted sub-applications.** Most important: `watch_router()` monitored nothing for a router whose routes come from its own `include_router()`.
+**Route monitoring fixes for included routers and mounted sub-applications, and documentation corrections.** Most important: `watch_router()` monitored nothing for a router whose routes come from its own `include_router()`, so those routes had no probes at all. Routes inside mounted sub-applications were never monitored either.
+
+### Upgrading: what you may see change
+
+No API changes. Routes that went unmonitored now get probes, so after upgrading:
+
+- **New probes appear** for routes reached through a nested `include_router()` (with `watch_router()`) and for routes of sub-applications attached with `app.mount()` (with `discover_routes()` and `watch_router()`). Like every route probe they are critical unless you pass `critical=False`, so a failing route among them can now fail `/health/ready`. They report `no_data` until their first request, which does not fail readiness. To keep a mounted sub-application out, pass `exclude_paths=["/mount-path/*"]`.
+- **Route probes on FastAPI 0.137+ gain the tags given to `include_router(..., tags=[...])`**, so `?tag=` filters and the dashboard's tag filter can match more probes. WebSocket route probes get these tags too, which they never did on FastAPI before 0.137.
 
 ### Bug Fixes
 
@@ -26,7 +33,7 @@ This affected 1.7.1 and 1.8.0. On FastAPI before 0.137 the routes are copied int
 
 #### `include_router(tags=...)` missing from route probe tags (FastAPI 0.137+)
 
-`discover_routes()` and `watch_router()` merge a route's FastAPI tags into its probe's tags. FastAPI 0.137+ keeps the tags passed to `include_router(..., tags=[...])` on the include instead of copying them onto each route, so probes got only the tags declared on the route or its `APIRouter(tags=...)`, and filtering by those tags (`?tag=`) skipped them. Include tags at every nesting level are now merged in, as on earlier FastAPI.
+`discover_routes()` and `watch_router()` merge a route's FastAPI tags into its probe's tags. FastAPI 0.137+ keeps the tags passed to `include_router(..., tags=[...])` on the include instead of copying them onto each route, so probes got only the tags declared on the route or its `APIRouter(tags=...)`, and filtering by those tags (`?tag=`) skipped them. Include tags at every nesting level are now merged in (outermost first), as earlier FastAPI copied them onto HTTP routes. WebSocket routes get them as well.
 
 #### A router included twice went unmonitored when one prefix was excluded (FastAPI 0.137+)
 
@@ -34,7 +41,7 @@ With `app.include_router(router, prefix="/v1")` and `app.include_router(router, 
 
 #### Routes of mounted sub-applications were never monitored
 
-`discover_routes()` and `watch_router()` did not look inside a `Mount`, so routes of a FastAPI sub-application attached with `app.mount("/v2", sub_app)` got no probes on any FastAPI version. They are now monitored under the full path (`GET /v2/items/{item_id}`), path filters match it, and the sub-application's route caches are refreshed so FastAPI 0.137+ serves the monitored handlers. A sub-application's own `HealthRegistry` routes stay excluded, and a `Mount` around a plain ASGI app (`StaticFiles`) has nothing to monitor.
+`discover_routes()` and `watch_router()` did not look inside a `Mount`, so routes of a FastAPI sub-application attached with `app.mount("/v2", sub_app)` got no probes on any FastAPI version. They are now monitored under the full path (`GET /v2/items/{item_id}`), path filters match it, and the sub-application's route caches are refreshed so FastAPI 0.137+ serves the monitored handlers. A sub-application's own `HealthRegistry` routes stay excluded, and a `Mount` around a plain ASGI app (`StaticFiles`) has nothing to monitor. A Mount's path parameters stay in template form (`/t/{tenant}/items`), as in per-route request metrics. After patching, the caches of nested included routers are refreshed as well as top-level ones.
 
 ### Documentation
 
@@ -48,7 +55,7 @@ Corrections where the docs disagreed with the code:
 - `expose_error_messages=True` gives `"HTTPException: <detail>"`, not `"HTTPException: 503: <detail>"`.
 - The `ThresholdProbe` summary row named its first argument `probe`; it is `inner_probe`.
 - The `circuit_breaker` details dict appears only on probes the breaker applies to, which excludes passive probes by default.
-- Only passive and route probes take `tags=`; tag others through a `ProbeGroup` or `probe.tags`.
+- The README said all probes accept `tags=`. Only passive, route and WebSocket probes do (`TCPProbe(tags=...)` raises `TypeError`); tag others through a `ProbeGroup` or `probe.tags`.
 - The `fastapi_watch.prometheus` docstring now lists `probe_no_data`, and says `probe_healthy`/`probe_degraded` are absent while a probe has no data.
 - `checked_at` is in the registry's `timezone`, not always UTC.
 - `ProbeResult.has_data` is now listed with the other `ProbeResult` properties.
