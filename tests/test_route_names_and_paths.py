@@ -258,3 +258,56 @@ def test_registry_routes_are_never_monitored(prefix):
     registry = HealthRegistry(app, prefix=prefix)
     registry.discover_routes()
     assert [p.name for p, _ in registry._probes] == ["work"]
+
+
+# ---------------------------------------------------------------------------
+# Mounted sub-applications
+# ---------------------------------------------------------------------------
+
+def _app_with_mounted_sub_app(tmp_path):
+    from fastapi.staticfiles import StaticFiles
+
+    sub = FastAPI()
+    items = APIRouter(prefix="/items")
+
+    @items.get("/{item_id}")
+    async def get_item(item_id: int):
+        return item_id
+
+    sub.include_router(items, prefix="/api", tags=["sub"])
+    HealthRegistry(sub)  # the sub-app's own health routes are never monitored
+
+    app = FastAPI()
+    app.mount("/t/{tenant}", sub)
+    app.mount("/static", StaticFiles(directory=tmp_path))
+    return app, items
+
+
+@pytest.mark.parametrize("warm", [False, True])
+def test_discover_routes_monitors_a_mounted_sub_app(tmp_path, warm):
+    app, _ = _app_with_mounted_sub_app(tmp_path)
+    client = TestClient(app)
+    if warm:  # FastAPI 0.137+ builds the sub-app's route cache on the first request
+        client.get("/t/acme/api/items/1")
+    registry = HealthRegistry(app)
+    registry.discover_routes()
+    client.get("/t/acme/api/items/1")
+
+    [(probe, _)] = registry._probes
+    assert (probe.name, probe.description, probe.tags) == ("get_item", "GET /t/{tenant}/api/items/{item_id}", ["sub"])
+    report = client.get("/health/status").json()
+    assert {p["name"]: p["details"]["request_count"] for p in report["probes"]} == {"get_item": 1}
+
+
+def test_path_filters_match_the_mount_path(tmp_path):
+    app, _ = _app_with_mounted_sub_app(tmp_path)
+    registry = HealthRegistry(app)
+    registry.discover_routes(exclude_paths=["/t/*"])
+    assert registry._probes == []
+
+
+def test_watch_router_finds_a_router_inside_a_mounted_sub_app(tmp_path):
+    app, items = _app_with_mounted_sub_app(tmp_path)
+    registry = HealthRegistry(app)
+    registry.watch_router(items)
+    assert [(p.name, p.description) for p, _ in registry._probes] == [("get_item", "GET /t/{tenant}/api/items/{item_id}")]

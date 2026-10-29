@@ -24,6 +24,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
 from pydantic_core import to_json
+from starlette.routing import Mount
 
 from ._executor import run_render
 from .alerts import BaseAlerter, WebhookAlerter
@@ -127,8 +128,13 @@ def _iter_app_routes(
     include prefix; ``_effective_path(route, prefix)`` gives the path a client requests.
     Likewise *tags* are the accumulated ``include_router(tags=...)``, outermost
     first, which the nested layout keeps on the include instead of the route.
+    A ``Mount`` adds its path to *prefix*; one around a plain ASGI app
+    (``StaticFiles``, say) has no routes to yield.
     """
     for item in routes:
+        if isinstance(item, Mount):
+            yield from _iter_app_routes(item.routes, prefix + item.path, tags)
+            continue
         if hasattr(item, "path"):
             yield item, prefix, tags
             continue
@@ -174,10 +180,14 @@ def _invalidate_included_router_caches(routes) -> None:
 
     After patching route.endpoint for monitoring, this forces the _IncludedRouter to
     rebuild its _EffectiveRouteContext list on the next request so it picks up the
-    wrapped endpoint.  Safe to call on older FastAPI where these attributes do not
-    exist (the hasattr guards make it a no-op).
+    wrapped endpoint.  Recurses into nested includes and mounted sub-applications,
+    which keep caches of their own.  Safe to call on older FastAPI where these
+    attributes do not exist (the hasattr guards make it a no-op).
     """
     for item in routes:
+        if isinstance(item, Mount):
+            _invalidate_included_router_caches(item.routes)
+            continue
         orig = getattr(item, "original_router", None)
         if orig is None:
             continue
@@ -187,6 +197,7 @@ def _invalidate_included_router_caches(routes) -> None:
             mark_changed()
         elif hasattr(item, "_effective_candidates_version"):
             item._effective_candidates_version = None
+        _invalidate_included_router_caches(getattr(orig, "routes", None) or [])
 
 
 def _route_description(route, path: str, is_websocket: bool) -> str:
@@ -1022,8 +1033,10 @@ class HealthRegistry:
         Call this after all routes are registered (e.g. at the end of your app
         module or inside a lifespan startup hook).
 
-        Routes mounted by any HealthRegistry are always excluded.  Path patterns
-        match the full path a client requests, including ``include_router`` prefixes.
+        Routes of FastAPI sub-applications and routers attached with
+        ``app.mount()`` are monitored too.  Routes mounted by any HealthRegistry
+        are always excluded.  Path patterns match the full path a client
+        requests, including ``include_router`` prefixes and ``Mount`` paths.
         FastAPI route tags (used for OpenAPI docs) are automatically merged into
         probe tags; *tags* adds extra labels on top of those.
 
