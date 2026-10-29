@@ -172,7 +172,7 @@ On shutdown the registry awaits `aclose()` on every registered and startup probe
 
 ## Per-probe poll frequency
 
-Each active probe can override the registry's `poll_interval_ms`. Passive probes don't accept this parameter — their `check()` only reads in-memory stats.
+Each active probe can override the registry's `poll_interval_ms`. Passive probes accept it too but rarely need it: their `check()` only reads in-memory stats.
 
 ```python
 registry = HealthRegistry(app, poll_interval_ms=60_000)
@@ -268,7 +268,7 @@ registry.add(probe)
 
 ## Circuit breaker metrics
 
-When enabled (default), a `circuit_breaker` dict is injected into every probe result's `details`:
+When enabled (default), a `circuit_breaker` dict is injected into the `details` of every probe the breaker applies to (active probes by default; passive probes only with `circuit_breaker_enabled=True`):
 
 ```json
 {
@@ -651,7 +651,7 @@ Every response from `/health/ready`, `/health/status`, and the SSE streams share
 | Field | Type | Description |
 |-------|------|-------------|
 | `status` | `"healthy"` \| `"degraded"` \| `"unhealthy"` \| `"no_data"` | Overall result — critical probes only; `"no_data"` while none of them has reported |
-| `checked_at` | `string \| null` | UTC ISO 8601 timestamp of the last probe run |
+| `checked_at` | `string \| null` | ISO 8601 timestamp of the last probe run, in the registry's `timezone` |
 | `timezone` | `string \| null` | IANA timezone name |
 | `probes` | `array` | Individual probe results |
 | `failing` | `string[]` | Names of critical probes whose status is `"unhealthy"`. Empty array when nothing is failing. Not affected by DEGRADED — only UNHEALTHY probes appear here. |
@@ -904,7 +904,7 @@ registry.add(checkout_probe)
 
 ### `watch_router` — mid priority
 
-Monitors every route on a specific `APIRouter` with shared settings. Call it after `app.include_router` — FastAPI must have already baked the routes into `app.routes` before `watch_router` can find them. Skips routes already decorated with `@probe.watch`. Overrides any `discover_routes` monitoring on the same routes.
+Monitors every route on a specific `APIRouter` with shared settings. Call it after `app.include_router` so the include prefix is known: path filters and probe descriptions use the full path. Skips routes already decorated with `@probe.watch`. Overrides any `discover_routes` monitoring on the same routes.
 
 ```python
 app.include_router(users_router, prefix="/users")
@@ -935,7 +935,7 @@ registry.watch_router(internal_router, tags=["internal"], critical=False)
 
 ### `discover_routes` — lowest priority
 
-Scans all registered routes and monitors any that haven't already been covered. Call it from a lifespan startup handler so all `include_router` calls have already run. Routes under the health prefix are always excluded automatically.
+Scans all registered routes and monitors any that haven't already been covered. Call it from a lifespan startup handler so all `include_router` calls have already run. Routes mounted by any `HealthRegistry` are always excluded; your own routes under the same prefix (`/healthcheck`, say) are monitored.
 
 ```python
 @asynccontextmanager
@@ -1064,7 +1064,7 @@ registry = HealthRegistry(app)
 registry.add(RequestMetricsProbe(app, max_error_rate=0.05, max_avg_rtt_ms=500))
 ```
 
-Pass the **app** to `RequestMetricsProbe`. Starlette builds middleware instances lazily (on the first request or lifespan event), so the probe looks up the live `RequestMetricsMiddleware` in `app.middleware_stack` on its first check. Until then it reports `"no requests observed yet"`; if the stack is built without the middleware it reports UNHEALTHY with a configuration error. Passing a `RequestMetricsMiddleware` instance you serve yourself still works.
+Pass the **app** to `RequestMetricsProbe`. Starlette builds middleware instances lazily (on the first request or lifespan event), so the probe looks up the live `RequestMetricsMiddleware` in `app.middleware_stack` on its first check. Until it has seen a request it reports `no_data` with `"no requests observed yet"` (see [Three-state health](#three-state-health-degraded)); if the stack is built without the middleware it reports UNHEALTHY with a configuration error. Passing a `RequestMetricsMiddleware` instance you serve yourself still works.
 
 `per_route=True` breaks stats down by route template (e.g. `/users/{user_id}`, including any `include_router` or `Mount` prefix). Requests that match no route share one `"<unmatched>"` entry and a `Mount` without inner routes (static files, raw ASGI apps) shares one `"/static/{path:path}"`-style entry, so the table stays bounded however many distinct URLs arrive. A `Mount`'s path parameters are keyed by name as well (`app.mount("/t/{tenant}", sub)` gives `/t/{tenant}/items`, not one key per tenant), so tenant IDs never appear in the metrics. As a backstop the table holds at most `max_routes` entries; requests for further routes share one `"<other>"` entry. `per_route=False` collects aggregates only.
 
@@ -1149,7 +1149,7 @@ Timestamps (`last_error_at`, `last_success_at`) are rendered in the dashboard as
 - `max_avg_rtt_ms` (default `None`) — UNHEALTHY if exceeded.
 - `min_error_status` (default `500`) — only 5xx count as errors by default. Set to `400` to include 4xx.
 
-Before the first request, `check()` returns `HEALTHY` with `"no requests observed yet"` — a fresh deployment never starts out unhealthy.
+Before the first request, `check()` returns `NO_DATA` with `"no requests observed yet"`. That is not a failure: it does not fail readiness or fire alerts, so a fresh deployment never starts out unhealthy (see [Three-state health](#three-state-health-degraded)).
 
 **Constructor args:**
 
@@ -1169,7 +1169,7 @@ Before the first request, `check()` returns `HEALTHY` with `"no requests observe
 | `cache_time_window_s` | `120.0` | When `cache_window_size` is not set, count hits/misses over the last T seconds (default 120 s) |
 | `cache_reporting` | `True` | Set to `False` to disable automatic cache tracking even when wrapping `@lru_cache` / `@alru_cache` functions |
 | `circuit_breaker_enabled` | `False` | Passive probes only read in-memory stats, so the circuit breaker is off by default; set `True` to opt in |
-| `expose_error_messages` | `False` | Include the exception message in `last_error` (`"HTTPException: 503: <detail>"`). Messages can carry credentials, connection strings, or the bound parameters of a failed query, so leave this off unless the health endpoints require `auth` |
+| `expose_error_messages` | `False` | Include the exception message in `last_error` (`"HTTPException: <detail>"`). Messages can carry credentials, connection strings, or the bound parameters of a failed query, so leave this off unless the health endpoints require `auth` |
 
 Out-of-range settings raise `ValueError` when the probe is created: `window_size` and `cache_window_size` must be positive, `ema_alpha` must be in (0, 1], and `max_error_rate` in [0, 1]. The same rules apply to every passive probe and to `FastAPIWebSocketProbe`.
 
@@ -1226,7 +1226,7 @@ registry.add(chat_probe)
 
 **Health thresholds:**
 - `max_error_rate` (default `0.1`)
-- `min_active_connections` (default `0`, disabled) — UNHEALTHY if fewer than N sockets are open.
+- `min_active_connections` (default `0`, disabled) — UNHEALTHY if fewer than N sockets are open. Before the first connection the probe reports `no_data` instead, so a fresh pod still becomes ready.
 
 ---
 
@@ -1304,7 +1304,7 @@ registry.add(ThresholdProbe(
 ))
 ```
 
-If the inner probe returns UNHEALTHY, it passes through unchanged. `fail_if` takes precedence over `warn_if`.
+If the inner probe returns UNHEALTHY or `no_data`, it passes through unchanged. `fail_if` takes precedence over `warn_if`.
 
 ---
 
@@ -1531,7 +1531,7 @@ registry.add(db_probe)
 | `EventLoopProbe` | built-in | `warn_ms`, `fail_ms`, `sample_interval_ms` | `lag_ms`, `current_lag_ms` |
 | `TCPProbe` | built-in | `host`, `port`, `timeout` | `host`, `port`, `resolved_ips`, `connect_ms` |
 | `SMTPProbe` | built-in | `name`, `max_error_rate`, `max_avg_rtt_ms`, `slow_call_threshold_ms`, `cache_window_size`, `expose_error_messages` | `call_count`, `error_count`, `error_rate`, `avg_rtt_ms`, `p50_rtt_ms`, `p95_rtt_ms`, `p99_rtt_ms`, `error_types`, `last_error_at`\* |
-| `ThresholdProbe` | built-in | `probe`, `warn_if`, `fail_if` | delegates to inner probe |
+| `ThresholdProbe` | built-in | `inner_probe`, `warn_if`, `fail_if`, `name` | delegates to inner probe |
 
 #### Databases
 
@@ -1563,7 +1563,7 @@ registry.add(db_probe)
 | `HttpProbe` | built-in | `call_count`, `error_count`, `error_rate`, `avg_rtt_ms`, `p50_rtt_ms`, `p95_rtt_ms`, `p99_rtt_ms`, `error_types`, `last_error_at`\* |
 | `MongoProbe` | `mongo` | same |
 
-\* Conditional: `last_error_at` appears once any error has occurred; `last_success_at` appears only when ≥99% of the outcome window are failures; `slow_calls` only when `slow_call_threshold_ms` is set; `cache_hits`/`cache_misses` only when `record_cache_hit()`/`record_cache_miss()` have been called.
+\* Conditional: `last_error_at` appears once any error has occurred; `last_success_at` appears only when ≥99% of the outcome window are failures; `slow_calls` only when `slow_call_threshold_ms` is set; `cache_hits`/`cache_misses` only when `record_cache_hit()`/`record_cache_miss()` have been called or `@probe.watch` wraps an `@lru_cache`/`@alru_cache` function.
 
 #### Testing / placeholder
 

@@ -24,8 +24,8 @@ def _safe_eval(fn: Callable[[dict], bool], details: dict) -> tuple[bool, str | N
 class ThresholdProbe(BaseProbe):
     """Wraps another probe and applies callable thresholds to its details.
 
-    The inner probe runs normally.  If the inner probe is already UNHEALTHY its
-    result is passed through unchanged.  Otherwise *fail_if* is evaluated first
+    The inner probe runs normally.  If the inner probe is UNHEALTHY or NO_DATA its
+    result is passed through, renamed to this probe's name.  Otherwise *fail_if* is evaluated first
     (→ UNHEALTHY), then *warn_if* (→ DEGRADED).  Neither threshold fires means
     the inner probe's original status is preserved.
 

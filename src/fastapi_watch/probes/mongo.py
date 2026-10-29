@@ -14,7 +14,7 @@ class MongoProbe(PassiveProbe):
         name: Probe name shown in health reports (default ``"mongodb"``).
         max_error_rate: Error-rate threshold above which the probe is UNHEALTHY (0–1).
         max_avg_rtt_ms: Average-RTT threshold in milliseconds. ``None`` disables it.
-        window_size: Number of recent calls used for percentile calculations.
+        window_size: Rolling window for the error rate, RTT percentiles, throughput, and slow-call counts.
         ema_alpha: Smoothing factor for the exponential moving average (0–1).
         poll_interval_ms: Per-probe poll interval override.
 

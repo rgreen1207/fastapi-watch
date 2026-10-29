@@ -167,8 +167,7 @@ class InMemoryProbeStorage:
     and deques — no external dependencies, no I/O.
 
     **Latest results** (one per probe): expire after *result_ttl_seconds*
-    (default 2 hours).  A stale latest result is dropped on the next read so
-    ``GET /health/status`` never returns data older than the TTL.
+    (default 2 hours).  A stale latest result is dropped on the next read.
 
     **History** (rolling window per probe): capped at *max_results* entries
     (default 120 per probe); oldest entries are evicted when the cap is

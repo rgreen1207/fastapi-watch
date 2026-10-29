@@ -129,7 +129,8 @@ class FastAPIWebSocketProbe(BaseProbe):
         name: Probe name shown in health reports.
         max_error_rate: Error-rate threshold above which the probe is UNHEALTHY (0–1).
         min_active_connections: Minimum number of open sockets required for the probe
-            to be HEALTHY.  ``0`` (default) disables this check.
+            to be HEALTHY.  ``0`` (default) disables this check.  Before the first
+            connection the probe reports NO_DATA whatever the minimum.
         window_size: Number of recently closed connections used for the error rate.
         ema_alpha: Smoothing factor for the exponential moving average (0–1).
             Higher values make ``avg_duration_ms`` react faster to changes.

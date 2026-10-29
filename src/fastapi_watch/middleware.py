@@ -386,8 +386,9 @@ class RequestMetricsProbe(BaseProbe):
     configured thresholds.  When ``per_route=True`` is set on the middleware,
     ``details["routes"]`` contains a per-path breakdown.
 
-    Before any requests arrive, the probe returns HEALTHY with
-    ``"no requests observed yet"`` in details.
+    Before any requests arrive, the probe returns NO_DATA with
+    ``"no requests observed yet"`` in details: neither healthy nor failing,
+    it does not fail readiness or fire alerts.
 
     Args:
         middleware: The app the middleware was added to (recommended), or a

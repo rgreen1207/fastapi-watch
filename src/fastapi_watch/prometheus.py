@@ -16,8 +16,9 @@ Prometheus scrape config at that URL::
 
 Exposed metrics (all carry ``name`` and ``critical`` labels):
 
-* ``probe_healthy`` — 1 if the probe is HEALTHY, 0 otherwise
-* ``probe_degraded`` — 1 if the probe is DEGRADED, 0 otherwise
+* ``probe_healthy`` — 1 if the probe is HEALTHY, 0 otherwise (absent while it has no data)
+* ``probe_degraded`` — 1 if the probe is DEGRADED, 0 otherwise (absent while it has no data)
+* ``probe_no_data`` — 1 while the probe has nothing to report yet, 0 otherwise
 * ``probe_latency_ms`` — last observed check latency in milliseconds
 * ``probe_circuit_open`` — 1 if the circuit breaker is currently open
 * ``probe_circuit_consecutive_failures`` — current consecutive failure count
