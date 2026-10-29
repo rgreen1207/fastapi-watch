@@ -165,6 +165,76 @@ def test_watch_router_matches_prefixed_paths():
     assert [(p.name, p.description) for p, _ in registry._probes] == [("open_route", "GET /internal/open")]
 
 
+def _app_with_nested_router():
+    """A router whose routes all arrive through its own include_router()."""
+    app = FastAPI()
+    inner = APIRouter(prefix="/import")
+
+    @inner.get("/db")
+    async def import_db():
+        return 1
+
+    outer, top = APIRouter(), APIRouter()
+    outer.include_router(inner)
+    top.include_router(outer)
+    app.include_router(top, prefix="/api")
+    return app, outer
+
+
+@pytest.mark.parametrize("warm", [False, True])
+def test_watch_router_monitors_routes_from_nested_includes(warm):
+    app, outer = _app_with_nested_router()
+    client = TestClient(app)
+    if warm:  # FastAPI 0.137+ builds its route cache on the first request
+        client.get("/api/import/db")
+    registry = HealthRegistry(app)
+    registry.watch_router(outer)
+    client.get("/api/import/db")
+
+    assert [(p.name, p.description) for p, _ in registry._probes] == [("import_db", "GET /api/import/db")]
+    report = client.get("/health/status").json()
+    assert {p["name"]: p["details"]["request_count"] for p in report["probes"]} == {"import_db": 1}
+
+
+def test_include_router_tags_reach_the_probe():
+    app = FastAPI()
+    inner = APIRouter(prefix="/i")
+
+    @inner.get("/x", tags=["route"])
+    async def x():
+        return 1
+
+    outer = APIRouter()
+    outer.include_router(inner, tags=["inner"])
+    app.include_router(outer, prefix="/api", tags=["outer"])
+    registry = HealthRegistry(app)
+    registry.discover_routes(tags=["extra"])
+    [(probe, _)] = registry._probes
+    assert sorted(probe.tags) == ["extra", "inner", "outer", "route"]
+
+
+def test_router_included_twice_is_monitored_under_the_prefix_not_excluded():
+    app = FastAPI()
+    router = APIRouter()
+
+    @router.get("/x")
+    async def x():
+        return 1
+
+    app.include_router(router, prefix="/v1")
+    app.include_router(router, prefix="/v2")
+    registry = HealthRegistry(app)
+    registry.discover_routes(exclude_paths=["/v1/*"])
+    assert [(p.name, p.description) for p, _ in registry._probes] == [("x", "GET /v2/x")]
+
+
+def test_watch_router_on_a_nested_router_not_in_the_app_uses_its_inner_prefix():
+    _, outer = _app_with_nested_router()
+    registry = HealthRegistry(FastAPI())
+    registry.watch_router(outer)
+    assert [(p.name, p.description) for p, _ in registry._probes] == [("import_db", "GET /import/db")]
+
+
 def test_route_sharing_the_health_prefix_is_still_monitored():
     app = FastAPI()
 

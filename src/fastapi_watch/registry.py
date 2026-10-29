@@ -115,18 +115,22 @@ class _SlotStreamingResponse(StreamingResponse):
             self._release()
 
 
-def _iter_app_routes(routes, prefix: str = "") -> Iterator[tuple[Any, str]]:
-    """Yield ``(route, prefix)`` for every concrete route, recursing into router containers.
+def _iter_app_routes(
+    routes, prefix: str = "", tags: tuple[str, ...] = ()
+) -> Iterator[tuple[Any, str, tuple[str, ...]]]:
+    """Yield ``(route, prefix, tags)`` for every concrete route, recursing into router containers.
 
     Handles both the flat layout (FastAPI <0.137) where include_router copies routes
     with their full paths into app.routes, and the nested layout (FastAPI 0.137+) where
     _IncludedRouter wrapper objects are stored instead.  Routes inside _IncludedRouter
     retain their short path (without the prefix), so *prefix* is the accumulated
     include prefix; ``_effective_path(route, prefix)`` gives the path a client requests.
+    Likewise *tags* are the accumulated ``include_router(tags=...)``, outermost
+    first, which the nested layout keeps on the include instead of the route.
     """
     for item in routes:
         if hasattr(item, "path"):
-            yield item, prefix
+            yield item, prefix, tags
             continue
 
         # FastAPI 0.137+: _IncludedRouter stores prefix in include_context.prefix.
@@ -134,6 +138,7 @@ def _iter_app_routes(routes, prefix: str = "") -> Iterator[tuple[Any, str]]:
         include_ctx = getattr(item, "include_context", None)
         ctx_prefix = getattr(include_ctx, "prefix", None) or getattr(item, "prefix", "")
         item_prefix = prefix + ctx_prefix
+        item_tags = tags + tuple(getattr(include_ctx, "tags", None) or ())
 
         # Try all known container attributes to find sub-routes.
         sub = None
@@ -156,7 +161,7 @@ def _iter_app_routes(routes, prefix: str = "") -> Iterator[tuple[Any, str]]:
                     break
 
         if sub:
-            yield from _iter_app_routes(sub, item_prefix)
+            yield from _iter_app_routes(sub, item_prefix, item_tags)
 
 
 def _effective_path(route, prefix: str) -> str:
@@ -545,7 +550,7 @@ class HealthRegistry:
     Mounted routes (all customisable via *prefix*):
 
     - ``GET    /health/live``          — liveness; always 200
-    - ``GET    /health/ready``         — readiness; 200 if all critical probes pass, 503 otherwise
+    - ``GET    /health/ready``         — readiness; 200 unless a critical probe is unhealthy (503)
     - ``GET    /health/status``        — full probe detail; 200 / 207 (Multi-Status)
     - ``GET    /health/history``       — rolling probe result history
     - ``GET    /health/startup``       — startup check; 503 until :meth:`set_started` is called
@@ -671,7 +676,7 @@ class HealthRegistry:
             webhook_url="https://hooks.example.com/health",
             auth={"type": "apikey", "key": "s3cr3t"},
         )
-        registry.add(RedisProbe(url="redis://localhost", poll_interval_ms=5_000))
+        registry.add(TCPProbe("redis.internal", 6379, name="redis-tcp", poll_interval_ms=5_000))
         registry.set_started()   # call once app init is complete
     """
 
@@ -1086,8 +1091,8 @@ class HealthRegistry:
 
         Like :meth:`discover_routes` but scoped to a single router — useful
         when you want different tags, thresholds, or criticality per router.
-        Call it after ``app.include_router(router)`` so that FastAPI has
-        already baked the routes (with their final paths) into ``app.routes``.
+        Call it after ``app.include_router(router)`` so the include prefix is
+        known: path filters and probe descriptions use the full path.
         Both HTTP and WebSocket routes are monitored automatically.
 
         FastAPI route tags are merged into probe tags; *tags* adds extra labels
@@ -1139,17 +1144,21 @@ class HealthRegistry:
             # Monitor only write endpoints for the orders router
             registry.watch_router(orders_router, include_methods=["POST", "PUT", "DELETE"])
         """
-        router_endpoints = set().union(*(_endpoint_keys(r) for r in getattr(router, "routes", [])))
+        # Recurse: on FastAPI 0.137+ a router that include_router()s another
+        # holds _IncludedRouter wrappers, not the routes themselves.
+        router_routes = list(_iter_app_routes(getattr(router, "routes", [])))
+        router_endpoints = set().union(*(_endpoint_keys(r) for r, _, _ in router_routes))
         # Primary: the app's own route table, which carries the include prefix.
-        # Fallback: router.routes for anything the primary pass could not reach
-        # (they are the serving objects on FastAPI 0.137+, but carry no prefix).
+        # Fallback: the router's routes for anything the primary pass could not
+        # reach (they are the serving objects on FastAPI 0.137+, but carry only
+        # the prefixes of includes inside the router).
         candidates = [
-            (route, prefix) for route, prefix in _iter_app_routes(self.app.routes)
-            if _endpoint_keys(route) & router_endpoints
+            candidate for candidate in _iter_app_routes(self.app.routes)
+            if _endpoint_keys(candidate[0]) & router_endpoints
         ]
-        reached = set().union(*(_endpoint_keys(r) for r, _ in candidates))
+        reached = set().union(*(_endpoint_keys(r) for r, _, _ in candidates))
         candidates += [
-            (route, "") for route in getattr(router, "routes", [])
+            (route, prefix, tags) for route, prefix, tags in router_routes
             if _endpoint_keys(route) and not (_endpoint_keys(route) & reached)
         ]
         probe_group = ProbeGroup(tags=list(tags) if tags else None) if group else None
@@ -1173,7 +1182,7 @@ class HealthRegistry:
 
     def _monitor_routes(
         self,
-        candidates: "list[tuple[Any, str]]",
+        candidates: "list[tuple[Any, str, tuple[str, ...]]]",
         *,
         marker: str,
         refresh: bool,
@@ -1187,7 +1196,7 @@ class HealthRegistry:
         probe_kwargs: dict,
         probe_group: ProbeGroup | None = None,
     ) -> None:
-        """Wrap each candidate ``(route, include_prefix)`` with a route probe.
+        """Wrap each candidate ``(route, include_prefix, include_tags)`` with a route probe.
 
         Shared by :meth:`discover_routes` (``marker="discover"``) and
         :meth:`watch_router` (``marker="router"``).  Paths are matched on the
@@ -1210,11 +1219,10 @@ class HealthRegistry:
         taken = {p.name for p, _ in self._probes}
         seen: set[int] = set()
 
-        for route, prefix in candidates:
+        for route, prefix, include_tags in candidates:
             is_ws = APIWebSocketRoute is not None and isinstance(route, APIWebSocketRoute)
             if (not isinstance(route, APIRoute) and not is_ws) or id(route) in seen:
                 continue
-            seen.add(id(route))
             if _is_health_handler(getattr(route, "endpoint", None)):
                 continue
             path = _effective_path(route, prefix)
@@ -1224,6 +1232,10 @@ class HealthRegistry:
                 continue
             if methods_filter is not None and not is_ws and not set(route.methods or ()) & methods_filter:
                 continue
+            # Marked only once it passes the filters: on FastAPI 0.137+ a router
+            # included twice yields the same route object under each prefix, and
+            # one prefix being excluded must not leave the other unmonitored.
+            seen.add(id(route))
 
             current = getattr(route.dependant, "call", None)
             existing = getattr(current, "_fastapi_watch", None)
@@ -1245,7 +1257,8 @@ class HealthRegistry:
             # Validate before touching the route, so a bad name leaves it unpatched.
             self._check_probe_name(name)
 
-            probe_tags = list(dict.fromkeys(list(getattr(route, "tags", None) or []) + extra_tags))
+            route_tags = list(include_tags) + list(getattr(route, "tags", None) or [])
+            probe_tags = list(dict.fromkeys(route_tags + extra_tags))
             if is_ws:
                 probe = FastAPIWebSocketProbe(name=name, description=description, tags=probe_tags, **(ws_probe_kwargs or {}))
             else:
@@ -2750,7 +2763,7 @@ class HealthRegistry:
             tags=tags,
             include_in_schema=include_in_schema,
             summary="Detailed health status",
-            description="Returns full probe results. 200 when all healthy, 207 when any probe fails.",
+            description="Returns full probe results. 200 when critical probes are healthy or have no data yet, 207 when any critical probe is degraded or unhealthy.",
             dependencies=auth_deps,
         )
         async def health_status(
